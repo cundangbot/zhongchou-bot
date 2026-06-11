@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-crowdfund}
+      POSTGRES_USER: ${POSTGRES_USER:-crowdfund}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_now}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crowdfund} -d ${POSTGRES_DB:-crowdfund}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  tg-crowdfund-bot:
+    build: .
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./payment_checker.session:/app/payment_checker.session
+      - ./backups:/app/backups
+    command: ["sh", "-c", "alembic upgrade head && python -m app.main"]
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

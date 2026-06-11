@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from enum import StrEnum
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db.models import CrowdfundProject, ProjectStateHistory
+
+
+class ProjectState(StrEnum):
+    DRAFT = 'draft'
+    PENDING_REVIEW = 'pending_review'
+    REJECTED = 'rejected'
+    APPROVED_WAIT_CREATOR = 'approved_wait_creator'
+    ACTIVE = 'active'
+    FULL = 'full'
+    WAITING_CREATOR_RESOURCE = 'waiting_creator_resource'
+    WAITING_BUY_INFO = 'waiting_buy_info'
+    PLATFORM_PURCHASING = 'platform_purchasing'
+    ADMIN_UPLOADING = 'admin_uploading'
+    RESOURCE_UPLOADING = 'resource_uploading'
+    RESOURCE_SUBMITTED = 'resource_submitted'
+    RESOURCE_REVIEW = 'resource_review'
+    RESOURCE_REJECTED = 'resource_rejected'
+    RESOURCE_PUBLISHED = 'resource_published'
+    DELIVERED = 'delivered'
+    CANCELLED = 'cancelled'
+    EXPIRED = 'expired'
+    REFUND_PENDING = 'refund_pending'
+    REFUND_COMPLETED = 'refund_completed'
+
+
+ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    ProjectState.DRAFT: {ProjectState.PENDING_REVIEW},
+    ProjectState.PENDING_REVIEW: {ProjectState.REJECTED, ProjectState.APPROVED_WAIT_CREATOR, ProjectState.ACTIVE},
+    ProjectState.APPROVED_WAIT_CREATOR: {ProjectState.ACTIVE, ProjectState.CANCELLED},
+    ProjectState.ACTIVE: {ProjectState.FULL, ProjectState.CANCELLED, ProjectState.EXPIRED},
+    ProjectState.FULL: {
+        ProjectState.WAITING_CREATOR_RESOURCE, ProjectState.WAITING_BUY_INFO,
+        ProjectState.PLATFORM_PURCHASING, ProjectState.RESOURCE_UPLOADING,
+        ProjectState.CANCELLED,
+    },
+    ProjectState.WAITING_CREATOR_RESOURCE: {
+        ProjectState.RESOURCE_UPLOADING, ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.RESOURCE_REJECTED, ProjectState.CANCELLED,
+    },
+    ProjectState.WAITING_BUY_INFO: {ProjectState.PLATFORM_PURCHASING, ProjectState.CANCELLED},
+    ProjectState.PLATFORM_PURCHASING: {
+        ProjectState.ADMIN_UPLOADING, ProjectState.RESOURCE_UPLOADING,
+        ProjectState.RESOURCE_SUBMITTED, ProjectState.CANCELLED,
+    },
+    ProjectState.ADMIN_UPLOADING: {
+        ProjectState.PLATFORM_PURCHASING, ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.RESOURCE_UPLOADING, ProjectState.CANCELLED,
+    },
+    ProjectState.RESOURCE_UPLOADING: {
+        ProjectState.RESOURCE_SUBMITTED, ProjectState.RESOURCE_REJECTED,
+        ProjectState.CANCELLED,
+    },
+    ProjectState.RESOURCE_SUBMITTED: {
+        ProjectState.RESOURCE_PUBLISHED, ProjectState.DELIVERED,
+        ProjectState.RESOURCE_REJECTED, ProjectState.CANCELLED,
+    },
+    ProjectState.RESOURCE_REVIEW: {
+        ProjectState.RESOURCE_UPLOADING, ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.RESOURCE_REJECTED, ProjectState.CANCELLED,
+    },
+    ProjectState.RESOURCE_REJECTED: {
+        ProjectState.RESOURCE_UPLOADING, ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.CANCELLED,
+    },
+    ProjectState.RESOURCE_PUBLISHED: {ProjectState.DELIVERED, ProjectState.RESOURCE_REVIEW, ProjectState.CANCELLED},
+    ProjectState.DELIVERED: {ProjectState.RESOURCE_REVIEW},
+    ProjectState.CANCELLED: {ProjectState.REFUND_PENDING},
+    ProjectState.EXPIRED: {ProjectState.REFUND_PENDING},
+    ProjectState.REFUND_PENDING: {ProjectState.REFUND_COMPLETED},
+    ProjectState.REJECTED: set(),
+    ProjectState.REFUND_COMPLETED: set(),
+}
+
+
+class InvalidProjectTransition(ValueError):
+    pass
+
+
+async def initialize_project_state(
+    session: AsyncSession,
+    project: CrowdfundProject,
+    state: str = ProjectState.PENDING_REVIEW,
+    *, actor_id: int | None = None,
+    reason: str = '创建项目',
+) -> None:
+    project.status = str(state)
+    project.status_version = 1
+    await session.flush()
+    session.add(ProjectStateHistory(
+        project_id=project.id,
+        from_status=None,
+        to_status=str(state),
+        reason=reason,
+        actor_id=actor_id,
+        idempotency_key=f'project:{project.id}:initial',
+    ))
+
+
+async def transition_project(
+    session: AsyncSession,
+    project: CrowdfundProject,
+    new_status: str | ProjectState,
+    *,
+    reason: str | None = None,
+    actor_id: int | None = None,
+    idempotency_key: str | None = None,
+    metadata: dict | None = None,
+    force: bool = False,
+) -> bool:
+    """项目状态的唯一写入口。
+
+    返回 True 表示发生了状态变化；同状态调用返回 False，天然防重复。
+    """
+    # Serialize all state changes for the same project. SQLAlchemy's identity map
+    # returns the same ORM instance, so callers continue seeing the locked values.
+    project = (await session.execute(
+        select(CrowdfundProject).where(CrowdfundProject.id == project.id).with_for_update()
+    )).scalar_one()
+    target = str(new_status)
+    current = str(project.status)
+    if current == target:
+        return False
+    allowed = ALLOWED_TRANSITIONS.get(current, set())
+    if not force and target not in allowed:
+        raise InvalidProjectTransition(f'项目状态不能从 {current} 变更为 {target}')
+
+    if idempotency_key:
+        # 由唯一约束保证同一个业务状态变更只记录一次。
+        existing = await session.execute(
+            select(ProjectStateHistory.id).where(ProjectStateHistory.idempotency_key == idempotency_key)
+        )
+        if existing.scalar_one_or_none() is not None:
+            return False
+
+    old = current
+    project.status = target
+    project.status_version = int(project.status_version or 0) + 1
+    now = datetime.utcnow()
+    if target == ProjectState.FULL and project.full_at is None:
+        project.full_at = now
+    if target in (ProjectState.CANCELLED, ProjectState.EXPIRED):
+        project.expired_at = now
+        if reason:
+            project.cancel_reason = reason
+
+    session.add(ProjectStateHistory(
+        project_id=project.id,
+        from_status=old,
+        to_status=target,
+        reason=reason,
+        actor_id=actor_id,
+        idempotency_key=idempotency_key,
+        metadata_json=json.dumps(metadata, ensure_ascii=False) if metadata else None,
+    ))
+    await session.flush()
+    return True
