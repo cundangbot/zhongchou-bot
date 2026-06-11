@@ -11,3 +11,4 @@ data/
 venv/
 *.pyc
 .env.example
+*.patch
