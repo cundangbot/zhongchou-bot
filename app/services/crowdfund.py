@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.messages import cute as msg
 from app.db.models import CrowdfundProject, PaymentOrder
-from app.services.project_state import ProjectState, initialize_project_state, transition_project
 
 settings = get_settings()
 
@@ -36,6 +35,7 @@ async def create_project(
     description_message_id: int | None = None,
     description_items: str | None = None,
 ) -> CrowdfundProject:
+    from app.services.project_state import ProjectState, initialize_project_state, transition_project
     project = CrowdfundProject(
         creator_id=creator_id,
         creator_username=creator_username,
@@ -59,6 +59,7 @@ async def create_project(
 
 
 async def approve_project(session: AsyncSession, project_id: int, channel_message_id: int | None = None, actor_id: int | None = None) -> CrowdfundProject | None:
+    from app.services.project_state import ProjectState, initialize_project_state, transition_project
     project = await session.get(CrowdfundProject, project_id, with_for_update=True)
     if not project:
         return None
@@ -76,6 +77,7 @@ async def approve_project(session: AsyncSession, project_id: int, channel_messag
 
 
 async def reject_project(session: AsyncSession, project_id: int, actor_id: int | None = None) -> CrowdfundProject | None:
+    from app.services.project_state import ProjectState, initialize_project_state, transition_project
     project = await session.get(CrowdfundProject, project_id, with_for_update=True)
     if not project:
         return None
@@ -89,6 +91,7 @@ async def reject_project(session: AsyncSession, project_id: int, actor_id: int |
 
 
 async def cancel_project(session: AsyncSession, project_id: int, reason: str = '项目已取消', actor_id: int | None = None) -> CrowdfundProject | None:
+    from app.services.project_state import ProjectState, initialize_project_state, transition_project
     project = await session.get(CrowdfundProject, project_id, with_for_update=True)
     if not project:
         return None
@@ -105,6 +108,7 @@ async def cancel_project(session: AsyncSession, project_id: int, reason: str = '
 
 
 async def expire_old_projects(session: AsyncSession) -> list[CrowdfundProject]:
+    from app.services.project_state import ProjectState, initialize_project_state, transition_project
     cutoff = datetime.utcnow() - timedelta(days=settings.CROWDFUND_EXPIRE_DAYS)
     res = await session.execute(
         select(CrowdfundProject).where(
@@ -126,6 +130,7 @@ async def expire_old_projects(session: AsyncSession) -> list[CrowdfundProject]:
 
 
 async def expire_creator_prepay_timeout_projects(session: AsyncSession) -> list[CrowdfundProject]:
+    from app.services.project_state import ProjectState, initialize_project_state, transition_project
     now = datetime.utcnow()
     cutoff = now - timedelta(minutes=settings.PENDING_ORDER_EXPIRE_MINUTES)
     res = await session.execute(
@@ -168,6 +173,7 @@ async def expire_creator_prepay_timeout_projects(session: AsyncSession) -> list[
 
 
 async def expire_resource_timeout_projects(session: AsyncSession) -> list[CrowdfundProject]:
+    from app.services.project_state import ProjectState, initialize_project_state, transition_project
     now = datetime.utcnow()
     res = await session.execute(
         select(CrowdfundProject).where(
@@ -221,6 +227,7 @@ def project_progress_text(project: CrowdfundProject, *, compact: bool = False) -
 
 
 def project_public_text(project: CrowdfundProject) -> str:
+    from app.services.project_state import ProjectState, initialize_project_state, transition_project
     mode_map = {'prepaid': '🙋 我来垫付', 'platform': '🤖 小掌柜代买', 'owned': '📦 我已持有资源'}
     status_map = {
         ProjectState.DRAFT: '待提交',

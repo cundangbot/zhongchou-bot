@@ -51,7 +51,6 @@ from app.services.crowdfund import (
 )
 from app.services.payments import create_payment_order, friendly_verify_failure
 from app.states import BuyInfoCollect, CrowdfundCreate, ResourceUploadCollect
-from app.services.project_state import ProjectState, transition_project
 from app.services.idempotency import begin_operation, finish_operation
 from app.services.system_events import record_event
 from app.messages import cute as msg
@@ -402,6 +401,7 @@ async def _is_blacklisted(session, user_id: int) -> bool:
 
 
 async def _create_refund_records_and_send_list(bot: Bot, session, project: CrowdfundProject, reason: str) -> int:
+    from app.services.project_state import ProjectState, transition_project
     res = await session.execute(
         select(PaymentOrder).where(PaymentOrder.project_id == project.id, PaymentOrder.status == 'paid')
     )
@@ -527,6 +527,7 @@ async def _sync_admin_upload_session_to_project(session, project: CrowdfundProje
     修复平台代购场景：管理员点击“上传完成，私发资源”时，如果由于 FSM/管理员身份/数据库状态冲突导致 project.resource_text 为空，
     仍可从 ADMIN_UPLOAD_SESSIONS[chat_id]['items'] 恢复资源，避免误报“还没有收到资源”。
     """
+    from app.services.project_state import ProjectState, transition_project
     existing = _load_resource_items(project)
     session_items: list[dict] = []
 
@@ -732,6 +733,7 @@ async def _store_resource_item(session, project: CrowdfundProject, message: Mess
     旧逻辑会出现：每条都读取同一份旧 resource_text，然后各自覆盖保存，最终只剩 1 张。
     这里按 project_id 加锁，并在锁内 refresh + append + commit，确保整组都能入库。
     """
+    from app.services.project_state import ProjectState, transition_project
     async with _project_resource_lock(int(project.id)):
         await session.refresh(project)
         items = _load_resource_items(project)
@@ -923,6 +925,7 @@ async def _send_resource_preview_to_admin(bot: Bot, project: CrowdfundProject, i
 
 
 async def _publish_project_resource(bot: Bot, session, project: CrowdfundProject) -> tuple[bool, str]:
+    from app.services.project_state import ProjectState, transition_project
     items = _load_resource_items(project)
     if not items:
         return False, '该项目还没有上传资源。请点击“上传资源”按钮。'
@@ -1396,6 +1399,7 @@ async def creator_buyinfo_prompt(call: CallbackQuery, state: FSMContext):
 
 @router.message(BuyInfoCollect.info)
 async def collect_buyinfo(message: Message, state: FSMContext, bot: Bot):
+    from app.services.project_state import ProjectState, transition_project
     data = await state.get_data()
     project_id = int(data.get('project_id'))
     info = (message.text or message.caption or '').strip()
@@ -1473,6 +1477,7 @@ def _admin_upload_session_for_message(message: Message) -> dict | None:
 
 @router.callback_query(F.data.startswith('admin:upload_resource:'))
 async def admin_upload_resource_prompt(call: CallbackQuery, state: FSMContext, bot: Bot):
+    from app.services.project_state import ProjectState, transition_project
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
@@ -1587,6 +1592,7 @@ async def collect_resource_upload(message: Message, state: FSMContext, bot: Bot)
 
 @router.callback_query(F.data.startswith('resource:finish:'))
 async def resource_upload_finish(call: CallbackQuery, state: FSMContext, bot: Bot):
+    from app.services.project_state import ProjectState, transition_project
     project_id = int(call.data.split(':')[-1])
     data = await state.get_data()
     sess_key = call.message.chat.id
@@ -1675,6 +1681,7 @@ async def resource_upload_cancel(call: CallbackQuery, state: FSMContext):
 # 保留命令兼容。
 @router.message(F.text.regexp(r'^/buyinfo_(\d+)\s+(.+)$'))
 async def submit_buy_info(message: Message, bot: Bot):
+    from app.services.project_state import ProjectState, transition_project
     m = re.match(r'^/buyinfo_(\d+)\s+(.+)$', message.text.strip(), flags=re.S)
     if not m:
         return
@@ -1768,6 +1775,7 @@ async def admin_publish_resource(call: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith('admin:reject_resource:'))
 async def admin_reject_resource(call: CallbackQuery, bot: Bot):
+    from app.services.project_state import ProjectState, transition_project
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
@@ -1947,6 +1955,7 @@ async def admin_view_resources(call: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith('admin:reset_resource:'))
 async def admin_reset_resource(call: CallbackQuery, bot: Bot):
+    from app.services.project_state import ProjectState, transition_project
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
@@ -1966,6 +1975,7 @@ async def admin_reset_resource(call: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith('admin:mark_full:'))
 async def admin_mark_full(call: CallbackQuery, bot: Bot):
+    from app.services.project_state import ProjectState, transition_project
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return

@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db.models import PaymentOrder, CrowdfundProject, ResourceAccess, RiskLog, UserBlacklist, SystemMetric
 from app.services.payment_checker import FakaOrderResult, faka_query_client
-from app.services.project_state import ProjectState, transition_project
 from app.services.ledger import post_ledger, money
 from app.services.idempotency import begin_operation, finish_operation
 from app.services.system_events import set_metric
@@ -260,6 +259,7 @@ async def confirm_order_by_system_no(session: AsyncSession, user_id: int, system
 
 
 async def apply_paid_effects(session: AsyncSession, order: PaymentOrder) -> None:
+    from app.services.project_state import ProjectState, transition_project
     if order.effects_applied_at is not None:
         return
     if order.project_id:
