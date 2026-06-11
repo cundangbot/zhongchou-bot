@@ -15,6 +15,11 @@ services:
       timeout: 5s
       retries: 20
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   tg-crowdfund-bot:
     build: .
@@ -27,6 +32,11 @@ services:
       - ./backups:/app/backups
     command: ["sh", "-c", "alembic upgrade head && python -m app.main"]
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   postgres_data:

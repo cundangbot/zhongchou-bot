@@ -1,0 +1,181 @@
+Binary files a/app/__pycache__/keyboards.cpython-313.pyc and b/app/__pycache__/keyboards.cpython-313.pyc differ
+Binary files a/app/handlers/__pycache__/crowdfund.cpython-313.pyc and b/app/handlers/__pycache__/crowdfund.cpython-313.pyc differ
+diff -ruN a/app/handlers/crowdfund.py b/app/handlers/crowdfund.py
+--- a/app/handlers/crowdfund.py	2026-06-11 20:13:49.000000000 +0000
++++ b/app/handlers/crowdfund.py	2026-06-11 21:22:22.685609713 +0000
+@@ -28,6 +28,7 @@
+     payment_order_keyboard,
+     resource_upload_collect_keyboard,
+     admin_resource_upload_done_keyboard,
++    resource_upload_preview_keyboard,
+     description_collect_keyboard,
+     resource_claim_keyboard,
+     reimbursement_apply_keyboard,
+@@ -288,6 +289,20 @@
+     return [x for x in items if x.get('type') == kind]
+ 
+ 
++
++
++def _resource_upload_preview_text(project: CrowdfundProject, items: list[dict], role: str) -> str:
++    counts = _resource_type_counts(items)
++    owner = '平台代购管理员' if role == 'admin' else '发起人'
++    return (
++        f'👀 上传前预览确认\n'
++        f'{project_label(project)}\n\n'
++        f'上传人：{owner}\n'
++        f'资源统计：{counts}\n'
++        f'总数：{len(items)}\n\n'
++        f'确认无误后再提交审核；如果发现漏传，请点“继续上传”。'
++    )
++
+ def _upload_status_text(project: CrowdfundProject, items: list[dict], role: str) -> str:
+     counts = _resource_counts(items)
+     return msg.resource_upload_panel(
+@@ -1592,13 +1607,10 @@
+ 
+ @router.callback_query(F.data.startswith('resource:finish:'))
+ async def resource_upload_finish(call: CallbackQuery, state: FSMContext, bot: Bot):
+-    from app.services.project_state import ProjectState, transition_project
++    '''上传完成按钮先进入预览确认，不再直接提交。'''
+     project_id = int(call.data.split(':')[-1])
+     data = await state.get_data()
+-    sess_key = call.message.chat.id
+     admin_sess = ADMIN_UPLOAD_SESSIONS.get(call.message.chat.id)
+-
+-    # 管理员平台代购上传允许走独立会话，不强依赖 FSM。
+     if admin_sess and int(admin_sess.get('project_id') or 0) == project_id:
+         role = 'admin'
+     else:
+@@ -1606,34 +1618,90 @@
+             await call.answer('当前没有这个项目的上传会话，请先点击“上传资源”。', show_alert=True)
+             return
+         role = data.get('upload_role', 'creator')
++    async with SessionLocal() as session:
++        project = await session.get(CrowdfundProject, project_id)
++        if not project:
++            await call.answer('项目不存在', show_alert=True)
++            return
++        await _wait_media_group_flush()
++        await session.refresh(project)
++        items = await _sync_admin_upload_session_to_project(session, project, call.message.chat.id) if role == 'admin' else _load_resource_items(project)
++        if not items:
++            await call.answer('还没有收到资源，请先发送资源内容。', show_alert=True)
++            return
++        await call.message.answer(
++            _resource_upload_preview_text(project, items, role),
++            reply_markup=resource_upload_preview_keyboard(project.id, role),
++        )
++    await call.answer('请先确认预览。')
++
++
++@router.callback_query(F.data.startswith('resource:continue:'))
++async def resource_upload_continue(call: CallbackQuery, state: FSMContext):
++    parts = call.data.split(':')
++    project_id = int(parts[2])
++    role = parts[3] if len(parts) > 3 else 'creator'
++    if role != 'admin':
++        await state.update_data(project_id=project_id, upload_role=role)
++        await state.set_state(ResourceUploadCollect.resource)
++    await call.answer('可以继续发送资源。')
++
++
++@router.callback_query(F.data.startswith('resource:clear:'))
++async def resource_upload_clear(call: CallbackQuery, state: FSMContext):
++    parts = call.data.split(':')
++    project_id = int(parts[2])
++    role = parts[3] if len(parts) > 3 else 'creator'
++    async with SessionLocal() as session:
++        project = await session.get(CrowdfundProject, project_id)
++        if not project:
++            await call.answer('项目不存在', show_alert=True)
++            return
++        project.resource_text = '[]'
++        await session.commit()
++    if role == 'admin':
++        for sess in (ADMIN_UPLOAD_SESSIONS.get(call.message.chat.id), ADMIN_UPLOAD_SESSIONS.get(settings.ADMIN_GROUP_ID)):
++            if sess and int(sess.get('project_id') or 0) == project_id:
++                sess['items'] = []
++                sess['ack'] = False
++    else:
++        await state.update_data(project_id=project_id, upload_role=role)
++        await state.set_state(ResourceUploadCollect.resource)
++    await call.message.answer('🧹 已清空本次资源，请重新上传。')
++    await call.answer()
++
+ 
++@router.callback_query(F.data.startswith('resource:submit:'))
++async def resource_upload_submit(call: CallbackQuery, state: FSMContext, bot: Bot):
++    from app.services.project_state import ProjectState, transition_project
++    parts = call.data.split(':')
++    project_id = int(parts[2])
++    role = parts[3] if len(parts) > 3 else 'creator'
+     async with SessionLocal() as session:
+         project = await session.get(CrowdfundProject, project_id)
+         if not project:
+             await call.answer('项目不存在', show_alert=True)
+             return
+-        # 媒体组上传后用户马上点完成时，可能还有几条图片/视频 update 正在排队处理。
+-        # 等待一小段时间再读取，避免只提交第一张。
+         await _wait_media_group_flush()
+         await session.refresh(project)
+         items = await _sync_admin_upload_session_to_project(session, project, call.message.chat.id) if role == 'admin' else _load_resource_items(project)
+         if not items:
+-            await call.answer('还没有收到资源，请先在本群发送资源内容。', show_alert=True)
++            await call.answer('还没有收到资源，请先发送资源内容。', show_alert=True)
+             return
+-        await transition_project(session, project, ProjectState.RESOURCE_SUBMITTED, reason='资源上传完成，提交审核', force=True)
++        await transition_project(session, project, ProjectState.RESOURCE_SUBMITTED, reason='资源上传预览确认后提交审核', force=True)
+         await session.commit()
+         if role == 'admin':
+             await call.message.answer(
+-                f'✅ 平台代购资源已接收完成。\n{project_label(project)}\n分类：{_resource_type_counts(items)}\n\n请选择下一步：',
++                f'✅ 平台代购资源已确认提交。\n{project_label(project)}\n分类：{_resource_type_counts(items)}\n\n可以继续点“确认私发资源”。',
+                 reply_markup=admin_resource_upload_done_keyboard(project.id),
+             )
+         else:
+             await _send_resource_preview_to_admin(bot, project, items)
+-            await call.message.answer('✅ 已完成上传，并提交管理审核。审核通过后会直接私发给所有已支付拼车用户。')
++            await call.message.answer('✅ 已确认提交管理审核。审核通过后会直接私发给所有已支付拼车用户。')
+     if role == 'admin':
+         ADMIN_UPLOAD_SESSIONS.pop(call.message.chat.id, None)
+     await state.clear()
+-    await call.answer()
++    await call.answer('已提交。')
+ 
+ 
+ @router.callback_query(F.data.startswith('resource:view:'))
+diff -ruN a/app/keyboards.py b/app/keyboards.py
+--- a/app/keyboards.py	2026-06-11 21:22:21.400604541 +0000
++++ b/app/keyboards.py	2026-06-11 21:22:22.684934026 +0000
+@@ -216,18 +216,28 @@
+ 
+ def resource_upload_collect_keyboard(project_id: int) -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup(inline_keyboard=[
+-        [InlineKeyboardButton(text='✅ 上传好啦，提交审核', callback_data=f'resource:finish:{project_id}')],
++        [InlineKeyboardButton(text='👀 预览并确认提交', callback_data=f'resource:finish:{project_id}')],
+         [InlineKeyboardButton(text='⛔ 不传了，取消', callback_data=f'resource:cancel:{project_id}')],
+     ])
+ 
+ 
+ def admin_resource_upload_done_keyboard(project_id: int) -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup(inline_keyboard=[
+-        [InlineKeyboardButton(text='✅ 上传好啦，私发资源', callback_data=f'admin:publish_resource:{project_id}')],
++        [InlineKeyboardButton(text='👀 预览资源', callback_data=f'resource:finish:{project_id}')],
++        [InlineKeyboardButton(text='✅ 确认私发资源', callback_data=f'admin:publish_resource:{project_id}')],
+         [InlineKeyboardButton(text='⛔ 不传了，取消', callback_data=f'resource:cancel:{project_id}')],
+     ])
+ 
+ 
++def resource_upload_preview_keyboard(project_id: int, role: str = 'creator') -> InlineKeyboardMarkup:
++    return InlineKeyboardMarkup(inline_keyboard=[
++        [InlineKeyboardButton(text='✅ 确认提交审核', callback_data=f'resource:submit:{project_id}:{role}')],
++        [InlineKeyboardButton(text='➕ 继续上传', callback_data=f'resource:continue:{project_id}:{role}')],
++        [InlineKeyboardButton(text='🧹 清空重传', callback_data=f'resource:clear:{project_id}:{role}')],
++        [InlineKeyboardButton(text='⛔ 取消上传', callback_data=f'resource:cancel:{project_id}')],
++    ])
++
++
+ def resource_review_keyboard(project_id: int) -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup(inline_keyboard=[
+         [InlineKeyboardButton(text='✅ 审核通过，放宝贝', callback_data=f'admin:publish_resource:{project_id}')],

@@ -216,15 +216,25 @@ def admin_project_detail_keyboard(project_id: int) -> InlineKeyboardMarkup:
 
 def resource_upload_collect_keyboard(project_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='✅ 上传好啦，提交审核', callback_data=f'resource:finish:{project_id}')],
+        [InlineKeyboardButton(text='👀 预览并确认提交', callback_data=f'resource:finish:{project_id}')],
         [InlineKeyboardButton(text='⛔ 不传了，取消', callback_data=f'resource:cancel:{project_id}')],
     ])
 
 
 def admin_resource_upload_done_keyboard(project_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='✅ 上传好啦，私发资源', callback_data=f'admin:publish_resource:{project_id}')],
+        [InlineKeyboardButton(text='👀 预览资源', callback_data=f'resource:finish:{project_id}')],
+        [InlineKeyboardButton(text='✅ 确认私发资源', callback_data=f'admin:publish_resource:{project_id}')],
         [InlineKeyboardButton(text='⛔ 不传了，取消', callback_data=f'resource:cancel:{project_id}')],
+    ])
+
+
+def resource_upload_preview_keyboard(project_id: int, role: str = 'creator') -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✅ 确认提交审核', callback_data=f'resource:submit:{project_id}:{role}')],
+        [InlineKeyboardButton(text='➕ 继续上传', callback_data=f'resource:continue:{project_id}:{role}')],
+        [InlineKeyboardButton(text='🧹 清空重传', callback_data=f'resource:clear:{project_id}:{role}')],
+        [InlineKeyboardButton(text='⛔ 取消上传', callback_data=f'resource:cancel:{project_id}')],
     ])
 
 
@@ -310,14 +320,14 @@ def refund_item_keyboard(refund_id: int) -> InlineKeyboardMarkup:
 
 def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='🧺 待审核车车', callback_data='admin:list:pending_review')],
-        [InlineKeyboardButton(text='📤 待补资源', callback_data='admin:list:wait_upload')],
-        [InlineKeyboardButton(text='💰 报销/提现小篮子', callback_data='admin:list:payouts')],
-        [InlineKeyboardButton(text='🧾 退款小票', callback_data='admin:list:refunds')],
-        [InlineKeyboardButton(text='💬 私聊客服记录', callback_data='admin:list:support')],
-        [InlineKeyboardButton(text='⚠️ 风控提醒', callback_data='admin:list:risks')],
-        [InlineKeyboardButton(text='💹 资金账本', callback_data='admin:list:ledger')],
-        [InlineKeyboardButton(text='🚨 异常小雷达', callback_data='admin:list:exceptions')],
+        [InlineKeyboardButton(text='🧺 待审核车车', callback_data='admin:list:pending_review:0')],
+        [InlineKeyboardButton(text='📤 待补资源', callback_data='admin:list:wait_upload:0')],
+        [InlineKeyboardButton(text='💰 报销/提现小篮子', callback_data='admin:list:payouts:0')],
+        [InlineKeyboardButton(text='🧾 退款小票', callback_data='admin:list:refunds:0')],
+        [InlineKeyboardButton(text='💬 私聊客服记录', callback_data='admin:list:support:0')],
+        [InlineKeyboardButton(text='⚠️ 风控提醒', callback_data='admin:list:risks:0')],
+        [InlineKeyboardButton(text='💹 资金账本', callback_data='admin:list:ledger:0')],
+        [InlineKeyboardButton(text='🚨 异常小雷达', callback_data='admin:list:exceptions:0')],
         [InlineKeyboardButton(text='🩺 系统健康', callback_data='admin:health')],
         [InlineKeyboardButton(text='🔎 项目搜索', callback_data='admin:search_help')],
     ])
@@ -546,7 +556,7 @@ def admin_search_results_keyboard(projects=None, orders=None, refunds=None, tick
         ])
 
     if refunds:
-        rows.append([InlineKeyboardButton(text='🧾 打开退款小票列表', callback_data='admin:list:refunds')])
+        rows.append([InlineKeyboardButton(text='🧾 打开退款小票列表', callback_data='admin:list:refunds:0')])
 
     for t in list(tickets or [])[:3]:
         tid = int(getattr(t, 'id', 0) or 0)

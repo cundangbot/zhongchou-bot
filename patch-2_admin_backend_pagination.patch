@@ -1,0 +1,124 @@
+Binary files a/app/__pycache__/keyboards.cpython-313.pyc and b/app/__pycache__/keyboards.cpython-313.pyc differ
+Binary files a/app/handlers/__pycache__/start.cpython-313.pyc and b/app/handlers/__pycache__/start.cpython-313.pyc differ
+diff -ruN a/app/handlers/start.py b/app/handlers/start.py
+--- a/app/handlers/start.py	2026-06-11 21:22:19.906991711 +0000
++++ b/app/handlers/start.py	2026-06-11 21:22:21.401916783 +0000
+@@ -894,6 +894,23 @@
+             await state.clear()
+ 
+ 
++
++def _admin_list_nav_rows(list_type: str, page: int, has_next: bool) -> list[list[InlineKeyboardButton]]:
++    nav = []
++    if page > 0:
++        nav.append(InlineKeyboardButton(text='⬅️ 上一页', callback_data=f'admin:list:{list_type}:{page - 1}'))
++    if has_next:
++        nav.append(InlineKeyboardButton(text='下一页 ➡️', callback_data=f'admin:list:{list_type}:{page + 1}'))
++    rows = []
++    if nav:
++        rows.append(nav)
++    rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
++    return rows
++
++
++def _admin_page_slice(items: list, page_size: int) -> tuple[list, bool]:
++    return items[:page_size], len(items) > page_size
++
+ def _fmt_dt(dt) -> str:
+     return dt.strftime('%Y-%m-%d %H:%M') if dt else '-'
+ 
+@@ -2737,22 +2754,27 @@
+     if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+         await call.answer('只能在审核群由管理员使用', show_alert=True)
+         return
+-    list_type = call.data.split(':')[-1]
++    parts = (call.data or '').split(':')
++    list_type = parts[2] if len(parts) > 2 else ''
++    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
++    page_size = 10
++    offset = max(0, page) * page_size
+     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+     async with SessionLocal() as session:
+         if list_type == 'pending_review':
+-            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).limit(10))
++            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).offset(offset).limit(page_size + 1))
+             projects = list(res.scalars().all())
++            projects, has_next = _admin_page_slice(projects, page_size)
+             if not projects:
+                 text = '🔍 暂无待审车车～'
+                 markup = admin_dashboard_keyboard()
+             else:
+-                lines = ['🔍 今日待审车车']
++                lines = [f'🔍 今日待审车车｜第 {page + 1} 页']
+                 rows = []
+                 for p in projects:
+                     lines.append(f'\n项目：P.{int(p.id or 0):03d}\n博主：{p.blogger}\n描述：{p.description}\n原价：{p.original_price:g} 元\n状态：{_status_label(p.status)}')
+                     rows.append([InlineKeyboardButton(text=f'🔍 P.{int(p.id or 0):03d}｜查看详情', callback_data=f'admin:project:{p.id}')])
+-                rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
++                rows.extend(_admin_list_nav_rows(list_type, page, has_next))
+                 text = '\n'.join(lines)
+                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
+         elif list_type == 'wait_upload':
+@@ -2767,7 +2789,7 @@
+                 for p in projects:
+                     lines.append(f'\n项目：P.{int(p.id or 0):03d}\n博主：{p.blogger}\n描述：{p.description}\n状态：{_status_label(p.status)}\n模式：{p.purchase_mode}')
+                     rows.append([InlineKeyboardButton(text=f'📤 P.{int(p.id or 0):03d}｜查看详情', callback_data=f'admin:project:{p.id}')])
+-                rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
++                rows.extend(_admin_list_nav_rows(list_type, page, has_next))
+                 text = '\n'.join(lines)
+                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
+         elif list_type == 'payouts':
+@@ -2827,14 +2849,16 @@
+                 select(ContactTicket)
+                 .where(ContactTicket.status.in_(['open', 'answered']), ContactTicket.created_at >= today_start)
+                 .order_by(ContactTicket.created_at.desc())
+-                .limit(10)
++                .offset(offset)
++                .limit(page_size + 1)
+             )
+             tickets = list(res.scalars().all())
++            tickets, has_next = _admin_page_slice(tickets, page_size)
+             if not tickets:
+                 text = '💬 暂无客服小纸条～\n\n用户点「联系小掌柜」后，会在这里生成客服小纸条；退款、报销、提现仍在各自业务列表处理。'
+                 markup = admin_dashboard_keyboard()
+             else:
+-                lines = ['💬 今日客服小纸条', '说明：这里只处理用户人工咨询；退款/报销/提现仍在对应业务列表处理。']
++                lines = [f'💬 今日客服小纸条｜第 {page + 1} 页', '说明：这里只处理用户人工咨询；退款/报销/提现仍在对应业务列表处理。']
+                 rows = []
+                 for t in tickets:
+                     user_label = t.username or str(t.user_id)
+diff -ruN a/app/keyboards.py b/app/keyboards.py
+--- a/app/keyboards.py	2026-06-11 19:33:57.000000000 +0000
++++ b/app/keyboards.py	2026-06-11 21:22:21.400604541 +0000
+@@ -310,14 +310,14 @@
+ 
+ def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup(inline_keyboard=[
+-        [InlineKeyboardButton(text='🧺 待审核车车', callback_data='admin:list:pending_review')],
+-        [InlineKeyboardButton(text='📤 待补资源', callback_data='admin:list:wait_upload')],
+-        [InlineKeyboardButton(text='💰 报销/提现小篮子', callback_data='admin:list:payouts')],
+-        [InlineKeyboardButton(text='🧾 退款小票', callback_data='admin:list:refunds')],
+-        [InlineKeyboardButton(text='💬 私聊客服记录', callback_data='admin:list:support')],
+-        [InlineKeyboardButton(text='⚠️ 风控提醒', callback_data='admin:list:risks')],
+-        [InlineKeyboardButton(text='💹 资金账本', callback_data='admin:list:ledger')],
+-        [InlineKeyboardButton(text='🚨 异常小雷达', callback_data='admin:list:exceptions')],
++        [InlineKeyboardButton(text='🧺 待审核车车', callback_data='admin:list:pending_review:0')],
++        [InlineKeyboardButton(text='📤 待补资源', callback_data='admin:list:wait_upload:0')],
++        [InlineKeyboardButton(text='💰 报销/提现小篮子', callback_data='admin:list:payouts:0')],
++        [InlineKeyboardButton(text='🧾 退款小票', callback_data='admin:list:refunds:0')],
++        [InlineKeyboardButton(text='💬 私聊客服记录', callback_data='admin:list:support:0')],
++        [InlineKeyboardButton(text='⚠️ 风控提醒', callback_data='admin:list:risks:0')],
++        [InlineKeyboardButton(text='💹 资金账本', callback_data='admin:list:ledger:0')],
++        [InlineKeyboardButton(text='🚨 异常小雷达', callback_data='admin:list:exceptions:0')],
+         [InlineKeyboardButton(text='🩺 系统健康', callback_data='admin:health')],
+         [InlineKeyboardButton(text='🔎 项目搜索', callback_data='admin:search_help')],
+     ])
+@@ -546,7 +546,7 @@
+         ])
+ 
+     if refunds:
+-        rows.append([InlineKeyboardButton(text='🧾 打开退款小票列表', callback_data='admin:list:refunds')])
++        rows.append([InlineKeyboardButton(text='🧾 打开退款小票列表', callback_data='admin:list:refunds:0')])
+ 
+     for t in list(tickets or [])[:3]:
+         tid = int(getattr(t, 'id', 0) or 0)

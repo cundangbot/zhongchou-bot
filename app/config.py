@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # SUPPORT_ADMIN_ID=0 时使用 ADMIN_IDS 里的第一个管理员。
     SUPPORT_ADMIN_ID: int = 0
     SUPPORT_PRIVATE_BRIDGE_ENABLED: bool = True
+    SUPPORT_TICKET_IDLE_CLOSE_HOURS: int = 24
+    SUPPORT_ADMIN_HOLD_EXPIRE_HOURS: int = 2
     # 如以后确实需要临时切回外部客服机器人，可把 SUPPORT_EXTERNAL_ONLY 改为 true。
     SUPPORT_BOT_USERNAME: str = '@jingpinhybot'
     SUPPORT_BOT_START_PREFIX: str = 'cf'

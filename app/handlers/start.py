@@ -75,9 +75,25 @@ from app.services.project_runtime import (
 )
 from app.services.payment_flow import confirm_payment_message
 from app.messages import cute as msg
+from app.utils.timezone import business_today_start_utc
+from app.callbacks import parse_admin_list
 
 router = Router()
 settings = get_settings()
+
+# 客服会话生产兜底配置。数据库表或 FSM 临时不可用时，仍能保持管理员当前对话。
+SUPPORT_TICKET_IDLE_CLOSE_HOURS = int(getattr(settings, 'SUPPORT_TICKET_IDLE_CLOSE_HOURS', 24) or 24)
+SUPPORT_ADMIN_HOLD_EXPIRE_HOURS = int(getattr(settings, 'SUPPORT_ADMIN_HOLD_EXPIRE_HOURS', 2) or 2)
+SUPPORT_ADMIN_ACTIVE_SESSIONS: dict[int, dict] = {}
+
+
+def _support_now() -> datetime:
+    return datetime.utcnow()
+
+
+def _support_active_expired(updated_at: datetime | None, *, hours: int) -> bool:
+    return bool(updated_at and updated_at < _support_now() - timedelta(hours=max(1, int(hours))))
+
 
 
 async def _edit_panel(call: CallbackQuery, text: str, reply_markup=None) -> None:
@@ -403,56 +419,95 @@ async def _set_support_admin_active_session(
     source: str | None = None,
     ref_id: int | None = None,
 ) -> None:
-    """记录管理员当前保持的私聊客服对象，避免 FSM 状态丢失造成回复找不到用户。"""
-    async with SessionLocal() as session:
-        res = await session.execute(select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id)).limit(1))
-        active = res.scalar_one_or_none()
-        if active:
-            active.ticket_id = int(ticket_id)
-            active.user_id = int(user_id)
-            active.source = source
-            active.ref_id = int(ref_id) if ref_id else None
-            active.updated_at = datetime.utcnow()
-        else:
-            session.add(SupportAdminSession(
-                admin_id=int(admin_id),
-                ticket_id=int(ticket_id),
-                user_id=int(user_id),
-                source=source,
-                ref_id=int(ref_id) if ref_id else None,
-            ))
-        await session.commit()
+    """记录管理员当前保持的私聊客服对象。
+
+    优先写数据库；如果迁移未跑、数据库短暂异常或 FSM 丢失，内存兜底仍能让
+    “保持这个对话”后的下一条管理员消息正确路由到用户。
+    """
+    SUPPORT_ADMIN_ACTIVE_SESSIONS[int(admin_id)] = {
+        'ticket_id': int(ticket_id),
+        'user_id': int(user_id),
+        'source': source,
+        'ref_id': int(ref_id) if ref_id else None,
+        'updated_at': _support_now(),
+    }
+    try:
+        async with SessionLocal() as session:
+            res = await session.execute(select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id)).limit(1))
+            active = res.scalar_one_or_none()
+            if active:
+                active.ticket_id = int(ticket_id)
+                active.user_id = int(user_id)
+                active.source = source
+                active.ref_id = int(ref_id) if ref_id else None
+                active.updated_at = _support_now()
+            else:
+                session.add(SupportAdminSession(
+                    admin_id=int(admin_id),
+                    ticket_id=int(ticket_id),
+                    user_id=int(user_id),
+                    source=source,
+                    ref_id=int(ref_id) if ref_id else None,
+                ))
+            await session.commit()
+    except Exception:
+        return
 
 
 async def _get_support_admin_active_ticket_id(admin_id: int) -> int | None:
-    async with SessionLocal() as session:
-        res = await session.execute(
-            select(SupportAdminSession)
-            .where(SupportAdminSession.admin_id == int(admin_id))
-            .order_by(SupportAdminSession.updated_at.desc())
-            .limit(1)
-        )
-        active = res.scalar_one_or_none()
-        if not active:
-            return None
-        ticket = await session.get(ContactTicket, int(active.ticket_id))
-        if not ticket or ticket.status == 'closed':
-            await session.delete(active)
-            await session.commit()
-            return None
-        return int(active.ticket_id)
+    mem = SUPPORT_ADMIN_ACTIVE_SESSIONS.get(int(admin_id))
+    if mem and not _support_active_expired(mem.get('updated_at'), hours=SUPPORT_ADMIN_HOLD_EXPIRE_HOURS):
+        return int(mem['ticket_id'])
+    if mem:
+        SUPPORT_ADMIN_ACTIVE_SESSIONS.pop(int(admin_id), None)
+    try:
+        async with SessionLocal() as session:
+            res = await session.execute(
+                select(SupportAdminSession)
+                .where(SupportAdminSession.admin_id == int(admin_id))
+                .order_by(SupportAdminSession.updated_at.desc())
+                .limit(1)
+            )
+            active = res.scalar_one_or_none()
+            if not active:
+                return None
+            if _support_active_expired(active.updated_at, hours=SUPPORT_ADMIN_HOLD_EXPIRE_HOURS):
+                await session.delete(active)
+                await session.commit()
+                return None
+            ticket = await session.get(ContactTicket, int(active.ticket_id))
+            if not ticket or ticket.status == 'closed':
+                await session.delete(active)
+                await session.commit()
+                return None
+            SUPPORT_ADMIN_ACTIVE_SESSIONS[int(admin_id)] = {
+                'ticket_id': int(active.ticket_id),
+                'user_id': int(active.user_id),
+                'source': active.source,
+                'ref_id': active.ref_id,
+                'updated_at': active.updated_at or _support_now(),
+            }
+            return int(active.ticket_id)
+    except Exception:
+        return None
 
 
 async def _clear_support_admin_active_session(admin_id: int, ticket_id: int | None = None) -> None:
-    async with SessionLocal() as session:
-        q = select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id))
-        if ticket_id:
-            q = q.where(SupportAdminSession.ticket_id == int(ticket_id))
-        rows = list((await session.execute(q)).scalars().all())
-        for row in rows:
-            await session.delete(row)
-        if rows:
-            await session.commit()
+    mem = SUPPORT_ADMIN_ACTIVE_SESSIONS.get(int(admin_id))
+    if mem and (ticket_id is None or int(mem.get('ticket_id') or 0) == int(ticket_id)):
+        SUPPORT_ADMIN_ACTIVE_SESSIONS.pop(int(admin_id), None)
+    try:
+        async with SessionLocal() as session:
+            q = select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id))
+            if ticket_id:
+                q = q.where(SupportAdminSession.ticket_id == int(ticket_id))
+            rows = list((await session.execute(q)).scalars().all())
+            for row in rows:
+                await session.delete(row)
+            if rows:
+                await session.commit()
+    except Exception:
+        return
 
 
 async def _support_ticket_id_from_admin_message_id(admin_id: int, admin_message_id: int) -> int | None:
@@ -471,6 +526,19 @@ async def _support_ticket_id_from_admin_message_id(admin_id: int, admin_message_
 
 
 async def _support_active_ticket_for_user(session, user_id: int) -> ContactTicket | None:
+    cutoff = _support_now() - timedelta(hours=max(1, SUPPORT_TICKET_IDLE_CLOSE_HOURS))
+    stale = list((await session.execute(
+        select(ContactTicket).where(
+            ContactTicket.user_id == int(user_id),
+            ContactTicket.status.in_(['open', 'answered']),
+            ContactTicket.created_at < cutoff,
+        )
+    )).scalars().all())
+    for ticket in stale:
+        ticket.status = 'closed'
+        ticket.closed_at = _support_now()
+    if stale:
+        await session.flush()
     res = await session.execute(
         select(ContactTicket)
         .where(ContactTicket.user_id == int(user_id), ContactTicket.status.in_(['open', 'answered']))
@@ -827,6 +895,23 @@ async def _send_support_reply_core(
         if clear_state:
             await state.clear()
 
+
+
+def _admin_list_nav_rows(list_type: str, page: int, has_next: bool) -> list[list[InlineKeyboardButton]]:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text='⬅️ 上一页', callback_data=f'admin:list:{list_type}:{page - 1}'))
+    if has_next:
+        nav.append(InlineKeyboardButton(text='下一页 ➡️', callback_data=f'admin:list:{list_type}:{page + 1}'))
+    rows = []
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
+    return rows
+
+
+def _admin_page_slice(items: list, page_size: int) -> tuple[list, bool]:
+    return items[:page_size], len(items) > page_size
 
 def _fmt_dt(dt) -> str:
     return dt.strftime('%Y-%m-%d %H:%M') if dt else '-'
@@ -2572,7 +2657,7 @@ async def _send_admin_dashboard(message: Message):
         await message.answer('这个小掌柜面板只有管理员可以打开喔～')
         return
     from datetime import datetime, timedelta, time
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = business_today_start_utc()
     async with SessionLocal() as session:
         def scalar(q):
             return session.execute(q)
@@ -2671,22 +2756,25 @@ async def admin_dashboard_list(call: CallbackQuery):
     if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
-    list_type = call.data.split(':')[-1]
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    list_type, page = parse_admin_list(call.data)
+    page_size = 10
+    offset = max(0, page) * page_size
+    today_start = business_today_start_utc()
     async with SessionLocal() as session:
         if list_type == 'pending_review':
-            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).limit(10))
+            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).offset(offset).limit(page_size + 1))
             projects = list(res.scalars().all())
+            projects, has_next = _admin_page_slice(projects, page_size)
             if not projects:
                 text = '🔍 暂无待审车车～'
                 markup = admin_dashboard_keyboard()
             else:
-                lines = ['🔍 今日待审车车']
+                lines = [f'🔍 今日待审车车｜第 {page + 1} 页']
                 rows = []
                 for p in projects:
                     lines.append(f'\n项目：P.{int(p.id or 0):03d}\n博主：{p.blogger}\n描述：{p.description}\n原价：{p.original_price:g} 元\n状态：{_status_label(p.status)}')
                     rows.append([InlineKeyboardButton(text=f'🔍 P.{int(p.id or 0):03d}｜查看详情', callback_data=f'admin:project:{p.id}')])
-                rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
+                rows.extend(_admin_list_nav_rows(list_type, page, has_next))
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'wait_upload':
@@ -2701,7 +2789,7 @@ async def admin_dashboard_list(call: CallbackQuery):
                 for p in projects:
                     lines.append(f'\n项目：P.{int(p.id or 0):03d}\n博主：{p.blogger}\n描述：{p.description}\n状态：{_status_label(p.status)}\n模式：{p.purchase_mode}')
                     rows.append([InlineKeyboardButton(text=f'📤 P.{int(p.id or 0):03d}｜查看详情', callback_data=f'admin:project:{p.id}')])
-                rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
+                rows.extend(_admin_list_nav_rows(list_type, page, has_next))
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'payouts':
@@ -2761,14 +2849,16 @@ async def admin_dashboard_list(call: CallbackQuery):
                 select(ContactTicket)
                 .where(ContactTicket.status.in_(['open', 'answered']), ContactTicket.created_at >= today_start)
                 .order_by(ContactTicket.created_at.desc())
-                .limit(10)
+                .offset(offset)
+                .limit(page_size + 1)
             )
             tickets = list(res.scalars().all())
+            tickets, has_next = _admin_page_slice(tickets, page_size)
             if not tickets:
                 text = '💬 暂无客服小纸条～\n\n用户点「联系小掌柜」后，会在这里生成客服小纸条；退款、报销、提现仍在各自业务列表处理。'
                 markup = admin_dashboard_keyboard()
             else:
-                lines = ['💬 今日客服小纸条', '说明：这里只处理用户人工咨询；退款/报销/提现仍在对应业务列表处理。']
+                lines = [f'💬 今日客服小纸条｜第 {page + 1} 页', '说明：这里只处理用户人工咨询；退款/报销/提现仍在对应业务列表处理。']
                 rows = []
                 for t in tickets:
                     user_label = t.username or str(t.user_id)
@@ -2873,7 +2963,7 @@ async def admin_dashboard_callback(call: CallbackQuery):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
     from datetime import datetime, timedelta
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = business_today_start_utc()
     async with SessionLocal() as session:
         new_projects = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.created_at >= today_start))).scalar() or 0
         paid_orders = (await session.execute(
@@ -3304,6 +3394,8 @@ async def admin_support_hold_private_dialog(call: CallbackQuery, state: FSMConte
     if not _is_support_private_admin(call.from_user.id):
         await call.answer('无权限', show_alert=True)
         return
+    await call.answer('正在保持这个对话...')
+    old_ticket_id = await _get_support_admin_active_ticket_id(call.from_user.id)
     ticket_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         ticket = await session.get(ContactTicket, ticket_id)
@@ -3316,8 +3408,10 @@ async def admin_support_hold_private_dialog(call: CallbackQuery, state: FSMConte
     await state.clear()
     await state.update_data(contact_ticket_id=ticket_id, support_private_bridge=True)
     await state.set_state(AdminContactReply.message)
-    await call.message.answer(msg.support_private_admin_hold(user_label=user_label, ticket_no=_support_no(ticket_id)))
-    await call.answer('已保持这个对话。')
+    switch_tip = ''
+    if old_ticket_id and int(old_ticket_id) != int(ticket_id):
+        switch_tip = f'\n\n🔁 已从 {_support_no(old_ticket_id)} 切换到 {_support_no(ticket_id)}。'
+    await call.message.answer(msg.support_private_admin_hold(user_label=user_label, ticket_no=_support_no(ticket_id)) + switch_tip)
 
 
 @router.message(lambda message: bool(
@@ -3340,7 +3434,12 @@ async def admin_support_private_reply_to_user(message: Message, state: FSMContex
 async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     ticket_id = int(data.get('contact_ticket_id') or 0)
+    if message.chat and message.chat.type == 'private' and _is_support_private_admin(message.from_user.id) and not ticket_id:
+        ticket_id = int(await _get_support_admin_active_ticket_id(message.from_user.id) or 0)
     if bool(data.get('support_private_bridge')) or (message.chat and message.chat.type == 'private' and _is_support_private_admin(message.from_user.id)):
+        if not ticket_id and not message.reply_to_message:
+            await message.reply(msg.support_private_admin_active_missing())
+            return
         # 管理员私聊客服桥：如果当前消息是回复另一位用户的通知，则自动切换目标用户。
         reply_ticket_id = await _support_ticket_id_from_admin_reply_message(message) if message.reply_to_message else None
         await _send_support_private_bridge_reply(

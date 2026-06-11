@@ -28,6 +28,7 @@ from app.keyboards import (
     payment_order_keyboard,
     resource_upload_collect_keyboard,
     admin_resource_upload_done_keyboard,
+    resource_upload_preview_keyboard,
     description_collect_keyboard,
     resource_claim_keyboard,
     reimbursement_apply_keyboard,
@@ -287,6 +288,20 @@ def _filter_resource_items(items: list[dict], kind: str) -> list[dict]:
         return [x for x in items if x.get('type') in ('document', 'animation', 'copy')]
     return [x for x in items if x.get('type') == kind]
 
+
+
+
+def _resource_upload_preview_text(project: CrowdfundProject, items: list[dict], role: str) -> str:
+    counts = _resource_type_counts(items)
+    owner = '平台代购管理员' if role == 'admin' else '发起人'
+    return (
+        f'👀 上传前预览确认\n'
+        f'{project_label(project)}\n\n'
+        f'上传人：{owner}\n'
+        f'资源统计：{counts}\n'
+        f'总数：{len(items)}\n\n'
+        f'确认无误后再提交审核；如果发现漏传，请点“继续上传”。'
+    )
 
 def _upload_status_text(project: CrowdfundProject, items: list[dict], role: str) -> str:
     counts = _resource_counts(items)
@@ -1592,13 +1607,10 @@ async def collect_resource_upload(message: Message, state: FSMContext, bot: Bot)
 
 @router.callback_query(F.data.startswith('resource:finish:'))
 async def resource_upload_finish(call: CallbackQuery, state: FSMContext, bot: Bot):
-    from app.services.project_state import ProjectState, transition_project
+    '''上传完成按钮先进入预览确认，不再直接提交。'''
     project_id = int(call.data.split(':')[-1])
     data = await state.get_data()
-    sess_key = call.message.chat.id
     admin_sess = ADMIN_UPLOAD_SESSIONS.get(call.message.chat.id)
-
-    # 管理员平台代购上传允许走独立会话，不强依赖 FSM。
     if admin_sess and int(admin_sess.get('project_id') or 0) == project_id:
         role = 'admin'
     else:
@@ -1606,34 +1618,90 @@ async def resource_upload_finish(call: CallbackQuery, state: FSMContext, bot: Bo
             await call.answer('当前没有这个项目的上传会话，请先点击“上传资源”。', show_alert=True)
             return
         role = data.get('upload_role', 'creator')
-
     async with SessionLocal() as session:
         project = await session.get(CrowdfundProject, project_id)
         if not project:
             await call.answer('项目不存在', show_alert=True)
             return
-        # 媒体组上传后用户马上点完成时，可能还有几条图片/视频 update 正在排队处理。
-        # 等待一小段时间再读取，避免只提交第一张。
         await _wait_media_group_flush()
         await session.refresh(project)
         items = await _sync_admin_upload_session_to_project(session, project, call.message.chat.id) if role == 'admin' else _load_resource_items(project)
         if not items:
-            await call.answer('还没有收到资源，请先在本群发送资源内容。', show_alert=True)
+            await call.answer('还没有收到资源，请先发送资源内容。', show_alert=True)
             return
-        await transition_project(session, project, ProjectState.RESOURCE_SUBMITTED, reason='资源上传完成，提交审核', force=True)
+        await call.message.answer(
+            _resource_upload_preview_text(project, items, role),
+            reply_markup=resource_upload_preview_keyboard(project.id, role),
+        )
+    await call.answer('请先确认预览。')
+
+
+@router.callback_query(F.data.startswith('resource:continue:'))
+async def resource_upload_continue(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split(':')
+    project_id = int(parts[2])
+    role = parts[3] if len(parts) > 3 else 'creator'
+    if role != 'admin':
+        await state.update_data(project_id=project_id, upload_role=role)
+        await state.set_state(ResourceUploadCollect.resource)
+    await call.answer('可以继续发送资源。')
+
+
+@router.callback_query(F.data.startswith('resource:clear:'))
+async def resource_upload_clear(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split(':')
+    project_id = int(parts[2])
+    role = parts[3] if len(parts) > 3 else 'creator'
+    async with SessionLocal() as session:
+        project = await session.get(CrowdfundProject, project_id)
+        if not project:
+            await call.answer('项目不存在', show_alert=True)
+            return
+        project.resource_text = '[]'
+        await session.commit()
+    if role == 'admin':
+        for sess in (ADMIN_UPLOAD_SESSIONS.get(call.message.chat.id), ADMIN_UPLOAD_SESSIONS.get(settings.ADMIN_GROUP_ID)):
+            if sess and int(sess.get('project_id') or 0) == project_id:
+                sess['items'] = []
+                sess['ack'] = False
+    else:
+        await state.update_data(project_id=project_id, upload_role=role)
+        await state.set_state(ResourceUploadCollect.resource)
+    await call.message.answer('🧹 已清空本次资源，请重新上传。')
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('resource:submit:'))
+async def resource_upload_submit(call: CallbackQuery, state: FSMContext, bot: Bot):
+    from app.services.project_state import ProjectState, transition_project
+    parts = call.data.split(':')
+    project_id = int(parts[2])
+    role = parts[3] if len(parts) > 3 else 'creator'
+    async with SessionLocal() as session:
+        project = await session.get(CrowdfundProject, project_id)
+        if not project:
+            await call.answer('项目不存在', show_alert=True)
+            return
+        await _wait_media_group_flush()
+        await session.refresh(project)
+        items = await _sync_admin_upload_session_to_project(session, project, call.message.chat.id) if role == 'admin' else _load_resource_items(project)
+        if not items:
+            await call.answer('还没有收到资源，请先发送资源内容。', show_alert=True)
+            return
+        await transition_project(session, project, ProjectState.RESOURCE_SUBMITTED, reason='资源上传预览确认后提交审核', force=True)
         await session.commit()
         if role == 'admin':
             await call.message.answer(
-                f'✅ 平台代购资源已接收完成。\n{project_label(project)}\n分类：{_resource_type_counts(items)}\n\n请选择下一步：',
+                f'✅ 平台代购资源已确认提交。\n{project_label(project)}\n分类：{_resource_type_counts(items)}\n\n可以继续点“确认私发资源”。',
                 reply_markup=admin_resource_upload_done_keyboard(project.id),
             )
         else:
             await _send_resource_preview_to_admin(bot, project, items)
-            await call.message.answer('✅ 已完成上传，并提交管理审核。审核通过后会直接私发给所有已支付拼车用户。')
+            await call.message.answer('✅ 已确认提交管理审核。审核通过后会直接私发给所有已支付拼车用户。')
     if role == 'admin':
         ADMIN_UPLOAD_SESSIONS.pop(call.message.chat.id, None)
     await state.clear()
-    await call.answer()
+    await call.answer('已提交。')
 
 
 @router.callback_query(F.data.startswith('resource:view:'))

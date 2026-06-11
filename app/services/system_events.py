@@ -68,3 +68,26 @@ async def record_or_update_event(session: AsyncSession, event_type: str, message
     row.created_at = datetime.utcnow()
     await session.flush()
     return row
+
+
+async def record_exception_event(
+    session: AsyncSession,
+    where: str,
+    error: Exception,
+    *,
+    severity: str = 'error',
+    project_id: int | None = None,
+    user_id: int | None = None,
+    metadata: dict | None = None,
+) -> SystemEvent:
+    payload = dict(metadata or {})
+    payload.setdefault('error_type', type(error).__name__)
+    return await record_or_update_event(
+        session,
+        f'exception:{where}',
+        f'{where}: {error}',
+        severity=severity,
+        project_id=project_id,
+        user_id=user_id,
+        metadata=payload,
+    )
