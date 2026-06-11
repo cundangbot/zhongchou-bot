@@ -46,7 +46,7 @@ def admin_dashboard_text(*, pending_review: int, wait_upload: int, pending_payou
         f'💸 报销待确认：{pending_payout}\n'
         f'💰 提现待确认：{pending_withdraw}\n'
         f'🧾 退款小票：{pending_refunds}\n'
-        f'💬 客服小纸条：{support_open}\n'
+        f'💬 私聊客服会话：{support_open}\n'
         f'⚠️ 风控提醒：{risks}\n'
         f'🚨 系统异常：{unresolved_events}\n'
         f'{LINE}\n'
@@ -1091,7 +1091,7 @@ def admin_dashboard_text(*, pending_review: int, wait_upload: int, pending_payou
             f'💸 报销待确认：{pending_payout}',
             f'💰 提现待确认：{pending_withdraw}',
             f'🧾 退款小票：{pending_refunds}',
-            f'💬 客服小纸条：{support_open}',
+            f'💬 私聊客服会话：{support_open}',
             f'⚠️ 风控提醒：{risks}',
             f'🚨 系统异常：{unresolved_events}',
         ),
@@ -1609,7 +1609,7 @@ def support_ticket_user_status(*, ticket_no: str, status: str, user_message: str
     return _panel('💬 客服小纸条状态', body, tip)
 
 # ---------------------------------------------------------------------------
-# v1.6.1.0 用户侧客服入口外置到 @jingpinhybot
+# v1.6.1.0 曾临时外置客服入口（v1.6.1.2 默认已回到内置客服）
 # ---------------------------------------------------------------------------
 
 def support_external_redirect(*, bot_username: str, source: str = 'generic', ref_id: int | None = 0) -> str:
@@ -1622,7 +1622,7 @@ def support_external_redirect(*, bot_username: str, source: str = 'generic', ref
     }.get(source or 'generic', source or '通用客服入口')
     ref_line = f'关联编号：{int(ref_id or 0)}' if int(ref_id or 0) else '关联编号：-'
     return _panel(
-        '💬 联系小掌柜｜已切换到独立客服机器人',
+        '💬 联系小掌柜｜外部客服应急模式',
         _body(
             f'客服机器人：{bot_username}',
             f'来源页面：{source_label}',
@@ -1645,7 +1645,7 @@ def welcome() -> str:
             '🚗 发起众筹\n把你珍藏的博主和资源丢进来，小掌柜帮你审核发车，一步到位',
             '🔥 热门众筹\n看看大家正在拼什么好东西，心动就上车，不用犹豫',
             '📋 我的众筹\n车票、退款、报销、提现和资源都在这里，随时翻随时看',
-            '💬 联系小掌柜\n人工咨询统一打开独立客服机器人，不再走本机器人旧工单链路',
+            '💬 联系小掌柜\n人工咨询默认在本众筹机器人内生成客服小纸条',
         ),
         '💡 小掌柜温馨提醒\n付完款记得回来验票哦，验票成功才算真正坐上座位。退款、报销、提现这些业务申请仍在本机器人提交，提交后会进入审核群待办。',
     )
@@ -1655,7 +1655,7 @@ def admin_panel_startup() -> str:
     return _panel(
         '🛠 小掌柜待办中心',
         '待办数据正在加载中～',
-        '处理建议：先看待审核、待资源、退款/报销/提现和异常小雷达。人工咨询已外置到客服机器人；这里的「旧客服工单」只处理历史遗留单。',
+        '处理建议：先看待审核、待资源、退款/报销/提现和异常小雷达。人工咨询已回到内置客服中心；这里处理客服小纸条。',
     )
 
 
@@ -1675,11 +1675,11 @@ def admin_dashboard_text(*, pending_review: int, wait_upload: int, pending_payou
             f'💸 报销待确认：{pending_payout}',
             f'💰 提现待确认：{pending_withdraw}',
             f'🧾 退款小票：{pending_refunds}',
-            f'💬 旧客服工单：{support_open}',
+            f'💬 私聊客服会话：{support_open}',
             f'⚠️ 风控提醒：{risks}',
             f'🚨 系统异常：{unresolved_events}',
         ),
-        '边界说明：用户咨询走外部客服机器人；退款、报销、提现、资源审核、手动补票仍是本群业务待办，不会发到外部客服。',
+        '边界说明：用户咨询生成客服小纸条；退款、报销、提现、资源审核、手动补票仍是本群业务待办。',
     )
 
 
@@ -1693,7 +1693,7 @@ def support_external_redirect(*, bot_username: str, source: str = 'generic', ref
     }.get(source or 'generic', source or '通用客服入口')
     ref_line = f'关联编号：{int(ref_id or 0)}' if int(ref_id or 0) else '关联编号：-'
     return _panel(
-        '💬 联系小掌柜｜请打开独立客服机器人',
+        '💬 联系小掌柜｜外部客服应急模式',
         _body(
             f'客服机器人：{bot_username}',
             f'来源页面：{source_label}',
@@ -1720,7 +1720,7 @@ def refund_admin_new(*, refund_no: str, user_label: str, user_id: int, amount: f
     return _panel(
         f'💸 业务审核｜新退款小票 {refund_no}',
         _body(
-            '📌 类型：退款业务单（仍在审核群处理，不走外部客服机器人）',
+            '📌 类型：退款业务单（审核群处理，不是客服咨询）',
             '📌 状态：待确认退款',
             f'👤 用户：{user_label}',
             f'🆔 用户ID：{user_id}',
@@ -1734,7 +1734,7 @@ def refund_admin_new(*, refund_no: str, user_label: str, user_id: int, amount: f
             '📮 用户收款资料',
             payout_info,
         ),
-        '处理边界：这张卡片是业务审核单，请管理员在本审核群核对并点击「✅ 确认已退款」。用户如果只是补充说明，再引导去外部客服机器人。',
+        '处理边界：这张卡片是业务审核单，请管理员在本审核群核对并点击「✅ 确认已退款」。用户如果只是补充说明，可让用户点「联系小掌柜」生成客服小纸条。',
     )
 
 
@@ -1743,4 +1743,286 @@ def admin_search_help() -> str:
         '🔎 项目搜索｜小掌柜放大镜',
         '请直接回复这条消息发送关键词：\n• P.012：按项目编号搜索\n• VP开头系统单号：按验票单搜索\n• 用户数字ID：查用户车票/退款/历史客服\n• 博主名字：查相关项目',
         '搜索结果会带快捷按钮，可以一键打开项目卡片、查看已支付用户、待付车票、资源或历史客服工单。\n\n人工咨询已经外置到客服机器人，本搜索只查当前机器人内的业务数据。',
+    )
+
+# ---------------------------------------------------------------------------
+# v1.6.1.2 内置客服中心：用户和管理员都留在众筹机器人里。
+# ---------------------------------------------------------------------------
+
+def welcome() -> str:
+    return _panel(
+        '🎀 欢迎来到拼车小车库～',
+        _body(
+            '我是你的小掌柜，专门帮你把发车、上车、验票、收资源这些事儿打理得明明白白 ✨',
+            '你可以这样玩转小车库：',
+            '🚗 发起众筹\n把你珍藏的博主和资源丢进来，小掌柜帮你审核发车，一步到位',
+            '🔥 热门众筹\n看看大家正在拼什么好东西，心动就上车，不用犹豫',
+            '📋 我的众筹\n车票、退款、报销、提现和资源都在这里，随时翻随时看',
+            '💬 联系小掌柜\n直接在本众筹机器人里留言，管理员会在客服小纸条里回复你',
+        ),
+        '💡 小掌柜温馨提醒\n付完款记得回来验票哦，验票成功才算真正坐上座位。退款、报销、提现这些业务申请仍在本机器人提交，提交后会进入审核群待办。',
+    )
+
+
+def admin_panel_startup() -> str:
+    return _panel(
+        '🛠 小掌柜待办中心',
+        '待办数据正在加载中～',
+        '处理建议：先看业务审核，再看客服小纸条。退款/报销/提现是业务单，用户普通咨询是客服单，两个入口分开处理。',
+    )
+
+
+def admin_dashboard_text(*, pending_review: int, wait_upload: int, pending_payout: int, pending_withdraw: int,
+                         pending_refunds: int, support_open: int, risks: int, unresolved_events: int,
+                         new_projects: int | None = None, paid_orders: int | None = None,
+                         income: float | int | None = None, full_projects: int | None = None) -> str:
+    return _panel(
+        '🛠 小掌柜待办中心',
+        _body(
+            '今日小车库概览：',
+            f'🚗 新发车：{new_projects or 0} 辆｜🎟️ 已上车：{paid_orders or 0} 次',
+            f'💰 今日收入：{float(income or 0):g} 元｜🎉 满员：{full_projects or 0} 辆',
+            '🧺 审核群业务待办：',
+            f'📝 待审核车车：{pending_review}',
+            f'📤 待补/待审资源：{wait_upload}',
+            f'💸 报销待确认：{pending_payout}',
+            f'💰 提现待确认：{pending_withdraw}',
+            f'🧾 退款小票：{pending_refunds}',
+            '💬 内置客服：',
+            f'私聊客服会话：{support_open}',
+            f'⚠️ 风控提醒：{risks}',
+            f'🚨 系统异常：{unresolved_events}',
+        ),
+        '边界说明：用户咨询在本众筹机器人生成客服小纸条；退款、报销、提现、资源审核、手动补票仍是审核群业务待办，不能混在客服里处理。',
+    )
+
+
+def support_external_redirect(*, bot_username: str, source: str = 'generic', ref_id: int | None = 0) -> str:
+    source_label = {
+        'generic': '通用客服入口',
+        'error': '验票/支付异常入口',
+        'pending': '待付车票入口',
+        'refund': '退款详情入口',
+        'project': '项目详情入口',
+    }.get(source or 'generic', source or '通用客服入口')
+    ref_line = f'关联编号：{int(ref_id or 0)}' if int(ref_id or 0) else '关联编号：-'
+    return _panel(
+        '💬 联系小掌柜｜外部客服应急模式',
+        _body(
+            f'客服机器人：{bot_username}',
+            f'来源页面：{source_label}',
+            ref_line,
+            '当前仅在 SUPPORT_EXTERNAL_ONLY=true 时使用。正常模式下，咨询会直接回到本众筹机器人内置客服中心。',
+        ),
+        f'请点下方按钮打开 {bot_username}。',
+    )
+
+
+def support_external_only_notice(*, bot_username: str) -> str:
+    return _panel(
+        '💬 客服入口临时切到外部机器人',
+        _body(
+            f'人工咨询请打开：{bot_username}',
+            '这是应急配置 SUPPORT_EXTERNAL_ONLY=true 时才会出现的提示。',
+            '退款、报销、提现、补票、资源审核这些业务待办仍会正常发送到审核群。',
+        ),
+        '正常情况下可把 SUPPORT_EXTERNAL_ONLY 改回 false，让用户直接在众筹机器人里联系客服。',
+    )
+
+
+def refund_admin_new(*, refund_no: str, user_label: str, user_id: int, amount: float, payment_label: str, system_no: str, pay_no: str, project_no: str, blogger: str, description: str, payout_info: str) -> str:
+    return _panel(
+        f'💸 业务审核｜新退款小票 {refund_no}',
+        _body(
+            '📌 类型：退款业务单（审核群处理，不是客服咨询）',
+            '📌 状态：待确认退款',
+            f'👤 用户：{user_label}',
+            f'🆔 用户ID：{user_id}',
+            f'项目：{project_no}',
+            f'博主：{blogger}',
+            f'描述：{description}',
+            f'🎫 原车票：{payment_label}',
+            f'🔎 系统单号：{system_no}',
+            f'💳 支付单号：{pay_no}',
+            f'💰 应退金额：{amount:g} 元',
+            '📮 用户收款资料',
+            payout_info,
+        ),
+        '处理边界：这张卡片是业务审核单，请管理员在本审核群核对并点击「✅ 确认已退款」。用户只是补充说明时，可让用户点「联系小掌柜」生成客服小纸条。',
+    )
+
+
+def admin_search_help() -> str:
+    return _panel(
+        '🔎 项目搜索｜小掌柜放大镜',
+        '请直接回复这条消息发送关键词：\n• P.012：按项目编号搜索\n• VP开头系统单号：按验票单搜索\n• 用户数字ID：查用户车票/退款/客服\n• 博主名字：查相关项目',
+        '搜索结果会带快捷按钮，可以一键打开项目卡片、查看已支付用户、待付车票、资源或客服小纸条。\n\n客服咨询和业务审核都在众筹机器人里，但入口分开：客服走指定管理员私聊桥，退款/报销/提现看审核群业务列表。',
+    )
+
+# ---------------------------------------------------------------------------
+# v1.6.1.3 内置私聊客服桥
+# 用户消息直接同步到 SUPPORT_ADMIN_ID 私聊；管理员回复对应消息即可回给用户。
+# ---------------------------------------------------------------------------
+
+def support_open() -> str:
+    return _panel(
+        '💬 小掌柜私聊窗口已打开～',
+        _body(
+            '你已经进入客服对话状态。',
+            '接下来直接发送文字、截图、文件、视频或语音就可以，小掌柜会在自己的机器人私聊里收到。',
+            '不用一条消息点一次按钮，也不会再把人工咨询发到审核群。',
+        ),
+        '想结束时点「结束联系客服」，或发送“结束客服”。',
+    )
+
+
+def support_user_confirm(ticket_no: str) -> str:
+    return (
+        f'✅ 已发送给小掌柜（{ticket_no}）\n'
+        '可以继续直接补充消息；小掌柜回复会出现在当前机器人私聊里。'
+    )
+
+
+def support_user_reply(ticket_no: str, reply_text: str | None = None) -> str:
+    # 旧审核群回复链路仍会调用这个函数；私聊桥新链路会原样发送管理员内容。
+    return _panel(
+        f'💬 小掌柜回复（{ticket_no}）',
+        reply_text or '小掌柜给你发来了一条回复。',
+        '有需要可以继续补充消息，小掌柜会接着看～',
+    )
+
+
+def support_user_closed() -> str:
+    return _panel(
+        '✅ 客服对话已结束',
+        '本次和小掌柜的对话已经关闭。',
+        '后面还有问题，可以再次点「联系小掌柜」重新打开对话。',
+    )
+
+
+def support_private_user_forward_failed(*, error: object) -> str:
+    return _panel(
+        '⚠️ 暂时没有成功转给小掌柜',
+        f'失败原因：{error}',
+        '你还停留在客服对话里，可以稍后再发一次；也请检查 SUPPORT_ADMIN_ID 是否已配置并且管理员已经打开过本机器人。',
+    )
+
+
+def support_private_admin_incoming_header(*, ticket_no: str, user_label: str, user_id: int, context_text: str, message_kind: str) -> str:
+    return (
+        f'💬 客服对话 {ticket_no}\n'
+        f'👤 用户：{user_label}（{user_id}）\n'
+        f'类型：{message_kind}\n'
+        f'{context_text or "来源页面：通用客服入口"}'
+    )
+
+
+def support_private_admin_text(*, header: str, user_message: str) -> str:
+    return (
+        f'{header}\n\n'
+        f'用户说：\n{user_message or "-"}\n\n'
+        '回复这条消息即可发回给该用户；点「保持这个对话」后可连续直接输入回复。'
+    )
+
+
+def support_private_admin_caption(*, header: str, user_caption: str | None = None) -> str:
+    caption = f'{header}\n\n'
+    if user_caption:
+        caption += f'用户说明：\n{user_caption}\n\n'
+    caption += '回复这条消息即可发回给该用户。'
+    return caption
+
+
+def support_private_admin_hold(*, user_label: str, ticket_no: str) -> str:
+    return (
+        f'📌 已保持对话 {ticket_no}\n'
+        f'当前回复对象：{user_label}\n\n'
+        '现在你直接发送文字、图片、文件、视频或语音，都会发给这个用户。\n'
+        '如果有别的用户进来，直接回复那位用户的消息，就会自动切换过去。'
+    )
+
+
+def support_private_admin_sent(*, user_label: str, ticket_no: str, delivery_method: str | None = None) -> str:
+    method_line = f'｜{delivery_method}' if delivery_method else ''
+    return f'✅ 已发送给 {user_label}（{ticket_no}）{method_line}'
+
+
+def support_private_admin_failed(*, user_label: str, ticket_no: str, error: object) -> str:
+    return (
+        f'❌ 没有发送成功给 {user_label}（{ticket_no}）\n'
+        f'原因：{error}\n'
+        '这个对话还保持着，可以处理后重新发送。'
+    )
+
+
+# ---------------------------------------------------------------------------
+# v1.6.1.4 管理员私聊会话中心增强
+# ---------------------------------------------------------------------------
+
+def support_user_closed_by_admin() -> str:
+    return _panel(
+        '✅ 您的对话已结束',
+        _body(
+            '小掌柜已经结束了本次客服对话。',
+            '这次问题如果已经处理好，可以去热门众筹瞧瞧看看～',
+            '后续还有新问题，也可以再次点「联系小掌柜」重新打开对话。',
+        ),
+        '小掌柜提醒：退款、报销、提现等业务进度仍然可以在「我的众筹」里查看。',
+    )
+
+
+def support_private_admin_closed(*, user_label: str, ticket_no: str, notify_error: object | None = None) -> str:
+    if notify_error:
+        return (
+            f'✅ 已结束客服对话 {ticket_no}\n'
+            f'用户：{user_label}\n\n'
+            f'⚠️ 但通知用户失败：{notify_error}'
+        )
+    return f'✅ 已结束客服对话 {ticket_no}\n用户：{user_label}\n已通知用户本次对话结束。'
+
+
+def support_private_admin_switched_from_business(*, ticket_no: str, user_label: str, user_id: int, source_label: str, detail: str) -> str:
+    return (
+        f'💬 已切到用户对话 {ticket_no}\n'
+        f'👤 用户：{user_label}（{user_id}）\n'
+        f'来源：{source_label}\n'
+        f'{detail or "-"}\n\n'
+        '你可以直接回复这条消息，也可以点「保持这个对话」后连续发送。\n'
+        '审核群继续处理退款、报销、提现等业务动作；沟通内容统一放在这里。'
+    )
+
+
+def support_private_admin_active_missing() -> str:
+    return (
+        '⚠️ 当前没有保持中的客服对话。\n\n'
+        '你可以：\n'
+        '1. 回复某条带 S.xxx 的用户消息；\n'
+        '2. 在退款/报销/提现审核卡片里点「切到用户对话」；\n'
+        '3. 等用户从「联系小掌柜」进入客服。'
+    )
+
+
+# 覆盖旧待办中心说明：客服交流统一在管理员私聊，审核群只保留业务审核。
+def admin_dashboard_text(*, pending_review: int, wait_upload: int, pending_payout: int, pending_withdraw: int,
+                         pending_refunds: int, support_open: int, risks: int, unresolved_events: int,
+                         new_projects: int | None = None, paid_orders: int | None = None,
+                         income: float | int | None = None, full_projects: int | None = None) -> str:
+    return _panel(
+        '🛠 小掌柜待办中心',
+        _body(
+            '今日小车库概览：',
+            f'🚗 新发车：{new_projects or 0} 辆｜🎟️ 已上车：{paid_orders or 0} 次',
+            f'💰 今日收入：{float(income or 0):g} 元｜🎉 满员：{full_projects or 0} 辆',
+            '🧺 审核群业务待办：',
+            f'📝 待审核车车：{pending_review}',
+            f'📤 待补/待审资源：{wait_upload}',
+            f'💸 报销待确认：{pending_payout}',
+            f'💰 提现待确认：{pending_withdraw}',
+            f'🧾 退款小票：{pending_refunds}',
+            '💬 管理员私聊客服：',
+            f'进行中/历史会话：{support_open}',
+            f'⚠️ 风控提醒：{risks}',
+            f'🚨 系统异常：{unresolved_events}',
+        ),
+        '边界说明：审核群只处理退款、报销、提现、资源、补票等业务动作；凡是需要和用户来回沟通的内容，统一切到 SUPPORT_ADMIN_ID 的私聊客服窗口。',
     )

@@ -9,7 +9,7 @@ from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, InputMediaPhoto, InputMediaVideo, InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
-from sqlalchemy import select, func, case, or_, cast, String, text
+from sqlalchemy import select, func, case, or_, cast, String, text, update
 
 from aiogram.exceptions import TelegramBadRequest
 
@@ -22,7 +22,7 @@ from app.services.telegram_direct import (
 
 from app.config import get_settings, ENV_FILE
 from app.db.base import SessionLocal
-from app.db.models import PaymentOrder, CrowdfundProject, ProfitWithdrawal, ResourceAccess, RiskLog, UserBlacklist, RefundRecord, ContactTicket, ResourceClaimProgress, FinancialLedger, SystemEvent, SystemMetric, ProjectStateHistory
+from app.db.models import PaymentOrder, CrowdfundProject, ProfitWithdrawal, ResourceAccess, RiskLog, UserBlacklist, RefundRecord, ContactTicket, SupportBridgeMessage, SupportAdminSession, ResourceClaimProgress, FinancialLedger, SystemEvent, SystemMetric, ProjectStateHistory
 from app.keyboards import (
     main_menu,
     order_center_keyboard,
@@ -48,6 +48,10 @@ from app.keyboards import (
     support_start_keyboard,
     contact_admin_keyboard,
     contact_answered_keyboard,
+    support_private_admin_keyboard,
+    support_admin_switch_keyboard,
+    support_closed_by_admin_keyboard,
+    support_private_user_keyboard,
     contact_back_keyboard,
     support_ticket_user_keyboard,
     external_support_keyboard,
@@ -122,6 +126,29 @@ def _payout_no(value: int | None) -> str:
 
 def _support_no(value: int | None) -> str:
     return f'S.{int(value or 0):03d}'
+
+
+def _support_private_admin_id() -> int | None:
+    """客服私聊桥的唯一管理员。SUPPORT_ADMIN_ID=0 时取 ADMIN_IDS 第一个。"""
+    configured = int(getattr(settings, 'SUPPORT_ADMIN_ID', 0) or 0)
+    if configured:
+        return configured
+    return int(settings.admin_id_list[0]) if settings.admin_id_list else None
+
+
+def _is_support_private_admin(user_id: int | None) -> bool:
+    admin_id = _support_private_admin_id()
+    return bool(admin_id and user_id and int(user_id) == int(admin_id))
+
+
+def _support_context_source_label(source: str | None) -> str:
+    return {
+        'generic': '通用客服入口',
+        'error': '验票/支付异常入口',
+        'pending': '待付车票入口',
+        'refund': '退款详情入口',
+        'project': '项目详情入口',
+    }.get(source or 'generic', source or '通用客服入口')
 
 
 def _message_has_media_payload(message: Message) -> bool:
@@ -338,6 +365,337 @@ async def _mark_support_delivery_failed(ticket_id: int, error_text: str) -> None
             ticket.status = 'open'
             ticket.last_error = error_text[:1800]
             await session.commit()
+
+
+async def _record_support_bridge_message(
+    *,
+    ticket_id: int,
+    user_id: int,
+    admin_id: int,
+    admin_chat_id: int | None,
+    admin_message_id: int,
+    user_message_id: int | None,
+    direction: str = 'user_to_admin',
+) -> None:
+    async with SessionLocal() as session:
+        session.add(SupportBridgeMessage(
+            ticket_id=int(ticket_id),
+            user_id=int(user_id),
+            admin_id=int(admin_id),
+            admin_chat_id=int(admin_chat_id) if admin_chat_id else None,
+            admin_message_id=int(admin_message_id),
+            user_message_id=int(user_message_id) if user_message_id else None,
+            direction=direction,
+        ))
+        try:
+            await session.commit()
+        except Exception:
+            # 同一条管理员消息重复记录时不影响客服主流程。
+            await session.rollback()
+
+
+
+async def _set_support_admin_active_session(
+    *,
+    admin_id: int,
+    ticket_id: int,
+    user_id: int,
+    source: str | None = None,
+    ref_id: int | None = None,
+) -> None:
+    """记录管理员当前保持的私聊客服对象，避免 FSM 状态丢失造成回复找不到用户。"""
+    async with SessionLocal() as session:
+        res = await session.execute(select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id)).limit(1))
+        active = res.scalar_one_or_none()
+        if active:
+            active.ticket_id = int(ticket_id)
+            active.user_id = int(user_id)
+            active.source = source
+            active.ref_id = int(ref_id) if ref_id else None
+            active.updated_at = datetime.utcnow()
+        else:
+            session.add(SupportAdminSession(
+                admin_id=int(admin_id),
+                ticket_id=int(ticket_id),
+                user_id=int(user_id),
+                source=source,
+                ref_id=int(ref_id) if ref_id else None,
+            ))
+        await session.commit()
+
+
+async def _get_support_admin_active_ticket_id(admin_id: int) -> int | None:
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(SupportAdminSession)
+            .where(SupportAdminSession.admin_id == int(admin_id))
+            .order_by(SupportAdminSession.updated_at.desc())
+            .limit(1)
+        )
+        active = res.scalar_one_or_none()
+        if not active:
+            return None
+        ticket = await session.get(ContactTicket, int(active.ticket_id))
+        if not ticket or ticket.status == 'closed':
+            await session.delete(active)
+            await session.commit()
+            return None
+        return int(active.ticket_id)
+
+
+async def _clear_support_admin_active_session(admin_id: int, ticket_id: int | None = None) -> None:
+    async with SessionLocal() as session:
+        q = select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id))
+        if ticket_id:
+            q = q.where(SupportAdminSession.ticket_id == int(ticket_id))
+        rows = list((await session.execute(q)).scalars().all())
+        for row in rows:
+            await session.delete(row)
+        if rows:
+            await session.commit()
+
+
+async def _support_ticket_id_from_admin_message_id(admin_id: int, admin_message_id: int) -> int | None:
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(SupportBridgeMessage)
+            .where(
+                SupportBridgeMessage.admin_id == int(admin_id),
+                SupportBridgeMessage.admin_message_id == int(admin_message_id),
+            )
+            .order_by(SupportBridgeMessage.created_at.desc())
+            .limit(1)
+        )
+        item = res.scalar_one_or_none()
+        return int(item.ticket_id) if item else None
+
+
+async def _support_active_ticket_for_user(session, user_id: int) -> ContactTicket | None:
+    res = await session.execute(
+        select(ContactTicket)
+        .where(ContactTicket.user_id == int(user_id), ContactTicket.status.in_(['open', 'answered']))
+        .order_by(ContactTicket.created_at.desc())
+        .limit(1)
+    )
+    return res.scalar_one_or_none()
+
+
+async def _open_or_reuse_support_ticket_for_business(
+    session,
+    *,
+    user_id: int,
+    username: str | None = None,
+    source_page: str = 'generic',
+    project_id: int | None = None,
+    order_id: int | None = None,
+    refund_id: int | None = None,
+    context_text: str = '',
+) -> ContactTicket:
+    ticket = await _support_active_ticket_for_user(session, int(user_id))
+    context = {
+        'source_page': source_page,
+        'project_id': project_id,
+        'order_id': order_id,
+        'refund_id': refund_id,
+        'context_text': context_text,
+    }
+    if ticket and ticket.status != 'closed':
+        ticket.status = 'open'
+        ticket.username = username or ticket.username
+        ticket.source_page = source_page or ticket.source_page
+        ticket.project_id = project_id or ticket.project_id
+        ticket.order_id = order_id or ticket.order_id
+        ticket.refund_id = refund_id or ticket.refund_id
+        ticket.context_json = json.dumps(context, ensure_ascii=False)
+        ticket.last_error = None
+        await session.commit()
+        await session.refresh(ticket)
+        return ticket
+    ticket = ContactTicket(
+        user_id=int(user_id),
+        username=username,
+        status='open',
+        user_message=f'管理员从{_support_context_source_label(source_page)}切入对话',
+        source_page=source_page,
+        project_id=project_id,
+        order_id=order_id,
+        refund_id=refund_id,
+        context_json=json.dumps(context, ensure_ascii=False),
+    )
+    session.add(ticket)
+    await session.commit()
+    await session.refresh(ticket)
+    return ticket
+
+
+def _support_user_display(user_id: int, username: str | None = None) -> str:
+    return username or str(user_id)
+
+
+async def _copy_support_user_message_to_admin(
+    bot: Bot,
+    *,
+    admin_id: int,
+    ticket: ContactTicket,
+    user_message: Message,
+    context_text: str,
+) -> int | None:
+    """把用户消息同步到客服管理员私聊，并返回管理员侧那条消息 ID。"""
+    user_label = ticket.username or str(ticket.user_id)
+    ticket_no = _support_no(ticket.id)
+    plain_text = (user_message.text or user_message.caption or '').strip()
+    header = msg.support_private_admin_incoming_header(
+        ticket_no=ticket_no,
+        user_label=user_label,
+        user_id=int(ticket.user_id),
+        context_text=context_text or '来源页面：通用客服入口',
+        message_kind=_support_reply_kind(user_message),
+    )
+    keyboard = support_private_admin_keyboard(ticket.id)
+
+    if not _message_has_media_payload(user_message):
+        sent = await bot.send_message(
+            admin_id,
+            msg.support_private_admin_text(header=header, user_message=plain_text),
+            reply_markup=keyboard,
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+        return sent.message_id
+
+    caption = msg.support_private_admin_caption(header=header, user_caption=plain_text)
+    try:
+        copied = await bot.copy_message(
+            admin_id,
+            user_message.chat.id,
+            user_message.message_id,
+            caption=caption[:1024],
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+        return getattr(copied, 'message_id', None)
+    except Exception:
+        # 部分消息类型不支持改 caption，改成先发路由头，再原样复制。管理员回复路由头或复制消息都尽量能识别。
+        header_msg = await bot.send_message(
+            admin_id,
+            header + '\n\n请回复这条消息，或点「保持这个对话」后直接输入回复。',
+            reply_markup=keyboard,
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+        try:
+            copied = await bot.copy_message(admin_id, user_message.chat.id, user_message.message_id)
+            copied_id = getattr(copied, 'message_id', None)
+            if copied_id:
+                await _record_support_bridge_message(
+                    ticket_id=ticket.id, user_id=ticket.user_id, admin_id=admin_id,
+                    admin_chat_id=admin_id, admin_message_id=int(copied_id),
+                    user_message_id=user_message.message_id, direction='user_to_admin',
+                )
+        except Exception:
+            pass
+        return header_msg.message_id
+
+
+async def _deliver_support_private_bridge_reply(
+    bot: Bot,
+    *,
+    user_id: int,
+    message: Message,
+    reply_text: str,
+    has_media: bool,
+) -> str:
+    """管理员私聊桥回复：尽量原样发给用户，不再包一层客服工单卡片。"""
+    mode = (settings.SUPPORT_DELIVERY_MODE or 'direct_http').strip().lower()
+    if has_media:
+        try:
+            await copy_message_direct(user_id, message.chat.id, message.message_id)
+            return '原生 Bot API HTTP 通道'
+        except Exception as direct_error:
+            if mode == 'direct_only' or not settings.SUPPORT_DELIVERY_FALLBACK_TO_AIOGRAM:
+                raise
+            await bot.copy_message(user_id, message.chat.id, message.message_id)
+            return f'aiogram 兜底通道（原生接口失败后切换；原错误：{direct_error}）'
+
+    try:
+        await send_message_direct(user_id, reply_text)
+        return '原生 Bot API HTTP 通道'
+    except Exception as direct_error:
+        if mode == 'direct_only' or not settings.SUPPORT_DELIVERY_FALLBACK_TO_AIOGRAM:
+            raise
+        await bot.send_message(user_id, reply_text, parse_mode=None, disable_web_page_preview=True)
+        return f'aiogram 兜底通道（原生接口失败后切换；原错误：{direct_error}）'
+
+
+async def _send_support_private_bridge_reply(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    ticket_id: int,
+    clear_state: bool = False,
+) -> None:
+    """客服管理员在机器人私聊里回复用户。"""
+    if not _is_support_private_admin(message.from_user.id):
+        return
+    reply_text = (message.text or message.caption or '').strip()
+    has_media = _message_has_media_payload(message)
+    if not reply_text and not has_media:
+        await message.reply('❌ 回复内容不能为空，请发送文字、图片、视频、文件或语音。')
+        return
+
+    async with SessionLocal() as session:
+        ticket = await session.get(ContactTicket, int(ticket_id))
+        if not ticket or ticket.status == 'closed':
+            await message.reply('❌ 这个客服对话不存在或已结束。')
+            if clear_state:
+                await state.clear()
+            return
+        user_id = int(ticket.user_id)
+        user_label = ticket.username or str(ticket.user_id)
+
+    await _set_support_admin_active_session(
+        admin_id=message.from_user.id,
+        ticket_id=int(ticket_id),
+        user_id=user_id,
+        source='private_reply',
+        ref_id=int(ticket_id),
+    )
+
+    try:
+        delivery_method = await _deliver_support_private_bridge_reply(
+            bot, user_id=user_id, message=message, reply_text=reply_text, has_media=has_media
+        )
+        answered_at = datetime.utcnow()
+        async with SessionLocal() as session:
+            ticket = await session.get(ContactTicket, int(ticket_id))
+            if ticket and ticket.status != 'closed':
+                ticket.status = 'answered'
+                ticket.admin_id = message.from_user.id
+                ticket.admin_reply = reply_text or f'见下方消息/附件（{_support_reply_kind(message)}）'
+                ticket.answered_at = answered_at
+                ticket.last_error = None
+                await session.commit()
+        await state.update_data(contact_ticket_id=int(ticket_id), support_private_bridge=True)
+        await state.set_state(AdminContactReply.message)
+        await message.reply(msg.support_private_admin_sent(user_label=user_label, ticket_no=_support_no(ticket_id), delivery_method=delivery_method))
+    except Exception as e:
+        friendly_error = _friendly_support_delivery_error(e)
+        await _mark_support_delivery_failed(int(ticket_id), friendly_error)
+        await message.reply(msg.support_private_admin_failed(user_label=user_label, ticket_no=_support_no(ticket_id), error=friendly_error))
+    finally:
+        if clear_state:
+            await state.clear()
+
+
+async def _support_ticket_id_from_admin_reply_message(message: Message) -> int | None:
+    reply = getattr(message, 'reply_to_message', None)
+    if not reply or not message.from_user:
+        return None
+    ticket_id = await _support_ticket_id_from_admin_message_id(message.from_user.id, reply.message_id)
+    if ticket_id:
+        return ticket_id
+    return _extract_support_ticket_id(reply.text or reply.caption or '')
 
 
 async def _update_support_card_after_reply(
@@ -1575,7 +1933,7 @@ async def collect_withdraw_info(message: Message, state: FSMContext, bot: Bot):
         if payout_type == 'reimbursement':
             admin_text = (
                 f'💰 业务审核｜发起人报销申请\n'
-                f'类型：报销业务单（仍在审核群处理，不走外部客服机器人）\n'
+                f'类型：报销业务单（审核群处理，不是客服咨询）\n'
                 f'{title}\n'
                 f'申请人：{applicant}\n'
                 f'报销单：{_payout_no(w.id)}\n'
@@ -1587,7 +1945,7 @@ async def collect_withdraw_info(message: Message, state: FSMContext, bot: Bot):
         else:
             admin_text = (
                 f'💰 业务审核｜发起人提现申请\n'
-                f'类型：提现业务单（仍在审核群处理，不走外部客服机器人）\n'
+                f'类型：提现业务单（审核群处理，不是客服咨询）\n'
                 f'{title}\n'
                 f'申请人：{applicant}\n'
                 f'提现单：{_payout_no(w.id)}\n'
@@ -1752,7 +2110,7 @@ async def admin_reject_withdraw(call: CallbackQuery, bot: Bot):
         try:
             await bot.send_message(
                 w.creator_id,
-                f'❌ {label} {_payout_no(w.id)} 已被管理员驳回。若需要补充说明，请打开外部客服机器人联系小掌柜。',
+                f'❌ {label} {_payout_no(w.id)} 已被管理员驳回。若需要补充说明，请在「我的众筹」里点联系小掌柜。',
             )
         except Exception as exc:
             notify_error = exc
@@ -2359,7 +2717,10 @@ async def admin_dashboard_list(call: CallbackQuery):
                     p = await session.get(CrowdfundProject, w.project_id)
                     label = '报销' if (getattr(w, 'payout_type', 'profit') or 'profit') == 'reimbursement' else '提现'
                     lines.append(f'\n{label}单：{_payout_no(w.id)}\n项目：P.{int(w.project_id or 0):03d}\n博主：{p.blogger if p else "-"}\n描述：{p.description if p else "-"}\n申请人：{w.creator_id}\n金额：{w.creator_amount:g} 元')
-                    rows.append([InlineKeyboardButton(text=f'✅ 确认 {label} {_payout_no(w.id)}', callback_data=f'admin:withdraw_paid:{w.id}')])
+                    rows.append([
+                        InlineKeyboardButton(text=f'✅ 确认 {label} {_payout_no(w.id)}', callback_data=f'admin:withdraw_paid:{w.id}'),
+                        InlineKeyboardButton(text='💬 对话', callback_data=f'admin:support_link:payout:{w.id}'),
+                    ])
                 rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2388,7 +2749,10 @@ async def admin_dashboard_list(call: CallbackQuery):
                         status=_refund_status_label(r.status),
                     ))
                     if r.status == 'pending_admin':
-                        rows.append([InlineKeyboardButton(text=f'✅ 确认退款 {_refund_no(r.id)}', callback_data=f'admin:refund_done:{r.id}')])
+                        rows.append([
+                            InlineKeyboardButton(text=f'✅ 确认退款 {_refund_no(r.id)}', callback_data=f'admin:refund_done:{r.id}'),
+                            InlineKeyboardButton(text='💬 对话', callback_data=f'admin:support_link:refund:{r.id}'),
+                        ])
                 rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2401,17 +2765,17 @@ async def admin_dashboard_list(call: CallbackQuery):
             )
             tickets = list(res.scalars().all())
             if not tickets:
-                text = '💬 暂无历史内置客服工单～\n\n人工咨询已经切换到外部客服机器人；这里仅保留旧版本遗留工单。'
+                text = '💬 暂无客服小纸条～\n\n用户点「联系小掌柜」后，会在这里生成客服小纸条；退款、报销、提现仍在各自业务列表处理。'
                 markup = admin_dashboard_keyboard()
             else:
-                lines = ['💬 今日历史内置客服工单', '说明：新人工咨询不再进入这里；退款/报销/提现仍在对应业务列表处理。']
+                lines = ['💬 今日客服小纸条', '说明：这里只处理用户人工咨询；退款/报销/提现仍在对应业务列表处理。']
                 rows = []
                 for t in tickets:
                     user_label = t.username or str(t.user_id)
                     status_label = {'open': '待回复', 'answered': '已回复', 'closed': '已关闭'}.get(t.status, t.status)
                     body = (t.user_message or '非文本消息')[:120]
                     lines.append(f'\n工单：{_support_no(t.id)}｜{status_label}\n用户：{user_label}（{t.user_id}）\n时间：{t.created_at:%Y-%m-%d %H:%M}\n内容：{body}')
-                    rows.append([InlineKeyboardButton(text=f'💬 回复旧工单 {_support_no(t.id)}', callback_data=f'admin:support_reply:{t.id}')])
+                    rows.append([InlineKeyboardButton(text=f'💬 回复用户 {_support_no(t.id)}', callback_data=f'admin:support_reply:{t.id}')])
                     rows.append([InlineKeyboardButton(text=f'✅ 关闭 {_support_no(t.id)}', callback_data=f'admin:support_close:{t.id}')])
                 rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
                 text = '\n'.join(lines)
@@ -2557,41 +2921,212 @@ async def admin_dashboard_callback(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith('support:start'))
 async def support_start_callback(call: CallbackQuery, state: FSMContext):
-    """兼容旧按钮：用户侧客服入口已经外置到 @jingpinhybot。
+    """众筹机器人内置私聊客服桥入口。
 
-    新版本键盘全部使用 URL 按钮，不会再进入本机工单状态机；
-    这里仅处理旧消息里残留的 support:start:* callback。
+    用户点「联系小掌柜」后进入持续客服对话态；消息不再发审核群，
+    而是直接同步到 SUPPORT_ADMIN_ID 的机器人私聊。管理员回复对应消息即可回给用户。
     """
     parts = (call.data or 'support:start:generic:0').split(':')
     source = parts[2] if len(parts) > 2 else 'generic'
     ref_id = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+
+    if bool(settings.SUPPORT_EXTERNAL_ONLY):
+        await state.clear()
+        await _edit_panel(
+            call,
+            msg.support_external_redirect(
+                bot_username=support_bot_display_name(),
+                source=source,
+                ref_id=ref_id,
+            ),
+            reply_markup=external_support_keyboard(source, ref_id, back_callback='orders:center'),
+        )
+        await call.answer('客服入口已临时切到外部机器人，请点按钮打开。')
+        return
+
+    admin_id = _support_private_admin_id()
+    if bool(getattr(settings, 'SUPPORT_PRIVATE_BRIDGE_ENABLED', True)) and not admin_id:
+        await call.answer('客服管理员还没有配置，请稍后再试。', show_alert=True)
+        return
+
+    context = {
+        'source_page': source,
+        'project_id': None,
+        'order_id': None,
+        'refund_id': None,
+        'last_error': None,
+        'context_text': f'来源页面：{_support_context_source_label(source)}',
+    }
+    default_label = "项目：-\n博主：-\n描述：-"
+    async with SessionLocal() as session:
+        if await _is_blacklisted(session, call.from_user.id):
+            await call.answer('你的账号暂时被限制使用。', show_alert=True)
+            return
+        if source in ('pending', 'error') and ref_id:
+            order = await session.get(PaymentOrder, ref_id)
+            if order and order.user_id == call.from_user.id:
+                project = await session.get(CrowdfundProject, order.project_id) if order.project_id else None
+                context.update(order_id=order.id, project_id=order.project_id, last_error=order.fail_reason)
+                context['context_text'] = (
+                    f'来源页面：待付/异常车票\n'
+                    f'{project_label(project) if project else default_label}\n'
+                    f'车票：{_ticket_no(order.id)}\n用户：{call.from_user.id}\n'
+                    f'当前状态：{order.status}\n最近错误：{order.fail_reason or "-"}'
+                )
+        elif source == 'refund' and ref_id:
+            refund = await session.get(RefundRecord, ref_id)
+            if refund and refund.user_id == call.from_user.id:
+                project = await session.get(CrowdfundProject, refund.project_id)
+                context.update(refund_id=refund.id, order_id=refund.order_id, project_id=refund.project_id)
+                context['context_text'] = (
+                    f'来源页面：退款详情\n{project_label(project) if project else default_label}\n'
+                    f'退款单：{_refund_no(refund.id)}\n用户：{call.from_user.id}\n当前状态：{_refund_status_label(refund.status)}'
+                )
+        elif source == 'project' and ref_id:
+            project = await session.get(CrowdfundProject, ref_id)
+            if project:
+                context.update(project_id=project.id)
+                context['context_text'] = f'来源页面：项目详情\n{project_label(project)}\n用户：{call.from_user.id}\n当前状态：{_status_label(project.status)}'
+
+        # 若用户已有未关闭会话，继续沿用，避免每条消息都变成一张新工单。
+        ticket = await _support_active_ticket_for_user(session, call.from_user.id)
+        if ticket:
+            context['ticket_id'] = ticket.id
+
     await state.clear()
-    await _edit_panel(
-        call,
-        msg.support_external_redirect(
-            bot_username=support_bot_display_name(),
-            source=source,
-            ref_id=ref_id,
-        ),
-        reply_markup=external_support_keyboard(source, ref_id, back_callback='orders:center'),
-    )
-    await call.answer('客服入口已切换到独立双向机器人，请点按钮打开。')
+    await state.update_data(contact_context=context, contact_ticket_id=context.get('ticket_id'), support_private_bridge_user=True)
+    await state.set_state(ContactSupport.message)
+    await _edit_panel(call, msg.support_open(), reply_markup=support_private_user_keyboard())
+    await call.answer('客服对话已打开，直接发消息即可。')
+
+
+@router.callback_query(F.data == 'support:end')
+async def support_end_callback(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    ticket_id = int(data.get('contact_ticket_id') or 0)
+    if ticket_id:
+        async with SessionLocal() as session:
+            ticket = await session.get(ContactTicket, ticket_id)
+            if ticket and int(ticket.user_id) == int(call.from_user.id) and ticket.status != 'closed':
+                ticket.status = 'closed'
+                ticket.closed_at = datetime.utcnow()
+                await session.commit()
+        admin_id = _support_private_admin_id()
+        if admin_id:
+            await _clear_support_admin_active_session(admin_id, ticket_id)
+            try:
+                await bot.send_message(admin_id, f'ℹ️ 用户已主动结束客服对话 {_support_no(ticket_id)}。')
+            except Exception:
+                pass
+    await state.clear()
+    await _edit_panel(call, msg.support_user_closed(), reply_markup=order_center_keyboard())
+    await call.answer('已结束客服对话。')
 
 
 @router.message(ContactSupport.message)
 async def collect_support_message(message: Message, state: FSMContext, bot: Bot):
-    """旧内置客服状态兼容处理。
+    """用户客服私聊桥：用户消息直接同步到指定客服管理员私聊，不进审核群。"""
+    if bool(settings.SUPPORT_EXTERNAL_ONLY):
+        await state.clear()
+        await message.answer(
+            msg.support_external_only_notice(bot_username=support_bot_display_name()),
+            reply_markup=external_support_keyboard('generic', 0, back_callback='orders:center'),
+        )
+        return
 
-    v1.6.1.1 起，新用户咨询不再在当前机器人生成 ContactTicket，也不再把普通咨询消息发审核群。
-    这样可以明确分层：
-    - 人工咨询：统一去外部双向客服机器人；
-    - 退款、报销、提现、补票、资源审核：仍由当前机器人产生业务待办并发送到审核群。
-    """
-    await state.clear()
-    await message.answer(
-        msg.support_external_only_notice(bot_username=support_bot_display_name()),
-        reply_markup=external_support_keyboard('generic', 0, back_callback='orders:center'),
-    )
+    if (message.text or '').strip() in {'退出客服', '结束客服', '/end_support', '/support_end'}:
+        data = await state.get_data()
+        ticket_id = int(data.get('contact_ticket_id') or 0)
+        if ticket_id:
+            async with SessionLocal() as session:
+                ticket = await session.get(ContactTicket, ticket_id)
+                if ticket and int(ticket.user_id) == int(message.from_user.id) and ticket.status != 'closed':
+                    ticket.status = 'closed'
+                    ticket.closed_at = datetime.utcnow()
+                    await session.commit()
+            admin_id = _support_private_admin_id()
+            if admin_id:
+                await _clear_support_admin_active_session(admin_id, ticket_id)
+                try:
+                    await bot.send_message(admin_id, f'ℹ️ 用户已主动结束客服对话 {_support_no(ticket_id)}。')
+                except Exception:
+                    pass
+        await state.clear()
+        await message.answer(msg.support_user_closed(), reply_markup=main_menu())
+        return
+
+    text = (message.text or message.caption or '').strip()
+    if not text and not _message_has_media_payload(message):
+        await message.answer('📮 小掌柜还没收到具体内容哦～请发送文字说明、截图、文件、视频或语音。', reply_markup=support_private_user_keyboard())
+        return
+
+    admin_id = _support_private_admin_id()
+    if not admin_id:
+        await message.answer('⚠️ 客服管理员还没有配置，请稍后再试。', reply_markup=main_menu())
+        return
+
+    data = await state.get_data()
+    context = data.get('contact_context') or {}
+    context_text = context.get('context_text') or f'来源页面：{_support_context_source_label(context.get("source_page"))}'
+    async with SessionLocal() as session:
+        if await _is_blacklisted(session, message.from_user.id):
+            await message.answer('⛔ 你的账号暂时被限制乘坐小车车了，有疑问请联系管理员。')
+            await state.clear()
+            return
+        ticket_id = int(data.get('contact_ticket_id') or context.get('ticket_id') or 0)
+        ticket = await session.get(ContactTicket, ticket_id) if ticket_id else None
+        if not ticket or ticket.status == 'closed' or int(ticket.user_id) != int(message.from_user.id):
+            ticket = ContactTicket(
+                user_id=message.from_user.id,
+                username=f'@{message.from_user.username}' if message.from_user.username else None,
+                status='open',
+                user_message=text or f'见下方消息/附件（{_support_reply_kind(message)}）',
+                source_page=context.get('source_page'),
+                project_id=context.get('project_id'),
+                order_id=context.get('order_id'),
+                refund_id=context.get('refund_id'),
+                last_error=context.get('last_error'),
+                context_json=json.dumps(context, ensure_ascii=False),
+            )
+            session.add(ticket)
+            await session.commit()
+            await session.refresh(ticket)
+        else:
+            ticket.status = 'open'
+            ticket.user_message = text or f'见下方消息/附件（{_support_reply_kind(message)}）'
+            ticket.username = f'@{message.from_user.username}' if message.from_user.username else ticket.username
+            ticket.last_error = None
+            ticket.context_json = json.dumps(context, ensure_ascii=False)
+            await session.commit()
+            await session.refresh(ticket)
+
+    try:
+        admin_message_id = await _copy_support_user_message_to_admin(
+            bot,
+            admin_id=admin_id,
+            ticket=ticket,
+            user_message=message,
+            context_text=context_text,
+        )
+        if admin_message_id:
+            await _record_support_bridge_message(
+                ticket_id=ticket.id,
+                user_id=ticket.user_id,
+                admin_id=admin_id,
+                admin_chat_id=admin_id,
+                admin_message_id=int(admin_message_id),
+                user_message_id=message.message_id,
+                direction='user_to_admin',
+            )
+        await state.update_data(contact_ticket_id=ticket.id, contact_context={**context, 'ticket_id': ticket.id})
+        await message.answer(msg.support_user_confirm(_support_no(ticket.id)), reply_markup=support_private_user_keyboard())
+    except Exception as e:
+        friendly_error = _friendly_support_delivery_error(e)
+        await _mark_support_delivery_failed(ticket.id, friendly_error)
+        await message.answer(
+            msg.support_private_user_forward_failed(error=friendly_error),
+            reply_markup=support_private_user_keyboard(),
+        )
 
 
 @router.callback_query(F.data.startswith('support:ticket:'))
@@ -2643,10 +3178,179 @@ async def admin_support_reply_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@router.callback_query(F.data.startswith('admin:support_link:'))
+async def admin_support_link_from_business(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """审核群业务单上的“切到用户对话”。
+
+    退款、报销、提现仍在审核群完成业务确认；需要沟通时，管理员点这个按钮，
+    机器人在管理员私聊里建立/切换到该用户的客服会话。
+    """
+    support_admin_id = _support_private_admin_id()
+    if not support_admin_id:
+        await call.answer('请先配置 SUPPORT_ADMIN_ID', show_alert=True)
+        return
+    if int(call.from_user.id) != int(support_admin_id):
+        await call.answer('这个按钮只给客服管理员使用，请让 SUPPORT_ADMIN_ID 对应管理员处理。', show_alert=True)
+        return
+    parts = (call.data or '').split(':')
+    source = parts[2] if len(parts) > 2 else 'generic'
+    ref_id = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+
+    async with SessionLocal() as session:
+        user_id = 0
+        username = None
+        project_id = None
+        order_id = None
+        refund_id = None
+        source_label = _support_context_source_label(source)
+        detail = ''
+        if source == 'refund':
+            refund = await session.get(RefundRecord, ref_id)
+            if not refund:
+                await call.answer('退款单不存在', show_alert=True)
+                return
+            order = await session.get(PaymentOrder, refund.order_id)
+            project = await session.get(CrowdfundProject, refund.project_id)
+            user_id = int(refund.user_id)
+            username = getattr(order, 'username', None)
+            project_id = int(refund.project_id or 0) or None
+            order_id = int(refund.order_id or 0) or None
+            refund_id = int(refund.id)
+            source_label = '退款业务单'
+            detail = (
+                f'退款单：{_refund_no(refund.id)}\n'
+                f'{project_label(project) if project else f"项目：P.{int(refund.project_id or 0):03d}"}\n'
+                f'金额：{float(refund.amount or 0):g} 元\n'
+                f'状态：{_refund_status_label(refund.status)}'
+            )
+        elif source == 'payout':
+            payout = await session.get(ProfitWithdrawal, ref_id)
+            if not payout:
+                await call.answer('报销/提现单不存在', show_alert=True)
+                return
+            project = await session.get(CrowdfundProject, payout.project_id)
+            user_id = int(payout.creator_id)
+            username = getattr(project, 'creator_username', None)
+            project_id = int(payout.project_id or 0) or None
+            source_label = '报销/提现业务单'
+            label = '报销' if (getattr(payout, 'payout_type', 'profit') or 'profit') == 'reimbursement' else '提现'
+            detail = (
+                f'{label}单：{_payout_no(payout.id)}\n'
+                f'{project_label(project) if project else f"项目：P.{int(payout.project_id or 0):03d}"}\n'
+                f'金额：{float(payout.creator_amount or 0):g} 元\n'
+                f'状态：{payout.status}'
+            )
+        else:
+            await call.answer('暂不支持这个业务来源', show_alert=True)
+            return
+
+        if not user_id:
+            await call.answer('没有找到这个业务单对应的用户', show_alert=True)
+            return
+        user_label = username or str(user_id)
+        context_text = f'来源页面：{source_label}\n{detail}'
+        ticket = await _open_or_reuse_support_ticket_for_business(
+            session,
+            user_id=user_id,
+            username=username,
+            source_page=source,
+            project_id=project_id,
+            order_id=order_id,
+            refund_id=refund_id,
+            context_text=context_text,
+        )
+
+    await _set_support_admin_active_session(
+        admin_id=call.from_user.id,
+        ticket_id=int(ticket.id),
+        user_id=user_id,
+        source=source,
+        ref_id=ref_id,
+    )
+    await state.clear()
+    try:
+        sent = await bot.send_message(
+            call.from_user.id,
+            msg.support_private_admin_switched_from_business(
+                ticket_no=_support_no(ticket.id),
+                user_label=user_label,
+                user_id=user_id,
+                source_label=source_label,
+                detail=detail,
+            ),
+            reply_markup=support_admin_switch_keyboard(ticket.id),
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+        await _record_support_bridge_message(
+            ticket_id=ticket.id,
+            user_id=user_id,
+            admin_id=call.from_user.id,
+            admin_chat_id=call.from_user.id,
+            admin_message_id=int(sent.message_id),
+            user_message_id=None,
+            direction='business_to_admin',
+        )
+    except Exception as exc:
+        await call.answer(f'无法发到管理员私聊：{_friendly_support_delivery_error(exc)}', show_alert=True)
+        return
+
+    await call.answer('已切到该用户对话，请到机器人私聊回复。', show_alert=True)
+
+
+@router.callback_query(F.data.startswith('admin:support_hold:'))
+async def admin_support_hold_private_dialog(call: CallbackQuery, state: FSMContext):
+    """管理员私聊里点「保持这个对话」后，后续直接发消息都会回给该用户。"""
+    if not _is_support_private_admin(call.from_user.id):
+        await call.answer('无权限', show_alert=True)
+        return
+    ticket_id = int(call.data.split(':')[-1])
+    async with SessionLocal() as session:
+        ticket = await session.get(ContactTicket, ticket_id)
+        if not ticket or ticket.status == 'closed':
+            await call.answer('这个客服对话不存在或已结束', show_alert=True)
+            return
+        user_label = ticket.username or str(ticket.user_id)
+        user_id = int(ticket.user_id)
+    await _set_support_admin_active_session(admin_id=call.from_user.id, ticket_id=ticket_id, user_id=user_id, source='hold', ref_id=ticket_id)
+    await state.clear()
+    await state.update_data(contact_ticket_id=ticket_id, support_private_bridge=True)
+    await state.set_state(AdminContactReply.message)
+    await call.message.answer(msg.support_private_admin_hold(user_label=user_label, ticket_no=_support_no(ticket_id)))
+    await call.answer('已保持这个对话。')
+
+
+@router.message(lambda message: bool(
+    message.chat and message.chat.type == 'private'
+    and message.from_user and _is_support_private_admin(message.from_user.id)
+    and message.reply_to_message
+))
+async def admin_support_private_reply_to_user(message: Message, state: FSMContext, bot: Bot):
+    """管理员在私聊里直接回复某条用户消息：自动切换目标用户并发送。"""
+    if (message.text or '').lstrip().startswith('/'):
+        return
+    ticket_id = await _support_ticket_id_from_admin_reply_message(message)
+    if not ticket_id:
+        await message.reply('⚠️ 没识别出要回复哪个用户。请回复带 S.xxx 的用户消息，或点「保持这个对话」。')
+        return
+    await _send_support_private_bridge_reply(message, state, bot, ticket_id=int(ticket_id), clear_state=False)
+
+
 @router.message(AdminContactReply.message)
 async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     ticket_id = int(data.get('contact_ticket_id') or 0)
+    if bool(data.get('support_private_bridge')) or (message.chat and message.chat.type == 'private' and _is_support_private_admin(message.from_user.id)):
+        # 管理员私聊客服桥：如果当前消息是回复另一位用户的通知，则自动切换目标用户。
+        reply_ticket_id = await _support_ticket_id_from_admin_reply_message(message) if message.reply_to_message else None
+        await _send_support_private_bridge_reply(
+            message,
+            state,
+            bot,
+            ticket_id=int(reply_ticket_id or ticket_id),
+            clear_state=False,
+        )
+        return
     await _send_support_reply_core(
         message,
         state,
@@ -2659,9 +3363,25 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
     )
 
 
+@router.message(lambda message: bool(
+    message.chat and message.chat.type == 'private'
+    and message.from_user and _is_support_private_admin(message.from_user.id)
+    and not message.reply_to_message
+))
+async def admin_support_private_active_dialog(message: Message, state: FSMContext, bot: Bot):
+    """管理员私聊里直接发送内容：发送给当前保持的用户，不依赖 FSM。"""
+    if (message.text or '').lstrip().startswith('/'):
+        return
+    ticket_id = await _get_support_admin_active_ticket_id(message.from_user.id)
+    if not ticket_id:
+        await message.reply(msg.support_private_admin_active_missing())
+        return
+    await _send_support_private_bridge_reply(message, state, bot, ticket_id=int(ticket_id), clear_state=False)
+
+
 @router.message(Command('reply', 'sreply'))
 async def admin_support_reply_command(message: Message, command: CommandObject, state: FSMContext, bot: Bot):
-    """审核群旧客服工单兜底入口：/reply S.001 要发送给用户的内容。也可回复工单卡片：/reply 内容。"""
+    """审核群客服工单兜底入口：/reply S.001 要发送给用户的内容。也可回复工单卡片：/reply 内容。"""
     if message.from_user.id not in settings.admin_id_list:
         await message.answer('无权限。')
         return
@@ -2707,22 +3427,41 @@ async def admin_support_reply_by_reply(message: Message, state: FSMContext, bot:
 
 
 @router.callback_query(F.data.startswith('admin:support_close:'))
-async def admin_support_close(call: CallbackQuery):
-    if call.from_user.id not in settings.admin_id_list:
+async def admin_support_close(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if call.from_user.id not in settings.admin_id_list and not _is_support_private_admin(call.from_user.id):
         await call.answer('无权限', show_alert=True)
         return
     ticket_id = int(call.data.split(':')[-1])
+    user_id = 0
+    user_label = '-'
     async with SessionLocal() as session:
         ticket = await session.get(ContactTicket, ticket_id)
         if not ticket:
-            await call.answer('工单不存在', show_alert=True)
+            await call.answer('客服对话不存在', show_alert=True)
             return
+        user_id = int(ticket.user_id)
+        user_label = ticket.username or str(ticket.user_id)
         ticket.status = 'closed'
         ticket.admin_id = call.from_user.id
         ticket.closed_at = datetime.utcnow()
         await session.commit()
-    await call.message.answer(f'✅ 已关闭历史客服工单 {_support_no(ticket_id)}。')
-    await call.answer()
+    await _clear_support_admin_active_session(call.from_user.id, ticket_id)
+    await state.clear()
+    notify_error = None
+    try:
+        await bot.send_message(
+            user_id,
+            msg.support_user_closed_by_admin(),
+            reply_markup=support_closed_by_admin_keyboard(),
+        )
+    except Exception as exc:
+        notify_error = _friendly_support_delivery_error(exc)
+    await call.message.answer(msg.support_private_admin_closed(
+        user_label=user_label,
+        ticket_no=_support_no(ticket_id),
+        notify_error=notify_error,
+    ))
+    await call.answer('已结束这个对话。')
 
 @router.message(Command('ban'))
 async def ban_user(message: Message):

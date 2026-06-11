@@ -41,11 +41,30 @@ def support_external_url(source: str = 'generic', ref_id: int | str | None = 0) 
 
 
 def support_contact_button(text: str = '💬 联系小掌柜', source: str = 'generic', ref_id: int | str | None = 0) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text=text, url=support_external_url(source, ref_id))
+    """统一客服入口。
+
+    默认使用众筹机器人内置客服工单：用户点按钮后直接在当前机器人留言，
+    管理员在待办中心/审核群里回复。只有 SUPPORT_EXTERNAL_ONLY=true 时，
+    才临时切回外部客服机器人。
+    """
+    settings = get_settings()
+    if bool(settings.SUPPORT_EXTERNAL_ONLY):
+        return InlineKeyboardButton(text=text, url=support_external_url(source, ref_id))
+    try:
+        safe_ref = int(ref_id or 0)
+    except (TypeError, ValueError):
+        safe_ref = 0
+    safe_source = ''.join(ch for ch in str(source or 'generic').lower() if ch.isascii() and (ch.isalnum() or ch == '_')) or 'generic'
+    return InlineKeyboardButton(text=text, callback_data=f'support:start:{safe_source}:{safe_ref}')
 
 
 def external_support_keyboard(source: str = 'generic', ref_id: int | str | None = 0, back_callback: str | None = 'orders:center') -> InlineKeyboardMarkup:
-    rows = [[support_contact_button(f'💬 打开 {support_bot_display_name()} 联系小掌柜', source, ref_id)]]
+    settings = get_settings()
+    if bool(settings.SUPPORT_EXTERNAL_ONLY):
+        first_text = f'💬 打开 {support_bot_display_name()} 联系小掌柜'
+    else:
+        first_text = '💬 在众筹机器人里联系小掌柜'
+    rows = [[support_contact_button(first_text, source, ref_id)]]
     if back_callback:
         rows.append([InlineKeyboardButton(text='📋 返回我的众筹', callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -231,6 +250,7 @@ def withdraw_project_keyboard(project_id: int) -> InlineKeyboardMarkup:
 def withdrawal_admin_keyboard(withdrawal_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='✅ 确认已支付提现/报销', callback_data=f'admin:withdraw_paid:{withdrawal_id}')],
+        [InlineKeyboardButton(text='💬 切到申请人对话', callback_data=f'admin:support_link:payout:{withdrawal_id}')],
         [InlineKeyboardButton(text='❌ 驳回申请', callback_data=f'admin:withdraw_reject:{withdrawal_id}')],
     ])
 
@@ -284,6 +304,7 @@ def refund_apply_keyboard(refund_id: int) -> InlineKeyboardMarkup:
 def refund_item_keyboard(refund_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='✅ 确认已退款', callback_data=f'admin:refund_done:{refund_id}')],
+        [InlineKeyboardButton(text='💬 切到退款用户对话', callback_data=f'admin:support_link:refund:{refund_id}')],
     ])
 
 
@@ -293,7 +314,7 @@ def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text='📤 待补资源', callback_data='admin:list:wait_upload')],
         [InlineKeyboardButton(text='💰 报销/提现小篮子', callback_data='admin:list:payouts')],
         [InlineKeyboardButton(text='🧾 退款小票', callback_data='admin:list:refunds')],
-        [InlineKeyboardButton(text='💬 旧客服工单', callback_data='admin:list:support')],
+        [InlineKeyboardButton(text='💬 私聊客服记录', callback_data='admin:list:support')],
         [InlineKeyboardButton(text='⚠️ 风控提醒', callback_data='admin:list:risks')],
         [InlineKeyboardButton(text='💹 资金账本', callback_data='admin:list:ledger')],
         [InlineKeyboardButton(text='🚨 异常小雷达', callback_data='admin:list:exceptions')],
@@ -405,6 +426,32 @@ def contact_answered_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def support_private_admin_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📌 保持这个对话', callback_data=f'admin:support_hold:{ticket_id}')],
+        [InlineKeyboardButton(text='✅ 结束这个对话', callback_data=f'admin:support_close:{ticket_id}')],
+    ])
+
+
+def support_private_user_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✅ 结束联系客服', callback_data='support:end')],
+        [InlineKeyboardButton(text='📋 返回我的众筹', callback_data='orders:center')],
+    ])
+
+
+def support_admin_switch_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📌 保持这个对话', callback_data=f'admin:support_hold:{ticket_id}')],
+        [InlineKeyboardButton(text='✅ 结束这个对话', callback_data=f'admin:support_close:{ticket_id}')],
+    ])
+
+
+def support_closed_by_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🔥 去热门众筹瞧瞧', callback_data='hot:list')],
+        [InlineKeyboardButton(text='📋 返回我的众筹', callback_data='orders:center')],
+    ])
 
 
 def support_ticket_user_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
@@ -504,7 +551,7 @@ def admin_search_results_keyboard(projects=None, orders=None, refunds=None, tick
     for t in list(tickets or [])[:3]:
         tid = int(getattr(t, 'id', 0) or 0)
         if tid:
-            rows.append([InlineKeyboardButton(text=f'💬 回复旧客服工单 S.{tid:03d}', callback_data=f'admin:support_reply:{tid}')])
+            rows.append([InlineKeyboardButton(text=f'💬 回复客服工单 S.{tid:03d}', callback_data=f'admin:support_reply:{tid}')])
 
     if not rows:
         rows.append([InlineKeyboardButton(text='🔎 再搜一次', callback_data='admin:search_help')])

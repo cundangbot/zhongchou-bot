@@ -100,6 +100,39 @@ class ResourceAccess(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class SupportBridgeMessage(Base):
+    __tablename__ = 'support_bridge_messages'
+    __table_args__ = (
+        UniqueConstraint('admin_id', 'admin_message_id', name='uq_support_bridge_admin_message'),
+        Index('ix_support_bridge_ticket_created', 'ticket_id', 'created_at'),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    admin_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    admin_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    admin_message_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    direction: Mapped[str] = mapped_column(String(16), default='user_to_admin')
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+
+class SupportAdminSession(Base):
+    __tablename__ = 'support_admin_sessions'
+    __table_args__ = (
+        UniqueConstraint('admin_id', name='uq_support_admin_session_admin'),
+        Index('ix_support_admin_sessions_ticket', 'ticket_id'),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    admin_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    ticket_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    ref_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+
 class ResourceClaimProgress(Base):
     __tablename__ = 'resource_claim_progress'
     __table_args__ = (UniqueConstraint('user_id', 'project_id', 'resource_kind', name='uq_claim_progress'),)
