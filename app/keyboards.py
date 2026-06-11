@@ -11,6 +11,46 @@ def _join_deeplink(project_id: int) -> str:
     return f'https://t.me/{username}?start=join_{project_id}'
 
 
+def _support_bot_username() -> str:
+    settings = get_settings()
+    username = (settings.SUPPORT_BOT_USERNAME or '@jingpinhybot').strip().lstrip('@')
+    return username or 'jingpinhybot'
+
+
+def support_bot_display_name() -> str:
+    return '@' + _support_bot_username()
+
+
+def support_external_url(source: str = 'generic', ref_id: int | str | None = 0) -> str:
+    """外部双向客服机器人深链。
+
+    payload 约定：<SUPPORT_BOT_START_PREFIX>_<来源>_<业务ID>
+    例：cf_error_123、cf_refund_8、cf_generic_0。
+    Telegram start payload 仅使用字母数字下划线，方便 @jingpinhybot 解析。
+    """
+    settings = get_settings()
+    username = _support_bot_username()
+    safe_source = ''.join(ch for ch in str(source or 'generic').lower() if ch.isascii() and (ch.isalnum() or ch == '_')) or 'generic'
+    try:
+        safe_ref = int(ref_id or 0)
+    except (TypeError, ValueError):
+        safe_ref = 0
+    prefix = ''.join(ch for ch in str(settings.SUPPORT_BOT_START_PREFIX or 'cf').lower() if ch.isascii() and (ch.isalnum() or ch == '_')) or 'cf'
+    payload = f'{prefix}_{safe_source}_{safe_ref}'[:64]
+    return f'https://t.me/{username}?start={payload}'
+
+
+def support_contact_button(text: str = '💬 联系小掌柜', source: str = 'generic', ref_id: int | str | None = 0) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, url=support_external_url(source, ref_id))
+
+
+def external_support_keyboard(source: str = 'generic', ref_id: int | str | None = 0, back_callback: str | None = 'orders:center') -> InlineKeyboardMarkup:
+    rows = [[support_contact_button(f'💬 打开 {support_bot_display_name()} 联系小掌柜', source, ref_id)]]
+    if back_callback:
+        rows.append([InlineKeyboardButton(text='📋 返回我的众筹', callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 # 底部常驻菜单：可爱版，显示在 Telegram 输入框下方。
 def main_menu() -> ReplyKeyboardMarkup:
     # 底部常驻菜单只保留用户最常用的 3 个入口。
@@ -37,7 +77,7 @@ def order_center_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text='💸 退款车票', callback_data='orders:refunds:0')],
         [InlineKeyboardButton(text='🙋 我是车主记录', callback_data='orders:created:0')],
         [InlineKeyboardButton(text='📦 我的宝贝资源', callback_data='resources:mine')],
-        [InlineKeyboardButton(text='💬 联系小掌柜', callback_data='support:start:generic:0')],
+        [support_contact_button('💬 联系小掌柜', 'generic', 0)],
     ])
 
 
@@ -103,6 +143,7 @@ def admin_review_keyboard(project_id: int) -> InlineKeyboardMarkup:
 
 
 def join_project_keyboard(project_id: int, full: bool = False, cancelled: bool = False, seat_price: float | int | None = None) -> InlineKeyboardMarkup:
+    settings = get_settings()
     if cancelled:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='⛔ 已取消本次拼车', callback_data=f'cf:cancelled:{project_id}')]
@@ -252,7 +293,7 @@ def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text='📤 待补资源', callback_data='admin:list:wait_upload')],
         [InlineKeyboardButton(text='💰 报销/提现小篮子', callback_data='admin:list:payouts')],
         [InlineKeyboardButton(text='🧾 退款小票', callback_data='admin:list:refunds')],
-        [InlineKeyboardButton(text='💬 客服小纸条', callback_data='admin:list:support')],
+        [InlineKeyboardButton(text='💬 旧客服工单', callback_data='admin:list:support')],
         [InlineKeyboardButton(text='⚠️ 风控提醒', callback_data='admin:list:risks')],
         [InlineKeyboardButton(text='💹 资金账本', callback_data='admin:list:ledger')],
         [InlineKeyboardButton(text='🚨 异常小雷达', callback_data='admin:list:exceptions')],
@@ -283,7 +324,7 @@ def _page_rows(prefix: str, page: int, has_prev: bool, has_next: bool) -> list[l
 
 def verify_failure_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='💬 联系小掌柜', callback_data='support:start:error:0')],
+        [support_contact_button('💬 联系小掌柜', 'error', 0)],
         [InlineKeyboardButton(text='⬅️ 返回待付车票', callback_data='orders:pending:0')],
     ])
 
@@ -333,7 +374,7 @@ def refund_detail_keyboard(refund_id: int, can_apply: bool = False) -> InlineKey
     rows = []
     if can_apply:
         rows.append([InlineKeyboardButton(text='💸 申请退款', callback_data=f'refund:apply:{refund_id}')])
-    rows.append([InlineKeyboardButton(text='💬 联系小掌柜', callback_data=f'support:start:refund:{refund_id}')])
+    rows.append([support_contact_button('💬 联系小掌柜', 'refund', refund_id)])
     rows.append([InlineKeyboardButton(text='⬅️ 返回退款车票', callback_data='orders:refunds:0')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -347,9 +388,7 @@ def creator_project_detail_keyboard(project_id: int) -> InlineKeyboardMarkup:
 
 
 def support_start_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='💬 联系小掌柜', callback_data='support:start:generic:0')],
-    ])
+    return external_support_keyboard('generic', 0, back_callback='orders:center')
 
 
 def contact_admin_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
@@ -366,9 +405,18 @@ def contact_answered_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+
+
+def support_ticket_user_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🔄 查看小掌柜回复', callback_data=f'support:ticket:{ticket_id}')],
+        [support_contact_button('💬 继续联系客服', 'generic', 0)],
+        [InlineKeyboardButton(text='📋 返回我的众筹', callback_data='orders:center')],
+    ])
+
 def contact_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='💬 继续联系客服', callback_data='support:start:generic:0')],
+        [support_contact_button('💬 继续联系客服', 'generic', 0)],
         [InlineKeyboardButton(text='📋 返回我的众筹', callback_data='orders:center')],
     ])
 
@@ -389,7 +437,7 @@ def empty_resources_keyboard() -> InlineKeyboardMarkup:
 
 def payment_error_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='💬 联系小掌柜', callback_data=f'support:start:error:{order_id}')],
+        [support_contact_button('💬 联系小掌柜', 'error', order_id)],
         [InlineKeyboardButton(text='🔙 返回待付车票', callback_data='orders:pending:0')],
     ])
 
@@ -398,7 +446,7 @@ def refund_detail_context_keyboard(refund_id: int, can_apply: bool = False) -> I
     rows = []
     if can_apply:
         rows.append([InlineKeyboardButton(text='💸 申请退款', callback_data=f'refund:apply:{refund_id}')])
-    rows.append([InlineKeyboardButton(text='💬 联系小掌柜', callback_data=f'support:start:refund:{refund_id}')])
+    rows.append([support_contact_button('💬 联系小掌柜', 'refund', refund_id)])
     rows.append([InlineKeyboardButton(text='⬅️ 返回退款车票', callback_data='orders:refunds:0')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -456,7 +504,7 @@ def admin_search_results_keyboard(projects=None, orders=None, refunds=None, tick
     for t in list(tickets or [])[:3]:
         tid = int(getattr(t, 'id', 0) or 0)
         if tid:
-            rows.append([InlineKeyboardButton(text=f'💬 回复客服小纸条 S.{tid:03d}', callback_data=f'admin:support_reply:{tid}')])
+            rows.append([InlineKeyboardButton(text=f'💬 回复旧客服工单 S.{tid:03d}', callback_data=f'admin:support_reply:{tid}')])
 
     if not rows:
         rows.append([InlineKeyboardButton(text='🔎 再搜一次', callback_data='admin:search_help')])

@@ -15,6 +15,18 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ENV_FILE, env_file_encoding='utf-8', extra='ignore')
 
     BOT_TOKEN: str
+    # 客服回复默认绕过 aiogram 封装，直接调用 Telegram Bot API HTTP 接口。
+    # 如自建 telegram-bot-api，可填 http://telegram-bot-api:8081
+    BOT_API_BASE_URL: str = 'https://api.telegram.org'
+    SUPPORT_DELIVERY_MODE: str = 'direct_http'  # direct_http / aiogram / direct_only
+    SUPPORT_DIRECT_API_TIMEOUT_SECONDS: int = 15
+    SUPPORT_DELIVERY_FALLBACK_TO_AIOGRAM: bool = True
+    # 用户侧客服入口已外置到独立双向机器人。所有「联系小掌柜」按钮都会跳到这里。
+    SUPPORT_BOT_USERNAME: str = '@jingpinhybot'
+    SUPPORT_BOT_START_PREFIX: str = 'cf'
+    # true：本机器人不再生成新的内置客服工单；所有用户侧人工咨询都跳转外部客服机器人。
+    # 退款、报销、提现、补票、资源审核等业务待办不受影响，仍发送到 ADMIN_GROUP_ID 审核群。
+    SUPPORT_EXTERNAL_ONLY: bool = True
     # 机器人用户名，用于公开频道按钮跳转私聊深链，例如 @your_bot 或 your_bot。
     BOT_USERNAME: str = ''
     ADMIN_GROUP_ID: int

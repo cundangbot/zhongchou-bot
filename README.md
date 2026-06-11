@@ -1,9 +1,10 @@
-# v1.6.0.6 循环导入实修版
+# v1.6.0.9 客服回复换接口版
 
 - 已拆分数据库 Base/模型依赖，移除 `app.db.base ↔ app.db.models` 循环。
 - 已将跨 Handler 的验票后处理、频道更新和满员通知移到 Service 层。
 - `start.py` 不再反向导入 `crowdfund.py`。
 - 已实际运行数据库初始化、路由注册、调度器注册和完整启动到 polling 入口。
+- 客服回复默认切换为原生 Telegram Bot API HTTP 投递；用户侧新增「查看小掌柜回复」主动拉取兜底。
 
 # 拼拼小车库 v1.6.0.3 — PostgreSQL 生产稳定版
 
@@ -22,6 +23,7 @@
 - PostgreSQL 单实例锁，防止重复 polling / scheduler
 - 用户订单面板的返回路径、到期时间和状态刷新
 - 带订单上下文的客服工单
+- 客服回复原生 Bot API 投递与用户主动拉取兜底
 - 热门众筹智能排序
 - 资源领取分页进度与断点续领
 - 审核群管理面板、项目搜索、异常面板和健康检查
@@ -144,13 +146,24 @@ ALLOW_SQLITE_DEV=true
 
 `/health`、`/search`、`/reply` 和 `/sreply` 仍可由管理员在审核群手动输入，但不会显示在命令菜单。
 
-客服工单现在有三种等价回复方式：
+客服工单现在有三种等价回复方式，且默认不再使用 aiogram 封装投递用户私聊，而是直接调用 Telegram Bot API HTTP 接口：
 
 - 点工单卡片「回复用户」，按提示回复。
 - 直接回复管理群里的工单卡片或送达回执，机器人会自动按 `S.001` 路由给用户。
 - 发送 `/reply S.001 回复内容` 或 `/sreply S.001 回复内容` 作为兜底。
 
-如果投递失败，机器人会在审核群给出可处理原因，并把失败原因写入工单 `last_error`。
+如果投递失败，机器人会在审核群给出可处理原因，并把失败原因写入工单 `last_error`。用户提交客服后也会看到「🔄 查看小掌柜回复」按钮；管理员回复内容会落库，用户可以主动打开这张小纸条查看回复，不再完全依赖手机推送。
+
+相关配置：
+
+```env
+BOT_API_BASE_URL=https://api.telegram.org
+SUPPORT_DELIVERY_MODE=direct_http
+SUPPORT_DIRECT_API_TIMEOUT_SECONDS=15
+SUPPORT_DELIVERY_FALLBACK_TO_AIOGRAM=true
+```
+
+如部署了自建 `telegram-bot-api` 服务，可把 `BOT_API_BASE_URL` 改为内网地址，例如 `http://telegram-bot-api:8081`。
 
 ## 5. 状态机
 
@@ -301,3 +314,49 @@ SEED_MODE_ENABLED=false
 ## v1.6.0.8 满员成功频道提醒风格统一
 
 拼车满员后发送到公开频道的“拼车成功”独立提醒，已改为复用全站统一卡片样式：标题在卡片外、正文在上下分隔线内、小掌柜提醒在卡片外。满员后补票按钮也会按项目实际车位价格显示，不再固定写死 30 元。
+
+
+## v1.6.0.9 客服回复换接口
+
+客服回复链路默认从 aiogram 封装方法切换为原生 Telegram Bot API HTTP 接口，直接调用 `sendMessage` / `copyMessage`。如果原生接口异常，可按配置自动退回 aiogram 旧通道；审核群送达回执会显示实际投递通道。
+
+同时新增用户侧主动拉取兜底：用户提交客服小纸条后，会出现「🔄 查看小掌柜回复」按钮。管理员回复内容会写入工单，用户即使没有收到手机推送，也能从这张小纸条里查看回复。
+
+## v1.6.1.0：客服入口外置到独立双向机器人
+
+用户侧所有「联系小掌柜 / 继续联系客服」按钮已统一改为打开独立双向客服机器人，默认：`@jingpinhybot`。
+
+新增配置：
+
+```env
+SUPPORT_BOT_USERNAME=@jingpinhybot
+SUPPORT_BOT_START_PREFIX=cf
+SUPPORT_EXTERNAL_ONLY=true
+```
+
+按钮会生成 Telegram deep link，例如：
+
+```text
+https://t.me/jingpinhybot?start=cf_error_123
+```
+
+旧消息里残留的 `support:start:*` 按钮也会被兼容处理，引导用户打开独立客服机器人，不再进入当前机器人的旧客服工单状态机。
+
+
+## v1.6.1.1 业务审核与外部客服分层
+
+本版本把“人工咨询”和“业务待办”彻底拆开：
+
+- 用户侧所有「联系小掌柜 / 继续联系客服」入口仍统一打开 `@jingpinhybot`。
+- 当前机器人不再生成新的内置客服工单，旧 `ContactSupport` 状态会自动清除并引导用户去外部客服机器人。
+- 退款申请、报销申请、提现申请、资源审核、手动补票、异常验票等业务流程不走外部客服机器人，仍发送到 `ADMIN_GROUP_ID` 审核群。
+- 审核群面板里的客服入口改为“旧客服工单”，仅用于处理旧版本遗留的 `ContactTicket`。
+- 报销/提现确认付款、驳回时增加用户通知异常兜底：业务状态和账本会先完成，若私信用户失败，审核群回执会明确显示失败原因。
+
+配置项：
+
+```env
+SUPPORT_EXTERNAL_ONLY=true
+```
+
+建议正式环境保持为 `true`，避免普通咨询消息和退款/报销/提现业务审核单混在同一条旧客服链路里。
