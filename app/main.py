@@ -21,6 +21,7 @@ from app.keyboards import join_project_keyboard, admin_dashboard_keyboard
 from app.services.singleton import SingletonLease
 from app.db.models import SystemMetric
 from app import runtime
+from app.services.logging_setup import setup_logging
 from app.messages import cute as msg
 
 
@@ -161,7 +162,7 @@ async def ensure_admin_control_panel(bot: Bot, settings) -> None:
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    setup_logging()
     settings = get_settings()
 
     lease = SingletonLease()

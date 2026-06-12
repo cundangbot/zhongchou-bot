@@ -26,12 +26,14 @@ class Settings(BaseSettings):
     # SUPPORT_ADMIN_ID=0 时使用 ADMIN_IDS 里的第一个管理员。
     SUPPORT_ADMIN_ID: int = 0
     SUPPORT_PRIVATE_BRIDGE_ENABLED: bool = True
-    SUPPORT_TICKET_IDLE_CLOSE_HOURS: int = 24
-    SUPPORT_ADMIN_HOLD_EXPIRE_HOURS: int = 2
     # 如以后确实需要临时切回外部客服机器人，可把 SUPPORT_EXTERNAL_ONLY 改为 true。
     SUPPORT_BOT_USERNAME: str = '@jingpinhybot'
     SUPPORT_BOT_START_PREFIX: str = 'cf'
     SUPPORT_EXTERNAL_ONLY: bool = False
+    # 客服会话超时：用户/管理员长时间无互动后自动关闭或解除保持，避免旧会话吞掉新流程资料。
+    SUPPORT_SESSION_TIMEOUT_MINUTES: int = 120
+    # 本地业务日期时区：管理后台“今日”统计、时间展示统一按这个时区计算。
+    BUSINESS_TIMEZONE: str = 'Asia/Shanghai'
     # 机器人用户名，用于公开频道按钮跳转私聊深链，例如 @your_bot 或 your_bot。
     BOT_USERNAME: str = ''
     ADMIN_GROUP_ID: int

@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta
 
 from aiogram import Router, F, Bot
-from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, InputMediaPhoto, InputMediaVideo, InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
 from sqlalchemy import select, func, case, or_, cast, String, text, update
@@ -37,6 +37,7 @@ from app.keyboards import (
     withdrawal_admin_keyboard,
     reimbursement_apply_keyboard,
     admin_dashboard_keyboard,
+    admin_list_page_keyboard,
     admin_search_results_keyboard,
     admin_list_item_keyboard,
     paged_item_keyboard,
@@ -75,25 +76,10 @@ from app.services.project_runtime import (
 )
 from app.services.payment_flow import confirm_payment_message
 from app.messages import cute as msg
-from app.utils.timezone import business_today_start_utc
-from app.callbacks import parse_admin_list
+from app.utils.business_time import fmt_local, today_start_utc_naive
 
 router = Router()
 settings = get_settings()
-
-# 客服会话生产兜底配置。数据库表或 FSM 临时不可用时，仍能保持管理员当前对话。
-SUPPORT_TICKET_IDLE_CLOSE_HOURS = int(getattr(settings, 'SUPPORT_TICKET_IDLE_CLOSE_HOURS', 24) or 24)
-SUPPORT_ADMIN_HOLD_EXPIRE_HOURS = int(getattr(settings, 'SUPPORT_ADMIN_HOLD_EXPIRE_HOURS', 2) or 2)
-SUPPORT_ADMIN_ACTIVE_SESSIONS: dict[int, dict] = {}
-
-
-def _support_now() -> datetime:
-    return datetime.utcnow()
-
-
-def _support_active_expired(updated_at: datetime | None, *, hours: int) -> bool:
-    return bool(updated_at and updated_at < _support_now() - timedelta(hours=max(1, int(hours))))
-
 
 
 async def _edit_panel(call: CallbackQuery, text: str, reply_markup=None) -> None:
@@ -156,6 +142,52 @@ def _is_support_private_admin(user_id: int | None) -> bool:
     admin_id = _support_private_admin_id()
     return bool(admin_id and user_id and int(user_id) == int(admin_id))
 
+
+
+
+def _support_timeout_minutes() -> int:
+    try:
+        return max(1, int(getattr(settings, 'SUPPORT_SESSION_TIMEOUT_MINUTES', 120) or 120))
+    except Exception:
+        return 120
+
+
+def _admin_has_active_upload_session(user_id: int | None) -> bool:
+    """同步过滤器用：管理员正在私聊上传资源时，客服桥必须让路。"""
+    if not user_id:
+        return False
+    try:
+        from app.handlers.crowdfund import admin_has_active_upload_session
+        return bool(admin_has_active_upload_session(int(user_id)))
+    except Exception:
+        return False
+
+
+def _admin_support_active_dialog_filter(message: Message) -> bool:
+    # 只在“无 FSM 状态”的管理员私聊里兜底保持客服会话；
+    # 命令、资源上传、其它业务状态都不应该被客服桥吞掉。
+    text = (message.text or '').lstrip()
+    return bool(
+        message.chat and message.chat.type == 'private'
+        and message.from_user and _is_support_private_admin(message.from_user.id)
+        and not message.reply_to_message
+        and not text.startswith('/')
+        and not _admin_has_active_upload_session(message.from_user.id)
+    )
+
+
+async def _forward_to_admin_upload_if_needed(message: Message, bot: Bot, state: FSMContext | None = None) -> bool:
+    """管理员私聊上传资源优先于客服回复状态。返回 True 表示已交给资源上传流程处理。"""
+    if not (message.from_user and _admin_has_active_upload_session(message.from_user.id)):
+        return False
+    if state is not None:
+        await state.clear()
+    try:
+        from app.handlers.crowdfund import collect_admin_upload_session
+        await collect_admin_upload_session(message, bot)
+        return True
+    except Exception:
+        return False
 
 def _support_context_source_label(source: str | None) -> str:
     return {
@@ -419,95 +451,62 @@ async def _set_support_admin_active_session(
     source: str | None = None,
     ref_id: int | None = None,
 ) -> None:
-    """记录管理员当前保持的私聊客服对象。
-
-    优先写数据库；如果迁移未跑、数据库短暂异常或 FSM 丢失，内存兜底仍能让
-    “保持这个对话”后的下一条管理员消息正确路由到用户。
-    """
-    SUPPORT_ADMIN_ACTIVE_SESSIONS[int(admin_id)] = {
-        'ticket_id': int(ticket_id),
-        'user_id': int(user_id),
-        'source': source,
-        'ref_id': int(ref_id) if ref_id else None,
-        'updated_at': _support_now(),
-    }
-    try:
-        async with SessionLocal() as session:
-            res = await session.execute(select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id)).limit(1))
-            active = res.scalar_one_or_none()
-            if active:
-                active.ticket_id = int(ticket_id)
-                active.user_id = int(user_id)
-                active.source = source
-                active.ref_id = int(ref_id) if ref_id else None
-                active.updated_at = _support_now()
-            else:
-                session.add(SupportAdminSession(
-                    admin_id=int(admin_id),
-                    ticket_id=int(ticket_id),
-                    user_id=int(user_id),
-                    source=source,
-                    ref_id=int(ref_id) if ref_id else None,
-                ))
-            await session.commit()
-    except Exception:
-        return
+    """记录管理员当前保持的私聊客服对象，避免 FSM 状态丢失造成回复找不到用户。"""
+    async with SessionLocal() as session:
+        res = await session.execute(select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id)).limit(1))
+        active = res.scalar_one_or_none()
+        if active:
+            active.ticket_id = int(ticket_id)
+            active.user_id = int(user_id)
+            active.source = source
+            active.ref_id = int(ref_id) if ref_id else None
+            active.updated_at = datetime.utcnow()
+        else:
+            session.add(SupportAdminSession(
+                admin_id=int(admin_id),
+                ticket_id=int(ticket_id),
+                user_id=int(user_id),
+                source=source,
+                ref_id=int(ref_id) if ref_id else None,
+            ))
+        await session.commit()
 
 
 async def _get_support_admin_active_ticket_id(admin_id: int) -> int | None:
-    mem = SUPPORT_ADMIN_ACTIVE_SESSIONS.get(int(admin_id))
-    if mem and not _support_active_expired(mem.get('updated_at'), hours=SUPPORT_ADMIN_HOLD_EXPIRE_HOURS):
-        return int(mem['ticket_id'])
-    if mem:
-        SUPPORT_ADMIN_ACTIVE_SESSIONS.pop(int(admin_id), None)
-    try:
-        async with SessionLocal() as session:
-            res = await session.execute(
-                select(SupportAdminSession)
-                .where(SupportAdminSession.admin_id == int(admin_id))
-                .order_by(SupportAdminSession.updated_at.desc())
-                .limit(1)
-            )
-            active = res.scalar_one_or_none()
-            if not active:
-                return None
-            if _support_active_expired(active.updated_at, hours=SUPPORT_ADMIN_HOLD_EXPIRE_HOURS):
-                await session.delete(active)
-                await session.commit()
-                return None
-            ticket = await session.get(ContactTicket, int(active.ticket_id))
-            if not ticket or ticket.status == 'closed':
-                await session.delete(active)
-                await session.commit()
-                return None
-            SUPPORT_ADMIN_ACTIVE_SESSIONS[int(admin_id)] = {
-                'ticket_id': int(active.ticket_id),
-                'user_id': int(active.user_id),
-                'source': active.source,
-                'ref_id': active.ref_id,
-                'updated_at': active.updated_at or _support_now(),
-            }
-            return int(active.ticket_id)
-    except Exception:
-        return None
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(SupportAdminSession)
+            .where(SupportAdminSession.admin_id == int(admin_id))
+            .order_by(SupportAdminSession.updated_at.desc())
+            .limit(1)
+        )
+        active = res.scalar_one_or_none()
+        if not active:
+            return None
+        ticket = await session.get(ContactTicket, int(active.ticket_id))
+        expired = False
+        if active.updated_at:
+            expired = active.updated_at < datetime.utcnow() - timedelta(minutes=_support_timeout_minutes())
+        if expired or not ticket or ticket.status == 'closed':
+            await session.delete(active)
+            if expired and ticket and ticket.status != 'closed':
+                ticket.status = 'closed'
+                ticket.closed_at = datetime.utcnow()
+            await session.commit()
+            return None
+        return int(active.ticket_id)
 
 
 async def _clear_support_admin_active_session(admin_id: int, ticket_id: int | None = None) -> None:
-    mem = SUPPORT_ADMIN_ACTIVE_SESSIONS.get(int(admin_id))
-    if mem and (ticket_id is None or int(mem.get('ticket_id') or 0) == int(ticket_id)):
-        SUPPORT_ADMIN_ACTIVE_SESSIONS.pop(int(admin_id), None)
-    try:
-        async with SessionLocal() as session:
-            q = select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id))
-            if ticket_id:
-                q = q.where(SupportAdminSession.ticket_id == int(ticket_id))
-            rows = list((await session.execute(q)).scalars().all())
-            for row in rows:
-                await session.delete(row)
-            if rows:
-                await session.commit()
-    except Exception:
-        return
+    async with SessionLocal() as session:
+        q = select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id))
+        if ticket_id:
+            q = q.where(SupportAdminSession.ticket_id == int(ticket_id))
+        rows = list((await session.execute(q)).scalars().all())
+        for row in rows:
+            await session.delete(row)
+        if rows:
+            await session.commit()
 
 
 async def _support_ticket_id_from_admin_message_id(admin_id: int, admin_message_id: int) -> int | None:
@@ -526,26 +525,22 @@ async def _support_ticket_id_from_admin_message_id(admin_id: int, admin_message_
 
 
 async def _support_active_ticket_for_user(session, user_id: int) -> ContactTicket | None:
-    cutoff = _support_now() - timedelta(hours=max(1, SUPPORT_TICKET_IDLE_CLOSE_HOURS))
-    stale = list((await session.execute(
-        select(ContactTicket).where(
-            ContactTicket.user_id == int(user_id),
-            ContactTicket.status.in_(['open', 'answered']),
-            ContactTicket.created_at < cutoff,
-        )
-    )).scalars().all())
-    for ticket in stale:
-        ticket.status = 'closed'
-        ticket.closed_at = _support_now()
-    if stale:
-        await session.flush()
     res = await session.execute(
         select(ContactTicket)
         .where(ContactTicket.user_id == int(user_id), ContactTicket.status.in_(['open', 'answered']))
         .order_by(ContactTicket.created_at.desc())
         .limit(1)
     )
-    return res.scalar_one_or_none()
+    ticket = res.scalar_one_or_none()
+    if not ticket:
+        return None
+    last_activity = ticket.answered_at or ticket.created_at
+    if last_activity and last_activity < datetime.utcnow() - timedelta(minutes=_support_timeout_minutes()):
+        ticket.status = 'closed'
+        ticket.closed_at = datetime.utcnow()
+        await session.commit()
+        return None
+    return ticket
 
 
 async def _open_or_reuse_support_ticket_for_business(
@@ -896,25 +891,8 @@ async def _send_support_reply_core(
             await state.clear()
 
 
-
-def _admin_list_nav_rows(list_type: str, page: int, has_next: bool) -> list[list[InlineKeyboardButton]]:
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text='⬅️ 上一页', callback_data=f'admin:list:{list_type}:{page - 1}'))
-    if has_next:
-        nav.append(InlineKeyboardButton(text='下一页 ➡️', callback_data=f'admin:list:{list_type}:{page + 1}'))
-    rows = []
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
-    return rows
-
-
-def _admin_page_slice(items: list, page_size: int) -> tuple[list, bool]:
-    return items[:page_size], len(items) > page_size
-
 def _fmt_dt(dt) -> str:
-    return dt.strftime('%Y-%m-%d %H:%M') if dt else '-'
+    return fmt_local(dt)
 
 
 def _project_lines(project: CrowdfundProject | None = None, blogger: str | None = None, description: str | None = None, prefix: str = '项目') -> str:
@@ -1261,7 +1239,8 @@ async def _handle_join_deeplink(message: Message, project_id: int) -> None:
 
 
 @router.message(CommandStart())
-async def start(message: Message, command: CommandObject | None = None):
+async def start(message: Message, state: FSMContext, command: CommandObject | None = None):
+    await state.clear()
     args = (command.args or "").strip() if command else ""
     if args.startswith("join_"):
         try:
@@ -1277,7 +1256,8 @@ async def start(message: Message, command: CommandObject | None = None):
 @router.message(Command('orders'))
 @router.message(F.text == '📋 众筹订单')
 @router.message(F.text == '📋 我的众筹')
-async def order_center_text(message: Message):
+async def order_center_text(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(msg.order_center(), reply_markup=order_center_keyboard())
 
 
@@ -1656,6 +1636,7 @@ async def submit_order_prompt(call: CallbackQuery, state: FSMContext):
             await call.answer('该待支付订单不存在或已处理', show_alert=True)
             return
         target = await _target_text(session, order)
+    await state.clear()
     await state.update_data(pay_order_id=order_id)
     await state.set_state(PaymentSubmit.system_no)
     await _edit_panel(call, msg.submit_order_prompt(
@@ -1782,7 +1763,8 @@ async def _load_hot_projects(session) -> list[CrowdfundProject]:
 
 
 @router.message(F.text == '🔥 热门众筹')
-async def hot_projects_text(message: Message):
+async def hot_projects_text(message: Message, state: FSMContext):
+    await state.clear()
     async with SessionLocal() as session:
         projects = await _load_hot_projects(session)
     if not projects:
@@ -1913,6 +1895,7 @@ async def creator_reimbursement_request(call: CallbackQuery, state: FSMContext):
             session.add(w)
             await session.commit()
             await session.refresh(w)
+    await state.clear()
     await state.update_data(withdrawal_id=w.id)
     await state.set_state(ProfitWithdrawCollect.payout_info)
     await call.message.answer(
@@ -1976,6 +1959,7 @@ async def creator_withdraw_request(call: CallbackQuery, state: FSMContext):
         session.add(w)
         await session.commit()
         await session.refresh(w)
+    await state.clear()
     await state.update_data(withdrawal_id=w.id)
     await state.set_state(ProfitWithdrawCollect.payout_info)
     await call.message.answer(
@@ -2446,7 +2430,8 @@ async def admin_force_verify(message: Message, bot: Bot):
 
 
 @router.message(Command('admin'))
-async def admin(message: Message):
+async def admin(message: Message, state: FSMContext):
+    await state.clear()
     if message.from_user.id not in settings.admin_id_list:
         await message.answer('无权限。')
         return
@@ -2454,7 +2439,8 @@ async def admin(message: Message):
 
 
 @router.message(F.text == '📦 我的宝贝资源')
-async def my_resources_text(message: Message):
+async def my_resources_text(message: Message, state: FSMContext):
+    await state.clear()
     await _send_my_resources_message(message)
 
 
@@ -2657,7 +2643,7 @@ async def _send_admin_dashboard(message: Message):
         await message.answer('这个小掌柜面板只有管理员可以打开喔～')
         return
     from datetime import datetime, timedelta, time
-    today_start = business_today_start_utc()
+    today_start = today_start_utc_naive()
     async with SessionLocal() as session:
         def scalar(q):
             return session.execute(q)
@@ -2756,15 +2742,21 @@ async def admin_dashboard_list(call: CallbackQuery):
     if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
-    list_type, page = parse_admin_list(call.data)
-    page_size = 10
-    offset = max(0, page) * page_size
-    today_start = business_today_start_utc()
+    parts = (call.data or '').split(':')
+    list_type = parts[2] if len(parts) > 2 else ''
+    try:
+        page = max(0, int(parts[3])) if len(parts) > 3 else 0
+    except Exception:
+        page = 0
+    page_size = 8
+    offset = page * page_size
+    today_start = today_start_utc_naive()
     async with SessionLocal() as session:
         if list_type == 'pending_review':
             res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).offset(offset).limit(page_size + 1))
             projects = list(res.scalars().all())
-            projects, has_next = _admin_page_slice(projects, page_size)
+            has_next = len(projects) > page_size
+            projects = projects[:page_size]
             if not projects:
                 text = '🔍 暂无待审车车～'
                 markup = admin_dashboard_keyboard()
@@ -2774,32 +2766,36 @@ async def admin_dashboard_list(call: CallbackQuery):
                 for p in projects:
                     lines.append(f'\n项目：P.{int(p.id or 0):03d}\n博主：{p.blogger}\n描述：{p.description}\n原价：{p.original_price:g} 元\n状态：{_status_label(p.status)}')
                     rows.append([InlineKeyboardButton(text=f'🔍 P.{int(p.id or 0):03d}｜查看详情', callback_data=f'admin:project:{p.id}')])
-                rows.extend(_admin_list_nav_rows(list_type, page, has_next))
+                rows.extend(admin_list_page_keyboard(list_type, page, page > 0, has_next).inline_keyboard)
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'wait_upload':
-            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status.in_(['waiting_creator_resource','waiting_buy_info','platform_purchasing','admin_uploading','resource_uploading','resource_rejected','resource_review']), CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).limit(10))
+            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status.in_(['waiting_creator_resource','waiting_buy_info','platform_purchasing','admin_uploading','resource_uploading','resource_rejected','resource_review']), CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).offset(offset).limit(page_size + 1))
             projects = list(res.scalars().all())
+            has_next = len(projects) > page_size
+            projects = projects[:page_size]
             if not projects:
                 text = '📤 暂无待补资源～'
                 markup = admin_dashboard_keyboard()
             else:
-                lines = ['📤 今日待补资源']
+                lines = [f'📤 今日待补资源｜第 {page + 1} 页']
                 rows = []
                 for p in projects:
                     lines.append(f'\n项目：P.{int(p.id or 0):03d}\n博主：{p.blogger}\n描述：{p.description}\n状态：{_status_label(p.status)}\n模式：{p.purchase_mode}')
                     rows.append([InlineKeyboardButton(text=f'📤 P.{int(p.id or 0):03d}｜查看详情', callback_data=f'admin:project:{p.id}')])
-                rows.extend(_admin_list_nav_rows(list_type, page, has_next))
+                rows.extend(admin_list_page_keyboard(list_type, page, page > 0, has_next).inline_keyboard)
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'payouts':
-            res = await session.execute(select(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.created_at >= today_start).order_by(ProfitWithdrawal.created_at.desc()).limit(10))
+            res = await session.execute(select(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.created_at >= today_start).order_by(ProfitWithdrawal.created_at.desc()).offset(offset).limit(page_size + 1))
             payouts = list(res.scalars().all())
+            has_next = len(payouts) > page_size
+            payouts = payouts[:page_size]
             if not payouts:
                 text = '💰 暂无报销/提现待处理～'
                 markup = admin_dashboard_keyboard()
             else:
-                lines = ['💰 今日报销/提现列表']
+                lines = [f'💰 今日报销/提现列表｜第 {page + 1} 页']
                 rows = []
                 for w in payouts:
                     p = await session.get(CrowdfundProject, w.project_id)
@@ -2809,17 +2805,19 @@ async def admin_dashboard_list(call: CallbackQuery):
                         InlineKeyboardButton(text=f'✅ 确认 {label} {_payout_no(w.id)}', callback_data=f'admin:withdraw_paid:{w.id}'),
                         InlineKeyboardButton(text='💬 对话', callback_data=f'admin:support_link:payout:{w.id}'),
                     ])
-                rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
+                rows.extend(admin_list_page_keyboard(list_type, page, page > 0, has_next).inline_keyboard)
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'refunds':
-            res = await session.execute(select(RefundRecord).where(RefundRecord.status.in_(['pending_info','pending_admin']), RefundRecord.created_at >= today_start).order_by(RefundRecord.created_at.desc()).limit(10))
+            res = await session.execute(select(RefundRecord).where(RefundRecord.status.in_(['pending_info','pending_admin']), RefundRecord.created_at >= today_start).order_by(RefundRecord.created_at.desc()).offset(offset).limit(page_size + 1))
             refunds = list(res.scalars().all())
+            has_next = len(refunds) > page_size
+            refunds = refunds[:page_size]
             if not refunds:
                 text = msg.admin_refund_empty()
                 markup = admin_dashboard_keyboard()
             else:
-                lines = [msg.admin_refund_list_header(len(refunds))]
+                lines = [msg.admin_refund_list_header(len(refunds)) + f'｜第 {page + 1} 页']
                 rows = []
                 for r in refunds:
                     o = await session.get(PaymentOrder, r.order_id)
@@ -2841,7 +2839,7 @@ async def admin_dashboard_list(call: CallbackQuery):
                             InlineKeyboardButton(text=f'✅ 确认退款 {_refund_no(r.id)}', callback_data=f'admin:refund_done:{r.id}'),
                             InlineKeyboardButton(text='💬 对话', callback_data=f'admin:support_link:refund:{r.id}'),
                         ])
-                rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
+                rows.extend(admin_list_page_keyboard(list_type, page, page > 0, has_next).inline_keyboard)
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'support':
@@ -2853,7 +2851,8 @@ async def admin_dashboard_list(call: CallbackQuery):
                 .limit(page_size + 1)
             )
             tickets = list(res.scalars().all())
-            tickets, has_next = _admin_page_slice(tickets, page_size)
+            has_next = len(tickets) > page_size
+            tickets = tickets[:page_size]
             if not tickets:
                 text = '💬 暂无客服小纸条～\n\n用户点「联系小掌柜」后，会在这里生成客服小纸条；退款、报销、提现仍在各自业务列表处理。'
                 markup = admin_dashboard_keyboard()
@@ -2864,10 +2863,10 @@ async def admin_dashboard_list(call: CallbackQuery):
                     user_label = t.username or str(t.user_id)
                     status_label = {'open': '待回复', 'answered': '已回复', 'closed': '已关闭'}.get(t.status, t.status)
                     body = (t.user_message or '非文本消息')[:120]
-                    lines.append(f'\n工单：{_support_no(t.id)}｜{status_label}\n用户：{user_label}（{t.user_id}）\n时间：{t.created_at:%Y-%m-%d %H:%M}\n内容：{body}')
+                    lines.append(f'\n工单：{_support_no(t.id)}｜{status_label}\n用户：{user_label}（{t.user_id}）\n时间：{_fmt_dt(t.created_at)}\n内容：{body}')
                     rows.append([InlineKeyboardButton(text=f'💬 回复用户 {_support_no(t.id)}', callback_data=f'admin:support_reply:{t.id}')])
                     rows.append([InlineKeyboardButton(text=f'✅ 关闭 {_support_no(t.id)}', callback_data=f'admin:support_close:{t.id}')])
-                rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
+                rows.extend(admin_list_page_keyboard(list_type, page, page > 0, has_next).inline_keyboard)
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'ledger':
@@ -2940,16 +2939,18 @@ async def admin_dashboard_list(call: CallbackQuery):
             text = '\n'.join(lines)
             markup = admin_dashboard_keyboard()
         elif list_type == 'risks':
-            res = await session.execute(select(RiskLog).where(RiskLog.created_at >= today_start).order_by(RiskLog.created_at.desc()).limit(10))
+            res = await session.execute(select(RiskLog).where(RiskLog.created_at >= today_start).order_by(RiskLog.created_at.desc()).offset(offset).limit(page_size + 1))
             risks = list(res.scalars().all())
+            has_next = len(risks) > page_size
+            risks = risks[:page_size]
             if not risks:
                 text = '⚠️ 暂无风控记录～'
             else:
-                lines = ['⚠️ 今日风控记录']
+                lines = [f'⚠️ 今日风控记录｜第 {page + 1} 页']
                 for r in risks:
-                    lines.append(f'\n用户：{r.user_id}\n提交系统单号：{r.submitted_no or "-"}\n原因：{r.reason}\n时间：{r.created_at:%Y-%m-%d %H:%M}')
+                    lines.append(f'\n用户：{r.user_id}\n提交系统单号：{r.submitted_no or "-"}\n原因：{r.reason}\n时间：{_fmt_dt(r.created_at)}')
                 text = '\n'.join(lines)
-            markup = admin_dashboard_keyboard()
+            markup = admin_list_page_keyboard(list_type, page, page > 0, has_next)
         else:
             await call.answer('未知列表', show_alert=True)
             return
@@ -2963,7 +2964,7 @@ async def admin_dashboard_callback(call: CallbackQuery):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
     from datetime import datetime, timedelta
-    today_start = business_today_start_utc()
+    today_start = today_start_utc_naive()
     async with SessionLocal() as session:
         new_projects = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.created_at >= today_start))).scalar() or 0
         paid_orders = (await session.execute(
@@ -3124,7 +3125,28 @@ async def collect_support_message(message: Message, state: FSMContext, bot: Bot)
         )
         return
 
-    if (message.text or '').strip() in {'退出客服', '结束客服', '/end_support', '/support_end'}:
+    text_command = (message.text or '').strip()
+    # 用户一旦点/发业务入口，就立即离开客服桥，避免发起众筹、退款资料、资源资料继续被客服吞掉。
+    if text_command == '🚗 发起众筹':
+        await state.clear()
+        from app.handlers.crowdfund import _start_crowdfund_flow
+        await _start_crowdfund_flow(message, state)
+        return
+    if text_command in {'📋 我的众筹', '📋 众筹订单'}:
+        await state.clear()
+        await message.answer(msg.order_center(), reply_markup=order_center_keyboard())
+        return
+    if text_command == '🔥 热门众筹':
+        await state.clear()
+        async with SessionLocal() as session:
+            projects = await _load_hot_projects(session)
+        if not projects:
+            await message.answer(msg.hot_empty(), reply_markup=main_menu())
+        else:
+            await message.answer(_hot_page_text(projects, 0), reply_markup=hot_projects_keyboard(projects, page=0))
+        return
+
+    if text_command in {'退出客服', '结束客服', '/end_support', '/support_end'}:
         data = await state.get_data()
         ticket_id = int(data.get('contact_ticket_id') or 0)
         if ticket_id:
@@ -3394,8 +3416,6 @@ async def admin_support_hold_private_dialog(call: CallbackQuery, state: FSMConte
     if not _is_support_private_admin(call.from_user.id):
         await call.answer('无权限', show_alert=True)
         return
-    await call.answer('正在保持这个对话...')
-    old_ticket_id = await _get_support_admin_active_ticket_id(call.from_user.id)
     ticket_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         ticket = await session.get(ContactTicket, ticket_id)
@@ -3408,10 +3428,8 @@ async def admin_support_hold_private_dialog(call: CallbackQuery, state: FSMConte
     await state.clear()
     await state.update_data(contact_ticket_id=ticket_id, support_private_bridge=True)
     await state.set_state(AdminContactReply.message)
-    switch_tip = ''
-    if old_ticket_id and int(old_ticket_id) != int(ticket_id):
-        switch_tip = f'\n\n🔁 已从 {_support_no(old_ticket_id)} 切换到 {_support_no(ticket_id)}。'
-    await call.message.answer(msg.support_private_admin_hold(user_label=user_label, ticket_no=_support_no(ticket_id)) + switch_tip)
+    await call.message.answer(msg.support_private_admin_hold(user_label=user_label, ticket_no=_support_no(ticket_id)))
+    await call.answer('已保持这个对话。')
 
 
 @router.message(lambda message: bool(
@@ -3432,14 +3450,11 @@ async def admin_support_private_reply_to_user(message: Message, state: FSMContex
 
 @router.message(AdminContactReply.message)
 async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot):
+    if await _forward_to_admin_upload_if_needed(message, bot, state):
+        return
     data = await state.get_data()
     ticket_id = int(data.get('contact_ticket_id') or 0)
-    if message.chat and message.chat.type == 'private' and _is_support_private_admin(message.from_user.id) and not ticket_id:
-        ticket_id = int(await _get_support_admin_active_ticket_id(message.from_user.id) or 0)
     if bool(data.get('support_private_bridge')) or (message.chat and message.chat.type == 'private' and _is_support_private_admin(message.from_user.id)):
-        if not ticket_id and not message.reply_to_message:
-            await message.reply(msg.support_private_admin_active_missing())
-            return
         # 管理员私聊客服桥：如果当前消息是回复另一位用户的通知，则自动切换目标用户。
         reply_ticket_id = await _support_ticket_id_from_admin_reply_message(message) if message.reply_to_message else None
         await _send_support_private_bridge_reply(
@@ -3462,11 +3477,7 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
     )
 
 
-@router.message(lambda message: bool(
-    message.chat and message.chat.type == 'private'
-    and message.from_user and _is_support_private_admin(message.from_user.id)
-    and not message.reply_to_message
-))
+@router.message(StateFilter(None), lambda message: _admin_support_active_dialog_filter(message))
 async def admin_support_private_active_dialog(message: Message, state: FSMContext, bot: Bot):
     """管理员私聊里直接发送内容：发送给当前保持的用户，不依赖 FSM。"""
     if (message.text or '').lstrip().startswith('/'):
@@ -3620,6 +3631,7 @@ async def refund_apply_start(call: CallbackQuery, state: FSMContext):
             return
         order = await session.get(PaymentOrder, r.order_id)
         project = await session.get(CrowdfundProject, r.project_id)
+    await state.clear()
     await state.update_data(refund_id=refund_id)
     await state.set_state(RefundApplyCollect.payout_info)
     await call.message.answer(
@@ -3844,6 +3856,7 @@ async def admin_search_help(call: CallbackQuery, state: FSMContext):
     if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
+    await state.clear()
     await state.set_state(AdminSearch.query)
     await call.message.answer(
         msg.admin_search_help(),
@@ -3860,6 +3873,7 @@ async def admin_search_command(message: Message, state: FSMContext):
     if len(query) == 2:
         await _run_admin_search(message, query[1].strip())
     else:
+        await state.clear()
         await state.set_state(AdminSearch.query)
         await message.answer(
             msg.admin_search_help(),
