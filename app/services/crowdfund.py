@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.messages import cute as msg
 from app.db.models import CrowdfundProject, PaymentOrder
+from app.services.project_state import state_value
 
 settings = get_settings()
 
@@ -48,7 +49,7 @@ async def create_project(
         seat_price=Decimal(str(settings.SEAT_PRICE)),
         required_seats=calc_required_seats(original_price),
         purchase_mode=purchase_mode,
-        status=ProjectState.PENDING_REVIEW,
+        status=ProjectState.PENDING_REVIEW.value,
     )
     session.add(project)
     await session.flush()
@@ -95,12 +96,14 @@ async def cancel_project(session: AsyncSession, project_id: int, reason: str = '
     project = await session.get(CrowdfundProject, project_id, with_for_update=True)
     if not project:
         return None
-    if project.status not in (ProjectState.CANCELLED, ProjectState.EXPIRED, ProjectState.REFUND_PENDING, ProjectState.REFUND_COMPLETED):
+    terminal = {state_value(ProjectState.REFUND_COMPLETED)}
+    current = state_value(project.status)
+    if current not in terminal:
         await transition_project(
             session, project, ProjectState.CANCELLED,
             reason=reason, actor_id=actor_id,
             idempotency_key=f'project:{project.id}:cancel:{abs(hash(reason))}',
-            force=project.status in (ProjectState.REJECTED,),
+            force=current in {state_value(ProjectState.REJECTED), state_value(ProjectState.DELIVERED)},
         )
     await session.commit()
     await session.refresh(project)

@@ -1869,11 +1869,16 @@ def support_open() -> str:
         '💬 小掌柜私聊窗口已打开～',
         _body(
             '你已经进入客服对话状态啦～',
-            '直接发送文字、截图、文件、视频或语音，\n小掌柜都能收到。',
-            '有什么问题、需要什么帮助，\n直接丢过来就好 🎀',
-            '小掌柜看到消息会第一时间来敲你，\n别客气，随时找我 ✨',
+            '直接发送文字、截图、文件、视频或语音，',
+            '小掌柜都能收到。',
+            '',
+            '有什么问题、需要什么帮助，',
+            '直接丢过来就好 🎀',
+            '',
+            '小掌柜看到消息会第一时间来敲你，',
+            '别客气，随时找我 ✨',
         ),
-        '只有点「联系小掌柜」才会进入这里；点发起众筹、退款、资源上传等业务入口会自动回到对应流程。',
+        '想结束时点「结束联系客服」，或发送“结束客服”。',
     )
 
 
@@ -1945,7 +1950,7 @@ def support_private_admin_hold(*, user_label: str, ticket_no: str) -> str:
 
 def support_private_admin_sent(*, user_label: str, ticket_no: str, delivery_method: str | None = None) -> str:
     method_line = f'｜{delivery_method}' if delivery_method else ''
-    return f'✅ 已发送给 {user_label}（{ticket_no}）{method_line}\n📌 当前仍保持这个客服会话；要处理资源/众筹时请点业务按钮切换。'
+    return f'✅ 已发送给 {user_label}（{ticket_no}）{method_line}'
 
 
 def support_private_admin_failed(*, user_label: str, ticket_no: str, error: object) -> str:

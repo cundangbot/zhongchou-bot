@@ -27,9 +27,7 @@ from app.keyboards import (
     resource_review_keyboard,
     payment_order_keyboard,
     resource_upload_collect_keyboard,
-    resource_upload_preview_confirm_keyboard,
     admin_resource_upload_done_keyboard,
-    admin_resource_publish_confirm_keyboard,
     description_collect_keyboard,
     resource_claim_keyboard,
     reimbursement_apply_keyboard,
@@ -55,9 +53,9 @@ from app.services.payments import create_payment_order, friendly_verify_failure
 from app.states import BuyInfoCollect, CrowdfundCreate, ResourceUploadCollect
 from app.services.idempotency import begin_operation, finish_operation
 from app.services.system_events import record_event
-from app.utils.business_time import fmt_local
 from app.messages import cute as msg
 from app.services.project_runtime import notify_project_full as runtime_notify_project_full
+from app.services.project_state import state_value, ProjectState
 
 router = Router()
 settings = get_settings()
@@ -376,7 +374,8 @@ PROJECT_STATUS_LABELS = {
 
 
 def _status_label(status: str | None) -> str:
-    return PROJECT_STATUS_LABELS.get(status or '', status or '-')
+    normalized = state_value(status)
+    return PROJECT_STATUS_LABELS.get(normalized or '', normalized or '-')
 
 
 def _purchase_mode_label(mode: str | None) -> str:
@@ -985,7 +984,7 @@ async def _publish_project_resource(bot: Bot, session, project: CrowdfundProject
 
 
 async def _start_crowdfund_flow(target, state: FSMContext):
-    # 明确进入发起众筹流程：先退出客服/验票/退款等旧状态，避免资料被别的流程吞掉。
+    # 发起众筹是原有主业务流程；无论用户之前是否在客服桥，都先退出旧状态。
     await state.clear()
     await state.set_state(CrowdfundCreate.blogger)
     await target.answer(msg.crowdfunding_start(
@@ -1155,20 +1154,22 @@ async def cf_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 @router.callback_query(F.data.startswith('admin:approve:'))
-async def admin_approve(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_approve(call: CallbackQuery, bot: Bot):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         project = await session.get(CrowdfundProject, project_id)
         if not project:
             await call.answer('项目不存在', show_alert=True)
             return
-        if project.status != 'pending_review':
-            await call.answer('该投稿已经审核处理，请勿重复点击', show_alert=True)
+        current_status = state_value(project.status)
+        if project.status != current_status:
+            project.status = current_status
+            await session.flush()
+        if current_status != ProjectState.PENDING_REVIEW.value:
+            await call.answer(f'该投稿当前状态为「{_status_label(current_status)}」，不能再通过审核', show_alert=True)
             return
         operation_key = f'approve-project:{project.id}'
         if not await begin_operation(session, operation_key, 'approve_project'):
@@ -1212,23 +1213,32 @@ async def admin_approve(call: CallbackQuery, state: FSMContext, bot: Bot):
         )
         await finish_operation(session, operation_key, {'channel_message_id': sent.message_id})
         await session.commit()
-    await call.message.edit_text('✅ 已通过并发布众筹，已通知发起人支付双车位费用')
+    await _edit_panel(call, '✅ 已通过并发布众筹，已通知发起人支付双车位费用')
     await call.answer()
 
 
 @router.callback_query(F.data.startswith('admin:reject:'))
-async def admin_reject(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_reject(call: CallbackQuery, bot: Bot):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
+        project = await session.get(CrowdfundProject, project_id)
+        if not project:
+            await call.answer('项目不存在', show_alert=True)
+            return
+        current_status = state_value(project.status)
+        if project.status != current_status:
+            project.status = current_status
+            await session.flush()
+        if current_status != ProjectState.PENDING_REVIEW.value:
+            await call.answer(f'该投稿当前状态为「{_status_label(current_status)}」，不能再拒绝审核', show_alert=True)
+            return
         project = await reject_project(session, project_id, actor_id=call.from_user.id)
     if project:
         await bot.send_message(project.creator_id, msg.crowdfunding_rejected(project_title(project)))
-    await call.message.edit_text('❌ 已拒绝众筹')
+    await _edit_panel(call, '❌ 已拒绝众筹')
     await call.answer()
 
 
@@ -1396,7 +1406,6 @@ async def _confirm_payment_message(message: Message, bot: Bot, system_no: str, o
 
 @router.callback_query(F.data.startswith('creator:buyinfo:'))
 async def creator_buyinfo_prompt(call: CallbackQuery, state: FSMContext):
-    await state.clear()
     project_id = int(call.data.split(':')[-1])
     await state.update_data(project_id=project_id)
     await state.set_state(BuyInfoCollect.info)
@@ -1485,31 +1494,12 @@ def _admin_upload_session_for_message(message: Message) -> dict | None:
     return None
 
 
-async def _clear_admin_support_session(admin_id: int) -> None:
-    # 管理员进入资源上传等业务流程时，清掉“保持客服对话”，防止资源被客服桥吞掉。
-    async with SessionLocal() as session:
-        rows = list((await session.execute(select(SupportAdminSession).where(SupportAdminSession.admin_id == int(admin_id)))).scalars().all())
-        for row in rows:
-            await session.delete(row)
-        if rows:
-            await session.commit()
-
-
-def admin_has_active_upload_session(user_id: int | None) -> bool:
-    if not user_id:
-        return False
-    sess = ADMIN_UPLOAD_USER_SESSIONS.get(int(user_id))
-    return bool(sess and int(sess.get('project_id') or 0))
-
-
 @router.callback_query(F.data.startswith('admin:upload_resource:'))
 async def admin_upload_resource_prompt(call: CallbackQuery, state: FSMContext, bot: Bot):
     from app.services.project_state import ProjectState, transition_project
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
 
     async with SessionLocal() as session:
@@ -1531,6 +1521,13 @@ async def admin_upload_resource_prompt(call: CallbackQuery, state: FSMContext, b
     # 私聊兜底会话：如果群消息因 Bot 隐私/权限收不到，管理员私聊机器人也能上传。
     ADMIN_UPLOAD_USER_SESSIONS[call.from_user.id] = upload_session.copy()
     await state.clear()
+    # 管理员进入资源上传后，释放其保持的客服会话，避免私聊资源被客服桥吞掉。
+    async with SessionLocal() as session:
+        rows = list((await session.execute(select(SupportAdminSession).where(SupportAdminSession.admin_id == int(call.from_user.id)))).scalars().all())
+        for row in rows:
+            await session.delete(row)
+        if rows:
+            await session.commit()
 
     panel = await call.message.answer(
         _upload_status_text(project, [], 'admin'),
@@ -1621,98 +1618,54 @@ async def collect_resource_upload(message: Message, state: FSMContext, bot: Bot)
 
 @router.callback_query(F.data.startswith('resource:finish:'))
 async def resource_upload_finish(call: CallbackQuery, state: FSMContext, bot: Bot):
-    """上传完成第一步：只做预览确认，不直接提交/私发。"""
-    project_id = int(call.data.split(':')[-1])
-    role, project, items = await _resolve_upload_finish_context(call, state, project_id)
-    if not project:
-        return
-    if not items:
-        await call.answer('还没有收到资源，请先发送资源内容。', show_alert=True)
-        return
-    summary = _resource_preview_text(project, items, role)
-    if role == 'admin':
-        await call.message.answer(summary, reply_markup=admin_resource_publish_confirm_keyboard(project_id))
-        await call.answer('请先预览确认，再私发资源。')
-    else:
-        await call.message.answer(summary, reply_markup=resource_upload_preview_confirm_keyboard(project_id))
-        await call.answer('请先预览确认，再提交审核。')
-
-
-@router.callback_query(F.data.startswith('resource:continue:'))
-async def resource_upload_continue(call: CallbackQuery):
-    await call.answer('继续直接发送资源即可；发完再点“预览确认”。', show_alert=True)
-
-
-@router.callback_query(F.data.startswith('resource:confirm:'))
-async def resource_upload_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
     from app.services.project_state import ProjectState, transition_project
     project_id = int(call.data.split(':')[-1])
     data = await state.get_data()
-    if int(data.get('project_id') or 0) != project_id:
-        await call.answer('当前没有这个项目的上传会话，请重新打开上传面板。', show_alert=True)
-        return
-    async with SessionLocal() as session:
-        project = await session.get(CrowdfundProject, project_id)
-        if not project:
-            await call.answer('项目不存在', show_alert=True)
-            return
-        await _wait_media_group_flush()
-        await session.refresh(project)
-        items = _load_resource_items(project)
-        if not items:
-            await call.answer('还没有收到资源，请先发送资源内容。', show_alert=True)
-            return
-        await transition_project(session, project, ProjectState.RESOURCE_SUBMITTED, reason='资源预览确认后提交审核', force=True)
-        await session.commit()
-        await _send_resource_preview_to_admin(bot, project, items)
-    await state.clear()
-    await call.message.answer('✅ 已确认提交管理审核。审核通过后会直接私发给所有已支付拼车用户。')
-    await call.answer('已提交审核。')
+    sess_key = call.message.chat.id
+    admin_sess = ADMIN_UPLOAD_SESSIONS.get(call.message.chat.id)
+    if not admin_sess and call.from_user:
+        admin_sess = ADMIN_UPLOAD_USER_SESSIONS.get(call.from_user.id)
 
-
-async def _resolve_upload_finish_context(call: CallbackQuery, state: FSMContext, project_id: int) -> tuple[str | None, CrowdfundProject | None, list[dict]]:
-    data = await state.get_data()
-    admin_sess = (
-        ADMIN_UPLOAD_SESSIONS.get(call.message.chat.id)
-        or ADMIN_UPLOAD_SESSIONS.get(settings.ADMIN_GROUP_ID)
-        or (ADMIN_UPLOAD_USER_SESSIONS.get(call.from_user.id) if call.from_user else None)
-    )
-    role = 'admin' if admin_sess and int(admin_sess.get('project_id') or 0) == project_id else None
-    if not role:
+    # 管理员平台代购上传允许走独立会话，不强依赖 FSM。
+    if admin_sess and int(admin_sess.get('project_id') or 0) == project_id:
+        role = 'admin'
+    else:
         if int(data.get('project_id') or 0) != project_id:
             await call.answer('当前没有这个项目的上传会话，请先点击“上传资源”。', show_alert=True)
-            return None, None, []
+            return
         role = data.get('upload_role', 'creator')
+
     async with SessionLocal() as session:
         project = await session.get(CrowdfundProject, project_id)
         if not project:
             await call.answer('项目不存在', show_alert=True)
-            return None, None, []
+            return
+        # 媒体组上传后用户马上点完成时，可能还有几条图片/视频 update 正在排队处理。
+        # 等待一小段时间再读取，避免只提交第一张。
         await _wait_media_group_flush()
         await session.refresh(project)
         items = await _sync_admin_upload_session_to_project(session, project, call.message.chat.id) if role == 'admin' else _load_resource_items(project)
-        return role, project, items
+        if not items:
+            await call.answer('还没有收到资源，请先在本群发送资源内容。', show_alert=True)
+            return
+        await transition_project(session, project, ProjectState.RESOURCE_SUBMITTED, reason='资源上传完成，提交审核', force=True)
+        await session.commit()
+        if role == 'admin':
+            await call.message.answer(
+                f'✅ 平台代购资源已接收完成。\n{project_label(project)}\n分类：{_resource_type_counts(items)}\n\n请选择下一步：',
+                reply_markup=admin_resource_upload_done_keyboard(project.id),
+            )
+        else:
+            await _send_resource_preview_to_admin(bot, project, items)
+            await call.message.answer('✅ 已完成上传，并提交管理审核。审核通过后会直接私发给所有已支付拼车用户。')
+    if role == 'admin':
+        ADMIN_UPLOAD_SESSIONS.pop(call.message.chat.id, None)
+        ADMIN_UPLOAD_SESSIONS.pop(settings.ADMIN_GROUP_ID, None)
+        if call.from_user:
+            ADMIN_UPLOAD_USER_SESSIONS.pop(call.from_user.id, None)
+    await state.clear()
+    await call.answer()
 
-
-def _resource_preview_text(project: CrowdfundProject, items: list[dict], role: str | None) -> str:
-    counts = _resource_type_counts(items)
-    samples: list[str] = []
-    for item in items[:6]:
-        kind = item.get('type') or 'unknown'
-        caption = (item.get('caption') or item.get('text') or '').strip().replace('\n', ' ')
-        if len(caption) > 40:
-            caption = caption[:40] + '…'
-        samples.append(f'• {kind}' + (f'｜{caption}' if caption else ''))
-    more = f'\n…另有 {len(items)-6} 条' if len(items) > 6 else ''
-    action = '私发给已支付用户' if role == 'admin' else '提交管理审核'
-    return (
-        f'👀 资源上传预览确认\n\n'
-        f'{project_label(project)}\n'
-        f'分类：{counts}\n'
-        f'共收到：{len(items)} 条资源\n\n'
-        f'{chr(10).join(samples) if samples else "-"}{more}\n\n'
-        f'确认无误后再点下面按钮，系统才会{action}。'
-    )
 
 @router.callback_query(F.data.startswith('resource:view:'))
 async def user_view_resource(call: CallbackQuery, bot: Bot):
@@ -1812,12 +1765,10 @@ def _clear_admin_upload_sessions(project_id: int, chat_id: int | None = None) ->
 
 
 @router.callback_query(F.data.startswith('admin:resource_done:'))
-async def admin_resource_done(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_resource_done(call: CallbackQuery, bot: Bot):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         project = await session.get(CrowdfundProject, project_id)
@@ -1833,30 +1784,11 @@ async def admin_resource_done(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.answer()
 
 
-
-@router.callback_query(F.data.startswith('admin:preview_publish_resource:'))
-async def admin_preview_publish_resource(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in settings.admin_id_list:
-        await call.answer('无权限', show_alert=True)
-        return
-    project_id = int(call.data.split(':')[-1])
-    role, project, items = await _resolve_upload_finish_context(call, state, project_id)
-    if not project:
-        return
-    if not items:
-        await call.answer('还没有收到资源，请先发送资源内容。', show_alert=True)
-        return
-    await call.message.answer(_resource_preview_text(project, items, 'admin'), reply_markup=admin_resource_publish_confirm_keyboard(project_id))
-    await call.answer('请先预览确认，再私发资源。')
-
-
 @router.callback_query(F.data.startswith('admin:publish_resource:'))
-async def admin_publish_resource(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_publish_resource(call: CallbackQuery, bot: Bot):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         project = await session.get(CrowdfundProject, project_id)
@@ -1873,13 +1805,11 @@ async def admin_publish_resource(call: CallbackQuery, state: FSMContext, bot: Bo
 
 
 @router.callback_query(F.data.startswith('admin:reject_resource:'))
-async def admin_reject_resource(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_reject_resource(call: CallbackQuery, bot: Bot):
     from app.services.project_state import ProjectState, transition_project
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         project = await session.get(CrowdfundProject, project_id)
@@ -1895,12 +1825,10 @@ async def admin_reject_resource(call: CallbackQuery, state: FSMContext, bot: Bot
 
 
 @router.callback_query(F.data.startswith('admin:cancel_project:'))
-async def admin_cancel_project(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_cancel_project(call: CallbackQuery, bot: Bot):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         project = await session.get(CrowdfundProject, project_id)
@@ -1973,12 +1901,10 @@ async def user_view_resource_page(call: CallbackQuery, bot: Bot):
         await _safe_send(bot, call.from_user.id, '发送失败，请稍后重试或联系管理。')
 
 @router.callback_query(F.data.startswith('admin:project:'))
-async def admin_project_detail(call: CallbackQuery, state: FSMContext):
+async def admin_project_detail(call: CallbackQuery):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         p = await session.get(CrowdfundProject, project_id)
@@ -2000,18 +1926,16 @@ async def admin_project_detail(call: CallbackQuery, state: FSMContext):
             refunds=0,
             resource_status=_resource_type_counts(items),
         ),
-        reply_markup=admin_project_detail_keyboard(p.id),
+        reply_markup=admin_project_detail_keyboard(p.id, p.status),
     )
     await call.answer()
 
 
 @router.callback_query(F.data.startswith('admin:paid_users:'))
-async def admin_paid_users(call: CallbackQuery, state: FSMContext):
+async def admin_paid_users(call: CallbackQuery):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         p = await session.get(CrowdfundProject, project_id)
@@ -2025,12 +1949,10 @@ async def admin_paid_users(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith('admin:pending_orders:'))
-async def admin_pending_orders(call: CallbackQuery, state: FSMContext):
+async def admin_pending_orders(call: CallbackQuery):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         p = await session.get(CrowdfundProject, project_id)
@@ -2044,12 +1966,10 @@ async def admin_pending_orders(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith('admin:view_resources:'))
-async def admin_view_resources(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_view_resources(call: CallbackQuery, bot: Bot):
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         p = await session.get(CrowdfundProject, project_id)
@@ -2065,13 +1985,11 @@ async def admin_view_resources(call: CallbackQuery, state: FSMContext, bot: Bot)
 
 
 @router.callback_query(F.data.startswith('admin:reset_resource:'))
-async def admin_reset_resource(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_reset_resource(call: CallbackQuery, bot: Bot):
     from app.services.project_state import ProjectState, transition_project
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         p = await session.get(CrowdfundProject, project_id)
@@ -2087,13 +2005,11 @@ async def admin_reset_resource(call: CallbackQuery, state: FSMContext, bot: Bot)
 
 
 @router.callback_query(F.data.startswith('admin:mark_full:'))
-async def admin_mark_full(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def admin_mark_full(call: CallbackQuery, bot: Bot):
     from app.services.project_state import ProjectState, transition_project
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
-    await state.clear()
-    await _clear_admin_support_session(call.from_user.id)
     project_id = int(call.data.split(':')[-1])
     async with SessionLocal() as session:
         p = await session.get(CrowdfundProject, project_id)

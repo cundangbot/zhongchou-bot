@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from enum import StrEnum
+from enum import Enum
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import CrowdfundProject, ProjectStateHistory
 
 
-class ProjectState(StrEnum):
+class ProjectState(str, Enum):
     DRAFT = 'draft'
     PENDING_REVIEW = 'pending_review'
     REJECTED = 'rejected'
@@ -31,53 +31,104 @@ class ProjectState(StrEnum):
     REFUND_COMPLETED = 'refund_completed'
 
 
+def state_value(value: str | ProjectState | None) -> str:
+    """Normalize project status values.
+
+    历史代码里有些地方会把 Enum 直接 str() 成 ``ProjectState.X``，
+    这里统一规整成数据库使用的 ``pending_review`` 这类字符串。
+    """
+    if value is None:
+        return ''
+    if isinstance(value, ProjectState):
+        return value.value
+    raw = str(value).strip()
+    if raw.startswith('ProjectState.'):
+        name = raw.split('.', 1)[1]
+        try:
+            return ProjectState[name].value
+        except Exception:
+            return raw
+    return raw
+
+
+def _state_set(*values: str | ProjectState) -> set[str]:
+    return {state_value(v) for v in values}
+
+
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    ProjectState.DRAFT: {ProjectState.PENDING_REVIEW},
-    ProjectState.PENDING_REVIEW: {ProjectState.REJECTED, ProjectState.APPROVED_WAIT_CREATOR, ProjectState.ACTIVE},
-    ProjectState.APPROVED_WAIT_CREATOR: {ProjectState.ACTIVE, ProjectState.CANCELLED},
-    ProjectState.ACTIVE: {ProjectState.FULL, ProjectState.CANCELLED, ProjectState.EXPIRED},
-    ProjectState.FULL: {
-        ProjectState.WAITING_CREATOR_RESOURCE, ProjectState.WAITING_BUY_INFO,
-        ProjectState.PLATFORM_PURCHASING, ProjectState.RESOURCE_UPLOADING,
+    state_value(ProjectState.DRAFT): _state_set(ProjectState.PENDING_REVIEW, ProjectState.CANCELLED),
+    state_value(ProjectState.PENDING_REVIEW): _state_set(
+        ProjectState.REJECTED,
+        ProjectState.APPROVED_WAIT_CREATOR,
+        ProjectState.ACTIVE,
         ProjectState.CANCELLED,
-    },
-    ProjectState.WAITING_CREATOR_RESOURCE: {
-        ProjectState.RESOURCE_UPLOADING, ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.RESOURCE_REJECTED, ProjectState.CANCELLED,
-    },
-    ProjectState.WAITING_BUY_INFO: {ProjectState.PLATFORM_PURCHASING, ProjectState.CANCELLED},
-    ProjectState.PLATFORM_PURCHASING: {
-        ProjectState.ADMIN_UPLOADING, ProjectState.RESOURCE_UPLOADING,
-        ProjectState.RESOURCE_SUBMITTED, ProjectState.CANCELLED,
-    },
-    ProjectState.ADMIN_UPLOADING: {
-        ProjectState.PLATFORM_PURCHASING, ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.RESOURCE_UPLOADING, ProjectState.CANCELLED,
-    },
-    ProjectState.RESOURCE_UPLOADING: {
-        ProjectState.RESOURCE_SUBMITTED, ProjectState.RESOURCE_REJECTED,
+    ),
+    state_value(ProjectState.REJECTED): _state_set(ProjectState.CANCELLED),
+    state_value(ProjectState.APPROVED_WAIT_CREATOR): _state_set(ProjectState.ACTIVE, ProjectState.CANCELLED),
+    state_value(ProjectState.ACTIVE): _state_set(ProjectState.FULL, ProjectState.CANCELLED, ProjectState.EXPIRED),
+    state_value(ProjectState.FULL): _state_set(
+        ProjectState.WAITING_CREATOR_RESOURCE,
+        ProjectState.WAITING_BUY_INFO,
+        ProjectState.PLATFORM_PURCHASING,
+        ProjectState.RESOURCE_UPLOADING,
         ProjectState.CANCELLED,
-    },
-    ProjectState.RESOURCE_SUBMITTED: {
-        ProjectState.RESOURCE_PUBLISHED, ProjectState.DELIVERED,
-        ProjectState.RESOURCE_REJECTED, ProjectState.CANCELLED,
-    },
-    ProjectState.RESOURCE_REVIEW: {
-        ProjectState.RESOURCE_UPLOADING, ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.RESOURCE_REJECTED, ProjectState.CANCELLED,
-    },
-    ProjectState.RESOURCE_REJECTED: {
-        ProjectState.RESOURCE_UPLOADING, ProjectState.RESOURCE_SUBMITTED,
+    ),
+    state_value(ProjectState.WAITING_CREATOR_RESOURCE): _state_set(
+        ProjectState.RESOURCE_UPLOADING,
+        ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.RESOURCE_REJECTED,
         ProjectState.CANCELLED,
-    },
-    ProjectState.RESOURCE_PUBLISHED: {ProjectState.DELIVERED, ProjectState.RESOURCE_REVIEW, ProjectState.CANCELLED},
-    ProjectState.DELIVERED: {ProjectState.RESOURCE_REVIEW},
-    ProjectState.CANCELLED: {ProjectState.REFUND_PENDING},
-    ProjectState.EXPIRED: {ProjectState.REFUND_PENDING},
-    ProjectState.REFUND_PENDING: {ProjectState.REFUND_COMPLETED},
-    ProjectState.REJECTED: set(),
-    ProjectState.REFUND_COMPLETED: set(),
+    ),
+    state_value(ProjectState.WAITING_BUY_INFO): _state_set(ProjectState.PLATFORM_PURCHASING, ProjectState.CANCELLED),
+    state_value(ProjectState.PLATFORM_PURCHASING): _state_set(
+        ProjectState.ADMIN_UPLOADING,
+        ProjectState.RESOURCE_UPLOADING,
+        ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.CANCELLED,
+    ),
+    state_value(ProjectState.ADMIN_UPLOADING): _state_set(
+        ProjectState.PLATFORM_PURCHASING,
+        ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.RESOURCE_UPLOADING,
+        ProjectState.CANCELLED,
+    ),
+    state_value(ProjectState.RESOURCE_UPLOADING): _state_set(
+        ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.RESOURCE_REJECTED,
+        ProjectState.CANCELLED,
+    ),
+    state_value(ProjectState.RESOURCE_SUBMITTED): _state_set(
+        ProjectState.RESOURCE_PUBLISHED,
+        ProjectState.DELIVERED,
+        ProjectState.RESOURCE_REJECTED,
+        ProjectState.CANCELLED,
+    ),
+    state_value(ProjectState.RESOURCE_REVIEW): _state_set(
+        ProjectState.RESOURCE_UPLOADING,
+        ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.RESOURCE_REJECTED,
+        ProjectState.CANCELLED,
+    ),
+    state_value(ProjectState.RESOURCE_REJECTED): _state_set(
+        ProjectState.RESOURCE_UPLOADING,
+        ProjectState.RESOURCE_SUBMITTED,
+        ProjectState.CANCELLED,
+    ),
+    state_value(ProjectState.RESOURCE_PUBLISHED): _state_set(
+        ProjectState.DELIVERED,
+        ProjectState.RESOURCE_REVIEW,
+        ProjectState.CANCELLED,
+    ),
+    # 后台“手动取消项目”是管理兜底动作，允许已交付项目走取消/退款清单流程。
+    state_value(ProjectState.DELIVERED): _state_set(ProjectState.RESOURCE_REVIEW, ProjectState.CANCELLED),
+    state_value(ProjectState.CANCELLED): _state_set(ProjectState.REFUND_PENDING),
+    state_value(ProjectState.EXPIRED): _state_set(ProjectState.REFUND_PENDING),
+    state_value(ProjectState.REFUND_PENDING): _state_set(ProjectState.REFUND_COMPLETED),
+    state_value(ProjectState.REFUND_COMPLETED): set(),
 }
+
+
+TERMINAL_STATES = _state_set(ProjectState.REFUND_COMPLETED)
 
 
 class InvalidProjectTransition(ValueError):
@@ -87,17 +138,19 @@ class InvalidProjectTransition(ValueError):
 async def initialize_project_state(
     session: AsyncSession,
     project: CrowdfundProject,
-    state: str = ProjectState.PENDING_REVIEW,
-    *, actor_id: int | None = None,
+    state: str | ProjectState = ProjectState.PENDING_REVIEW,
+    *,
+    actor_id: int | None = None,
     reason: str = '创建项目',
 ) -> None:
-    project.status = str(state)
+    normalized = state_value(state)
+    project.status = normalized
     project.status_version = 1
     await session.flush()
     session.add(ProjectStateHistory(
         project_id=project.id,
         from_status=None,
-        to_status=str(state),
+        to_status=normalized,
         reason=reason,
         actor_id=actor_id,
         idempotency_key=f'project:{project.id}:initial',
@@ -119,21 +172,21 @@ async def transition_project(
 
     返回 True 表示发生了状态变化；同状态调用返回 False，天然防重复。
     """
-    # Serialize all state changes for the same project. SQLAlchemy's identity map
-    # returns the same ORM instance, so callers continue seeing the locked values.
     project = (await session.execute(
         select(CrowdfundProject).where(CrowdfundProject.id == project.id).with_for_update()
     )).scalar_one()
-    target = str(new_status)
-    current = str(project.status)
+    target = state_value(new_status)
+    current = state_value(project.status)
+    if project.status != current:
+        # 兼容历史脏数据，例如 ProjectState.PENDING_REVIEW。
+        project.status = current
     if current == target:
         return False
     allowed = ALLOWED_TRANSITIONS.get(current, set())
     if not force and target not in allowed:
-        raise InvalidProjectTransition(f'项目状态不能从 {current} 变更为 {target}')
+        raise InvalidProjectTransition(f'项目状态不能从 {current or project.status} 变更为 {target}')
 
     if idempotency_key:
-        # 由唯一约束保证同一个业务状态变更只记录一次。
         existing = await session.execute(
             select(ProjectStateHistory.id).where(ProjectStateHistory.idempotency_key == idempotency_key)
         )
@@ -144,9 +197,9 @@ async def transition_project(
     project.status = target
     project.status_version = int(project.status_version or 0) + 1
     now = datetime.utcnow()
-    if target == ProjectState.FULL and project.full_at is None:
+    if target == state_value(ProjectState.FULL) and project.full_at is None:
         project.full_at = now
-    if target in (ProjectState.CANCELLED, ProjectState.EXPIRED):
+    if target in _state_set(ProjectState.CANCELLED, ProjectState.EXPIRED):
         project.expired_at = now
         if reason:
             project.cancel_reason = reason
