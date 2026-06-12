@@ -230,37 +230,53 @@ def project_progress_text(project: CrowdfundProject, *, compact: bool = False) -
 
 
 def project_public_text(project: CrowdfundProject) -> str:
-    from app.services.project_state import ProjectState, initialize_project_state, transition_project
+    from app.services.project_state import ProjectState
     mode_map = {'prepaid': '🙋 我来垫付', 'platform': '🤖 小掌柜代买', 'owned': '📦 我已持有资源'}
+    current_status = state_value(project.status)
     status_map = {
-        ProjectState.DRAFT: '待提交',
-        ProjectState.PENDING: '待审核',
-        ProjectState.REJECTED: '审核未通过',
-        ProjectState.ACTIVE: '众筹中',
-        ProjectState.FULL: '已满员',
-        ProjectState.WAITING_CREATOR_RESOURCE: '等待车主上传资源',
-        ProjectState.WAITING_BUY_INFO: '等待购买资料',
-        ProjectState.PLATFORM_PURCHASING: '小掌柜代买中',
-        ProjectState.ADMIN_UPLOADING: '等待小掌柜上传资源',
-        ProjectState.RESOURCE_UPLOADING: '资源上传中',
-        ProjectState.RESOURCE_SUBMITTED: '资源待审核',
-        ProjectState.RESOURCE_REVIEW: '资源审核中',
-        ProjectState.RESOURCE_REJECTED: '资源需重传',
-        ProjectState.RESOURCE_PUBLISHED: '资源可领取',
-        ProjectState.DELIVERED: '已交付',
-        ProjectState.EXPIRED: '已超时',
-        ProjectState.CANCELLED: '已取消',
-        ProjectState.REFUND_PENDING: '退款处理中',
-        ProjectState.REFUND_COMPLETED: '退款完成',
+        state_value(ProjectState.DRAFT): '待提交',
+        state_value(ProjectState.PENDING_REVIEW): '待审核',
+        state_value(ProjectState.REJECTED): '审核未通过',
+        state_value(ProjectState.APPROVED_WAIT_CREATOR): '等待发起人预付',
+        state_value(ProjectState.ACTIVE): '众筹中',
+        state_value(ProjectState.FULL): '已满员',
+        state_value(ProjectState.WAITING_CREATOR_RESOURCE): '等待车主上传资源',
+        state_value(ProjectState.WAITING_BUY_INFO): '等待购买资料',
+        state_value(ProjectState.PLATFORM_PURCHASING): '小掌柜代买中',
+        state_value(ProjectState.ADMIN_UPLOADING): '等待小掌柜上传资源',
+        state_value(ProjectState.RESOURCE_UPLOADING): '资源上传中',
+        state_value(ProjectState.RESOURCE_SUBMITTED): '资源待审核',
+        state_value(ProjectState.RESOURCE_REVIEW): '资源审核中',
+        state_value(ProjectState.RESOURCE_REJECTED): '资源需重传',
+        state_value(ProjectState.RESOURCE_PUBLISHED): '资源可领取',
+        state_value(ProjectState.DELIVERED): '已交付',
+        state_value(ProjectState.EXPIRED): '已超时',
+        state_value(ProjectState.CANCELLED): '已取消',
+        state_value(ProjectState.REFUND_PENDING): '退款处理中',
+        state_value(ProjectState.REFUND_COMPLETED): '退款完成',
+    }
+    after_full_states = {
+        state_value(ProjectState.FULL),
+        state_value(ProjectState.WAITING_CREATOR_RESOURCE),
+        state_value(ProjectState.WAITING_BUY_INFO),
+        state_value(ProjectState.PLATFORM_PURCHASING),
+        state_value(ProjectState.ADMIN_UPLOADING),
+        state_value(ProjectState.RESOURCE_UPLOADING),
+        state_value(ProjectState.RESOURCE_SUBMITTED),
+        state_value(ProjectState.RESOURCE_REVIEW),
+        state_value(ProjectState.RESOURCE_REJECTED),
+        state_value(ProjectState.RESOURCE_PUBLISHED),
+        state_value(ProjectState.DELIVERED),
+    }
+    stopped_states = {
+        state_value(ProjectState.EXPIRED),
+        state_value(ProjectState.CANCELLED),
+        state_value(ProjectState.REFUND_PENDING),
+        state_value(ProjectState.REFUND_COMPLETED),
     }
     progress = project_progress_text(project)
     extra_note = None
-    if project.status in (
-        ProjectState.FULL, ProjectState.WAITING_CREATOR_RESOURCE, ProjectState.WAITING_BUY_INFO,
-        ProjectState.PLATFORM_PURCHASING, ProjectState.ADMIN_UPLOADING, ProjectState.RESOURCE_UPLOADING,
-        ProjectState.RESOURCE_SUBMITTED, ProjectState.RESOURCE_REVIEW, ProjectState.RESOURCE_REJECTED,
-        ProjectState.RESOURCE_PUBLISHED, ProjectState.DELIVERED,
-    ):
+    if current_status in after_full_states:
         pending_extra = max(0, int(project.extra_fund_count or 0) - int(project.extra_withdrawn_count or 0))
         withdraw_line = f'\n🍬 车主已提现：{project.creator_withdraw_times} 次' if int(project.creator_withdraw_times or 0) > 0 else ''
         progress = (
@@ -270,7 +286,7 @@ def project_public_text(project: CrowdfundProject) -> str:
             f'🎁 满员后补票：+{pending_extra} 人{withdraw_line}'
         )
         extra_note = '小掌柜提醒：这辆车已经满员啦，补票用户可在资源审核通过后领取宝贝～'
-    if project.status in (ProjectState.EXPIRED, ProjectState.CANCELLED, ProjectState.REFUND_PENDING, ProjectState.REFUND_COMPLETED):
+    if current_status in stopped_states:
         progress = f'⛔ 这辆小车已暂停\n原因：{project.cancel_reason or "项目已取消"}'
         extra_note = '小掌柜提醒：这辆车当前不能继续上车，如涉及退款请在「我的众筹」里查看退款小票。'
     total = calc_total_collect_amount(project.original_price or 0)
@@ -286,13 +302,8 @@ def project_public_text(project: CrowdfundProject) -> str:
         creator_prepay_seats=int(settings.CREATOR_PREPAY_SEATS),
         creator_prepay_amount=float(settings.creator_prepay_amount),
         mode_name=mode_map.get(project.purchase_mode, project.purchase_mode),
-        status_name=status_map.get(project.status, project.status),
-        after_full=project.status in (
-            ProjectState.FULL, ProjectState.WAITING_CREATOR_RESOURCE, ProjectState.WAITING_BUY_INFO,
-            ProjectState.PLATFORM_PURCHASING, ProjectState.ADMIN_UPLOADING, ProjectState.RESOURCE_UPLOADING,
-            ProjectState.RESOURCE_SUBMITTED, ProjectState.RESOURCE_REVIEW, ProjectState.RESOURCE_REJECTED,
-            ProjectState.RESOURCE_PUBLISHED, ProjectState.DELIVERED,
-        ),
+        status_name=status_map.get(current_status, current_status),
+        after_full=current_status in after_full_states,
         extra_fund_count=max(0, int(project.extra_fund_count or 0) - int(project.extra_withdrawn_count or 0)),
         extra_note=extra_note,
     )
