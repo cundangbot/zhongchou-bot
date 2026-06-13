@@ -62,7 +62,7 @@ from app.keyboards import (
 )
 from app.services.crowdfund import create_project, project_public_text, project_title, project_label, project_no, project_progress_text
 from app.services.project_state import ProjectState, state_value, transition_project, InvalidProjectTransition
-from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
+from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, restore_cancelled_order_as_paid, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
 from app.states import PaymentSubmit, ProfitWithdrawCollect, RefundApplyCollect, ContactSupport, AdminContactReply, AdminSearch, AdminManualVerify
 from app.services.ledger import post_ledger
 from app.services.idempotency import begin_operation, finish_operation
@@ -2775,6 +2775,46 @@ async def admin_rebind_order_user(message: Message, bot: Bot):
     )
 
 
+@router.message(Command('restore_order', 'restore_paid', 'mark_paid'))
+async def admin_restore_order_paid(message: Message, bot: Bot):
+    """把已取消/已过期但已经绑定 VP 的车票恢复为已支付。"""
+    if message.from_user.id not in settings.admin_id_list:
+        await message.answer('无权限。')
+        return
+    parts = (message.text or '').strip().split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer(
+            '用法：/restore_order T.车票ID [原因]\n'
+            '例：/restore_order T.060 用户付款已确认但车票被取消\n\n'
+            '适用：VP 单号、用户、项目都对，但车票状态是 cancelled/expired，用户「我拼车中」看不到。'
+        )
+        return
+    raw_ticket = parts[1].upper().replace('T.', '').replace('T', '').strip()
+    try:
+        order_id = int(raw_ticket)
+    except ValueError:
+        await message.answer('车票格式错误。示例：/restore_order T.060 用户付款已确认')
+        return
+    reason = parts[2].strip() if len(parts) >= 3 else None
+
+    async with SessionLocal() as session:
+        ok, reason_text, order = await restore_cancelled_order_as_paid(
+            session, order_id=order_id, admin_id=message.from_user.id, reason=reason
+        )
+        if not ok or not order:
+            await message.answer('❌ ' + reason_text)
+            return
+        await _after_admin_force_verify(bot, session, order, message.from_user.id)
+    await message.answer(
+        f'✅ 已恢复车票为已支付\n'
+        f'车票：{_ticket_no(order.id)}\n'
+        f'项目：P.{int(order.project_id or 0):03d}\n'
+        f'用户：{order.user_id}\n'
+        f'系统单号：{order.faka_system_no or "-"}\n\n'
+        f'现在用户的「我拼车中」会按 paid 车票显示；项目完成后也会按这张票发资源。'
+    )
+
+
 @router.message(Command('rebind_vp', 'reassign_vp'))
 async def admin_rebind_vp_user(message: Message, bot: Bot):
     """按 VP 系统单号把已支付车票接回正确用户。"""
@@ -3823,13 +3863,13 @@ async def admin_support_private_reply_to_user(message: Message, state: FSMContex
         else:
             await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
         return
-    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp'):
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
         await state.clear()
         if command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
             await admin_add_order(message, bot)
         elif command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order'):
             await admin_rebind_order_user(message, bot)
-        elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp'):
+        elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
             await admin_rebind_vp_user(message, bot)
         else:
             await admin_force_verify(message, bot)
@@ -3860,13 +3900,13 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
         else:
             await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
         return
-    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp'):
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
         await state.clear()
         if command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
             await admin_add_order(message, bot)
         elif command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order'):
             await admin_rebind_order_user(message, bot)
-        elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp'):
+        elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
             await admin_rebind_vp_user(message, bot)
         else:
             await admin_force_verify(message, bot)

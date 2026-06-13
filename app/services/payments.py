@@ -49,6 +49,12 @@ def _duplicate_order_message(duplicate: PaymentOrder | None, *, kind: str = '系
     project = _project_no(getattr(duplicate, 'project_id', None))
     status = getattr(duplicate, 'status', '-') or '-'
     user_id = getattr(duplicate, 'user_id', '-') or '-'
+    extra = ''
+    if status in ('cancelled', 'expired'):
+        extra = (
+            f'\n\n⚠️ 这笔付款现在占用的是一张“已取消/已过期”车票。'
+            f'如果确认这张票就是有效付款，请管理员用 /restore_order {ticket} 原因 先恢复为已支付。'
+        )
     return (
         f'该{kind}已经绑定过，不能重复使用。\n'
         f'占用车票：{ticket}\n'
@@ -57,6 +63,7 @@ def _duplicate_order_message(duplicate: PaymentOrder | None, *, kind: str = '系
         f'当前状态：{status}\n\n'
         f'如果你确认这是同一笔付款，请让小掌柜在后台搜索 {ticket} 或系统单号后处理。'
         f'管理员确认绑错时，可先 /search 系统单号。若只是挂错用户，用 /rebind_user {ticket} 正确用户ID；若要转到另一张待付车票，用 /move_bind T.目标车票 {ticket} 转绑。'
+        f'{extra}'
     )
 
 
@@ -752,6 +759,93 @@ async def force_create_paid_order_for_user(
         return False, _duplicate_order_message(duplicate, kind='订单号'), duplicate
     await session.refresh(order)
     return True, '补订单成功，已接到用户车票与资源资格上', order
+
+
+async def restore_cancelled_order_as_paid(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    admin_id: int,
+    reason: str | None = None,
+) -> tuple[bool, str, PaymentOrder | None]:
+    """Restore a cancelled/expired ticket that already has a real VP system number.
+
+    This is for the operational case: the VP is bound to T.xxx, the user_id and
+    project are correct, but the ticket status is `cancelled`, so the user cannot
+    see it in “我拼车中” and will not receive resources. The command makes the
+    local ticket paid again, then repairs counters/resource access from paid
+    orders.
+    """
+    try:
+        order_id = int(order_id)
+    except Exception:
+        return False, '车票编号格式错误，应为 T.060 这种格式', None
+
+    order = (await session.execute(
+        select(PaymentOrder).where(PaymentOrder.id == order_id).with_for_update()
+    )).scalar_one_or_none()
+    if not order:
+        return False, f'车票 {_no(order_id)} 不存在', None
+    if not order.project_id:
+        return False, f'车票 {_no(order.id)} 没有关联项目，不能恢复', order
+    if order.status == 'paid':
+        ok, sync_msg, _ = await sync_project_payment_closure(session, int(order.project_id))
+        await session.refresh(order)
+        return True, f'车票 {_no(order.id)} 已经是已支付。{sync_msg}', order
+    if order.status not in ('cancelled', 'expired'):
+        return False, f'车票 {_no(order.id)} 当前状态为 {order.status}，不是已取消/已过期车票，不能用恢复命令', order
+
+    system_no = normalize_system_no(order.faka_system_no)
+    if not system_no:
+        return False, f'车票 {_no(order.id)} 没有绑定 VP 系统单号，不能直接恢复；请用 /bind 或 /add_order 补单', order
+    duplicate = await find_duplicate_payment_order(session, system_no=system_no, exclude_order_id=order.id)
+    if duplicate:
+        return False, _duplicate_order_message(duplicate, kind='系统单号'), order
+
+    project = (await session.execute(
+        select(CrowdfundProject).where(CrowdfundProject.id == int(order.project_id)).with_for_update()
+    )).scalar_one_or_none()
+    if not project:
+        return False, f'车票 {_no(order.id)} 对应项目不存在，不能恢复', order
+
+    from app.services.project_state import state_value
+    project_status = state_value(project.status)
+    if project_status in ('rejected', 'refund_completed'):
+        return False, f'项目 {_project_no(project.id)} 当前状态为 {project_status}，不建议恢复车票；请走退款或重新拼车流程', order
+
+    operation_key = f'restore-order-paid:{order.id}'
+    if not await begin_operation(session, operation_key, 'restore_order_paid'):
+        return False, '这张车票的恢复操作正在处理或已经处理过，请刷新后再看。', order
+
+    previous_status = order.status
+    now = datetime.utcnow()
+    order.status = 'paid'
+    order.paid_amount = order.paid_amount or order.expected_amount
+    order.paid_at = order.paid_at or now
+    order.expires_at = order.expires_at or now
+    order.payment_source = order.payment_source or 'manual'
+    order.paid_channel = order.paid_channel or 'MANUAL'
+    order.paid_method = (f'管理员恢复已取消车票:{admin_id}; {order.paid_method or ""}')[:64]
+    order.fail_reason = None
+    order.raw_response = (order.raw_response or '') + (
+        f'\n\n[管理员恢复车票] {admin_id} 将状态从 {previous_status} 恢复为 paid'
+        + (f'｜{reason}' if reason else '')
+    )
+
+    await apply_paid_effects(session, order)
+    await post_ledger(
+        session, idempotency_key=f'payment:{order.id}', direction='income', category=order.order_type,
+        amount=order.paid_amount or order.expected_amount, payment_source=order.payment_source or 'manual',
+        project_id=order.project_id, order_id=order.id, user_id=order.user_id, operator_id=admin_id,
+        description='管理员恢复已取消车票为已支付',
+    )
+    await finish_operation(session, operation_key, {'order_id': order.id, 'previous_status': previous_status})
+
+    # Use paid orders as the final source of truth so counters/access are not left
+    # inconsistent even if the ticket had partially applied effects before.
+    await sync_project_payment_closure(session, int(order.project_id))
+    await session.refresh(order)
+    return True, f'已把 {_no(order.id)} 从 {previous_status} 恢复为已支付，并同步项目进度/资源权限', order
 
 
 def paid_order_seat_units(order: PaymentOrder) -> int:
