@@ -56,7 +56,7 @@ def _duplicate_order_message(duplicate: PaymentOrder | None, *, kind: str = '系
         f'绑定用户：{user_id}\n'
         f'当前状态：{status}\n\n'
         f'如果你确认这是同一笔付款，请让小掌柜在后台搜索 {ticket} 或系统单号后处理。'
-        f'管理员确认绑错时，可先 /search 系统单号，再用 /move_bind T.目标车票 {ticket} 转绑。'
+        f'管理员确认绑错时，可先 /search 系统单号。若只是挂错用户，用 /rebind_user {ticket} 正确用户ID；若要转到另一张待付车票，用 /move_bind T.目标车票 {ticket} 转绑。'
     )
 
 
@@ -541,6 +541,132 @@ async def move_paid_binding_to_order(
     return True, '转绑成功', target
 
 
+async def reassign_paid_order_to_user(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    target_user_id: int,
+    admin_id: int,
+    reason: str | None = None,
+) -> tuple[bool, str, PaymentOrder | None]:
+    """Move a paid local ticket from a wrong Telegram user_id to the correct one.
+
+    This is the recovery path for: "系统单号已经绑定成功，但正确用户的
+    我拼车中看不到". It does NOT add seats again. It only rewrites the
+    owner of the already-paid ticket and moves ResourceAccess to the target
+    user, then leaves project counters untouched.
+    """
+    try:
+        target_user_id = int(target_user_id)
+        order_id = int(order_id)
+    except Exception:
+        return False, '车票或用户ID格式错误', None
+    if target_user_id <= 0:
+        return False, '目标用户ID不正确', None
+
+    order = (await session.execute(
+        select(PaymentOrder).where(PaymentOrder.id == order_id).with_for_update()
+    )).scalar_one_or_none()
+    if not order:
+        return False, f'车票 {_no(order_id)} 不存在', None
+    if order.status != 'paid':
+        return False, f'车票 {_no(order.id)} 当前状态为 {order.status}，只有已支付车票才能改归属', order
+    if not order.project_id:
+        return False, f'车票 {_no(order.id)} 没有关联项目，不能改归属', order
+
+    old_user_id = int(order.user_id)
+    if old_user_id == target_user_id:
+        # Ensure access exists even if the user id is already correct.
+        exists = (await session.execute(select(ResourceAccess.id).where(
+            ResourceAccess.user_id == target_user_id,
+            ResourceAccess.project_id == order.project_id,
+        ))).scalar_one_or_none()
+        if exists is None:
+            session.add(ResourceAccess(user_id=target_user_id, project_id=order.project_id, source_order_id=order.id))
+            await session.commit()
+            await session.refresh(order)
+            return True, f'车票 {_no(order.id)} 本来就属于该用户，已补齐资源权限', order
+        return True, f'车票 {_no(order.id)} 本来就属于该用户，无需转绑', order
+
+    other_paid = (await session.execute(select(PaymentOrder).where(
+        PaymentOrder.project_id == order.project_id,
+        PaymentOrder.user_id == target_user_id,
+        PaymentOrder.status == 'paid',
+        PaymentOrder.id != order.id,
+    ).limit(1))).scalar_one_or_none()
+    if other_paid:
+        return False, (
+            f'目标用户在该项目已经有已支付车票 {_no(other_paid.id)}。\n'
+            f'为避免重复加车位，已拒绝直接改归属。请先 /audit_project {_project_no(order.project_id)} 核对，'
+            f'必要时人工确认后处理重复车票。'
+        ), order
+
+    # Remove only the access created by this ticket for the old user. If the old
+    # user has another paid ticket in the same project, its access is preserved.
+    await session.execute(delete(ResourceAccess).where(
+        ResourceAccess.user_id == old_user_id,
+        ResourceAccess.project_id == order.project_id,
+        ResourceAccess.source_order_id == order.id,
+    ))
+
+    order.user_id = target_user_id
+    order.username = None
+    note = f'管理员 {admin_id} 将车票归属从 {old_user_id} 改为 {target_user_id}'
+    if reason:
+        note += f'｜{reason}'
+    order.raw_response = (order.raw_response or '') + '\n\n[管理员改归属] ' + note
+    order.paid_method = (f'管理员改归属:{admin_id}; {order.paid_method or ""}')[:64]
+
+    exists = (await session.execute(select(ResourceAccess.id).where(
+        ResourceAccess.user_id == target_user_id,
+        ResourceAccess.project_id == order.project_id,
+    ))).scalar_one_or_none()
+    if exists is None:
+        session.add(ResourceAccess(user_id=target_user_id, project_id=order.project_id, source_order_id=order.id))
+
+    await post_ledger(
+        session,
+        idempotency_key=f'payment-reassign-user:{order.id}:{old_user_id}:{target_user_id}',
+        direction='neutral',
+        category='manual_reassign_user',
+        amount=0,
+        payment_source='manual_reassign',
+        project_id=order.project_id,
+        order_id=order.id,
+        user_id=target_user_id,
+        operator_id=admin_id,
+        description=f'管理员修改车票归属：{_no(order.id)} {old_user_id} -> {target_user_id}',
+        metadata={'old_user_id': old_user_id, 'target_user_id': target_user_id, 'reason': reason},
+    )
+    await session.commit()
+    await session.refresh(order)
+    return True, f'已把 {_no(order.id)} 接回用户 {target_user_id}', order
+
+
+async def reassign_paid_order_by_system_no(
+    session: AsyncSession,
+    *,
+    system_no: str,
+    target_user_id: int,
+    admin_id: int,
+    reason: str | None = None,
+) -> tuple[bool, str, PaymentOrder | None]:
+    """Find the paid ticket by VP system number and change its user owner."""
+    normalized = normalize_system_no(system_no)
+    if not normalized:
+        return False, '系统单号不能为空', None
+    order = (await session.execute(
+        select(PaymentOrder).where(func.upper(PaymentOrder.faka_system_no) == normalized).with_for_update()
+    )).scalar_one_or_none()
+    if not order:
+        return False, f'没有找到系统单号 {normalized} 对应的已绑定车票', None
+    if order.status != 'paid':
+        return False, f'系统单号 {normalized} 对应车票 {_no(order.id)} 当前状态为 {order.status}，不是已支付', order
+    return await reassign_paid_order_to_user(
+        session, order_id=order.id, target_user_id=target_user_id, admin_id=admin_id, reason=reason
+    )
+
+
 async def force_create_paid_order_for_user(
     session: AsyncSession,
     *,
@@ -626,6 +752,140 @@ async def force_create_paid_order_for_user(
         return False, _duplicate_order_message(duplicate, kind='订单号'), duplicate
     await session.refresh(order)
     return True, '补订单成功，已接到用户车票与资源资格上', order
+
+
+def paid_order_seat_units(order: PaymentOrder) -> int:
+    """Seat units counted in public crowdfunding progress for a paid order."""
+    if getattr(order, 'status', None) != 'paid':
+        return 0
+    if order.order_type == 'crowdfunding_creator_prepay':
+        return int(settings.CREATOR_PREPAY_SEATS or 2)
+    if order.order_type == 'crowdfunding_before_full':
+        return 1
+    return 0
+
+
+def paid_order_extra_units(order: PaymentOrder) -> int:
+    """Extra full-after payments do not fill the core progress bar, but affect extra fund accounting."""
+    if getattr(order, 'status', None) == 'paid' and order.order_type == 'crowdfunding_after_full':
+        return 1
+    return 0
+
+
+async def project_payment_snapshot(session: AsyncSession, project_id: int) -> dict:
+    """Return a single source-of-truth snapshot for a project's paid orders and access rows."""
+    project = await session.get(CrowdfundProject, int(project_id))
+    if not project:
+        return {'project': None}
+
+    orders = list((await session.execute(
+        select(PaymentOrder)
+        .where(PaymentOrder.project_id == int(project_id))
+        .order_by(PaymentOrder.status.asc(), PaymentOrder.id.asc())
+    )).scalars().all())
+    paid_orders = [o for o in orders if o.status == 'paid']
+    pending_orders = [o for o in orders if o.status == 'pending']
+    refunded_orders = [o for o in orders if o.status == 'refunded']
+    paid_seats_calc = sum(paid_order_seat_units(o) for o in paid_orders)
+    extra_calc = sum(paid_order_extra_units(o) for o in paid_orders)
+
+    access_rows = list((await session.execute(
+        select(ResourceAccess).where(ResourceAccess.project_id == int(project_id)).order_by(ResourceAccess.id.asc())
+    )).scalars().all())
+    access_users = {int(a.user_id) for a in access_rows}
+    paid_users = {int(o.user_id) for o in paid_orders}
+    missing_access_orders = [o for o in paid_orders if int(o.user_id) not in access_users]
+    access_without_paid_user = [a for a in access_rows if int(a.user_id) not in paid_users]
+
+    return {
+        'project': project,
+        'orders': orders,
+        'paid_orders': paid_orders,
+        'pending_orders': pending_orders,
+        'refunded_orders': refunded_orders,
+        'paid_seats_calc': paid_seats_calc,
+        'extra_calc': extra_calc,
+        'access_rows': access_rows,
+        'missing_access_orders': missing_access_orders,
+        'access_without_paid_user': access_without_paid_user,
+    }
+
+
+def project_payment_audit_text(snapshot: dict) -> str:
+    project = snapshot.get('project')
+    if not project:
+        return '项目不存在。'
+    paid_orders = snapshot.get('paid_orders') or []
+    pending_orders = snapshot.get('pending_orders') or []
+    refunded_orders = snapshot.get('refunded_orders') or []
+    access_rows = snapshot.get('access_rows') or []
+    paid_calc = int(snapshot.get('paid_seats_calc') or 0)
+    extra_calc = int(snapshot.get('extra_calc') or 0)
+    stored_paid = int(project.paid_seats or 0)
+    stored_extra = int(project.extra_fund_count or 0)
+
+    lines = [
+        f'🧾 项目支付闭环检查｜{_project_no(project.id)}',
+        f'状态：{getattr(project, "status", "-")}',
+        f'核心进度：项目表 {stored_paid}/{int(project.required_seats or 0)}｜订单计算 {paid_calc}/{int(project.required_seats or 0)}',
+        f'满员后补票：项目表 {stored_extra}｜订单计算 {extra_calc}',
+        f'已支付订单：{len(paid_orders)}｜待支付：{len(pending_orders)}｜已退款：{len(refunded_orders)}｜资源权限：{len(access_rows)}',
+    ]
+    if stored_paid != paid_calc or stored_extra != extra_calc:
+        lines.append('⚠️ 发现计数器和订单表不一致，建议执行 /sync_project ' + _project_no(project.id))
+    missing = snapshot.get('missing_access_orders') or []
+    ghost_access = snapshot.get('access_without_paid_user') or []
+    if missing:
+        lines.append('⚠️ 有已支付订单缺少资源权限：' + ', '.join(_no(o.id) for o in missing[:20]))
+    if ghost_access:
+        lines.append('⚠️ 有资源权限但找不到该用户已支付订单：' + ', '.join(str(a.user_id) for a in ghost_access[:20]))
+
+    lines.append('\n✅ 已支付订单明细：')
+    if paid_orders:
+        for o in paid_orders[:80]:
+            units = paid_order_seat_units(o) or paid_order_extra_units(o)
+            unit_label = f'{units}座' if o.order_type != 'crowdfunding_after_full' else '满员后补票'
+            lines.append(f'{_no(o.id)}｜用户 {o.user_id}｜{o.order_type}｜{unit_label}｜{o.faka_system_no or "-"}')
+    else:
+        lines.append('暂无已支付订单。')
+    if pending_orders:
+        lines.append('\n💳 待支付车票：' + ', '.join(_no(o.id) for o in pending_orders[:40]))
+    return '\n'.join(lines)
+
+
+async def sync_project_payment_closure(session: AsyncSession, project_id: int) -> tuple[bool, str, dict]:
+    """Repair denormalized project counters and ResourceAccess from paid orders."""
+    snapshot = await project_payment_snapshot(session, project_id)
+    project = snapshot.get('project')
+    if not project:
+        return False, '项目不存在。', snapshot
+
+    paid_orders = snapshot.get('paid_orders') or []
+    changed = []
+    calc_paid = int(snapshot.get('paid_seats_calc') or 0)
+    calc_extra = int(snapshot.get('extra_calc') or 0)
+    if int(project.paid_seats or 0) != calc_paid:
+        changed.append(f'paid_seats {int(project.paid_seats or 0)} → {calc_paid}')
+        project.paid_seats = calc_paid
+    safe_extra = max(calc_extra, int(project.extra_withdrawn_count or 0))
+    if int(project.extra_fund_count or 0) != safe_extra:
+        changed.append(f'extra_fund_count {int(project.extra_fund_count or 0)} → {safe_extra}')
+        project.extra_fund_count = safe_extra
+
+    for o in paid_orders:
+        exists = (await session.execute(select(ResourceAccess.id).where(
+            ResourceAccess.user_id == o.user_id,
+            ResourceAccess.project_id == project.id,
+        ))).scalar_one_or_none()
+        if exists is None:
+            session.add(ResourceAccess(user_id=o.user_id, project_id=project.id, source_order_id=o.id))
+            changed.append(f'补资源权限 {_no(o.id)} → 用户 {o.user_id}')
+
+    await session.commit()
+    repaired = await project_payment_snapshot(session, project_id)
+    if not changed:
+        return True, '检查完成：项目计数器、已支付订单和资源权限一致。', repaired
+    return True, '已修复：' + '；'.join(changed), repaired
 
 
 async def get_fund_balance(session: AsyncSession) -> float:

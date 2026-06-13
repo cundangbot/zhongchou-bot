@@ -11,5 +11,5 @@ backups/last_backup.txt
 *.session
 data/
 venv/
-__pycache__/
+pycache/
 *.pyc

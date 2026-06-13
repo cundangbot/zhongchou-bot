@@ -62,7 +62,7 @@ from app.keyboards import (
 )
 from app.services.crowdfund import create_project, project_public_text, project_title, project_label, project_no, project_progress_text
 from app.services.project_state import ProjectState, state_value, transition_project, InvalidProjectTransition
-from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order
+from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
 from app.states import PaymentSubmit, ProfitWithdrawCollect, RefundApplyCollect, ContactSupport, AdminContactReply, AdminSearch, AdminManualVerify
 from app.services.ledger import post_ledger
 from app.services.idempotency import begin_operation, finish_operation
@@ -2568,6 +2568,55 @@ async def admin_manual_verify_receive(message: Message, state: FSMContext, bot: 
     )
 
 
+
+def _parse_project_token(text: str | None) -> int | None:
+    raw = (text or '').strip().upper().replace('P.', '').replace('P', '')
+    try:
+        value = int(raw)
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+@router.message(Command('audit_project', 'check_project'))
+async def admin_audit_project(message: Message):
+    """Show why progress/paid-user/user-record data may be inconsistent."""
+    if message.from_user.id not in settings.admin_id_list:
+        await message.answer('无权限。')
+        return
+    parts = (message.text or '').strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer('用法：/audit_project P.项目\n示例：/audit_project P.012')
+        return
+    project_id = _parse_project_token(parts[1])
+    if not project_id:
+        await message.answer('项目编号格式错误。示例：/audit_project P.012')
+        return
+    async with SessionLocal() as session:
+        snapshot = await project_payment_snapshot(session, project_id)
+        text = project_payment_audit_text(snapshot)
+    await message.answer(text[:3900], reply_markup=admin_project_detail_keyboard(project_id))
+
+
+@router.message(Command('sync_project', 'repair_project'))
+async def admin_sync_project(message: Message):
+    """Repair paid_seats/extra_fund_count/resource_access from paid orders."""
+    if message.from_user.id not in settings.admin_id_list:
+        await message.answer('无权限。')
+        return
+    parts = (message.text or '').strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer('用法：/sync_project P.项目\n示例：/sync_project P.012')
+        return
+    project_id = _parse_project_token(parts[1])
+    if not project_id:
+        await message.answer('项目编号格式错误。示例：/sync_project P.012')
+        return
+    async with SessionLocal() as session:
+        ok, reason, snapshot = await sync_project_payment_closure(session, project_id)
+        text = reason + '\n\n' + project_payment_audit_text(snapshot)
+    await message.answer(('✅ ' if ok else '❌ ') + text[:3850], reply_markup=admin_project_detail_keyboard(project_id))
+
 @router.message(Command('force_verify', 'bind'))
 async def admin_force_verify(message: Message, bot: Bot):
     if message.from_user.id not in settings.admin_id_list:
@@ -2673,6 +2722,99 @@ async def admin_move_bind(message: Message, bot: Bot):
         f'系统单号：{order.faka_system_no or "-"}\n'
         f'用户：{order.user_id}\n'
         f'项目：P.{int(order.project_id or 0):03d}'
+    )
+
+
+@router.message(Command('rebind_user', 'reassign_order'))
+async def admin_rebind_order_user(message: Message, bot: Bot):
+    """把一张已支付车票接回正确用户。
+
+    用于：VP 已绑定成功，但正确用户「我拼车中」看不到。
+    这个命令不重复加车位，只改 payment_orders.user_id 并移动 ResourceAccess。
+    """
+    if message.from_user.id not in settings.admin_id_list:
+        await message.answer('无权限。')
+        return
+    parts = (message.text or '').strip().split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(
+            '用法：/rebind_user T.占用车票 正确用户ID [原因]\n'
+            '例：/rebind_user T.012 123456789 用户填错账号导致绑定到别人身上\n\n'
+            '说明：只适合“车票已经 paid，但挂错 Telegram 用户”的情况；不会重复加车位。'
+        )
+        return
+
+    raw_ticket = parts[1].upper().replace('T.', '').replace('T', '').strip()
+    try:
+        order_id = int(raw_ticket)
+        target_user_id = int(parts[2])
+    except ValueError:
+        await message.answer('车票或用户ID格式错误。示例：/rebind_user T.012 123456789')
+        return
+    reason = parts[3].strip() if len(parts) >= 4 else None
+
+    async with SessionLocal() as session:
+        ok, reason_text, order = await reassign_paid_order_to_user(
+            session,
+            order_id=order_id,
+            target_user_id=target_user_id,
+            admin_id=message.from_user.id,
+            reason=reason,
+        )
+        if not ok or not order:
+            await message.answer('❌ ' + reason_text)
+            return
+        await _after_admin_force_verify(bot, session, order, message.from_user.id)
+    await message.answer(
+        f'✅ 已重新接回用户\n'
+        f'车票：{_ticket_no(order.id)}\n'
+        f'项目：P.{int(order.project_id or 0):03d}\n'
+        f'用户：{order.user_id}\n'
+        f'系统单号：{order.faka_system_no or "-"}\n\n'
+        f'现在这个用户的「我拼车中/我的车票」会按这张 paid 车票显示；众筹完成后也会按这个用户发资源。'
+    )
+
+
+@router.message(Command('rebind_vp', 'reassign_vp'))
+async def admin_rebind_vp_user(message: Message, bot: Bot):
+    """按 VP 系统单号把已支付车票接回正确用户。"""
+    if message.from_user.id not in settings.admin_id_list:
+        await message.answer('无权限。')
+        return
+    parts = (message.text or '').strip().split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(
+            '用法：/rebind_vp VP系统单号 正确用户ID [原因]\n'
+            '例：/rebind_vp VP2026060202331011743 123456789 订单挂错用户\n\n'
+            '说明：机器人会先找到这个 VP 当前占用的已支付车票，再把归属改到正确用户。'
+        )
+        return
+    system_no = parts[1].strip().upper()
+    try:
+        target_user_id = int(parts[2])
+    except ValueError:
+        await message.answer('用户ID格式错误。示例：/rebind_vp VP2026... 123456789')
+        return
+    reason = parts[3].strip() if len(parts) >= 4 else None
+
+    async with SessionLocal() as session:
+        ok, reason_text, order = await reassign_paid_order_by_system_no(
+            session,
+            system_no=system_no,
+            target_user_id=target_user_id,
+            admin_id=message.from_user.id,
+            reason=reason,
+        )
+        if not ok or not order:
+            await message.answer('❌ ' + reason_text)
+            return
+        await _after_admin_force_verify(bot, session, order, message.from_user.id)
+    await message.answer(
+        f'✅ 已按系统单号重新接回用户\n'
+        f'车票：{_ticket_no(order.id)}\n'
+        f'项目：P.{int(order.project_id or 0):03d}\n'
+        f'用户：{order.user_id}\n'
+        f'系统单号：{order.faka_system_no or "-"}'
     )
 
 
@@ -3681,9 +3823,16 @@ async def admin_support_private_reply_to_user(message: Message, state: FSMContex
         else:
             await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
         return
-    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp'):
         await state.clear()
-        await (admin_add_order(message, bot) if command_text.startswith('/add_order') or command_text.startswith('/manual_order') else admin_force_verify(message, bot))
+        if command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
+            await admin_add_order(message, bot)
+        elif command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order'):
+            await admin_rebind_order_user(message, bot)
+        elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp'):
+            await admin_rebind_vp_user(message, bot)
+        else:
+            await admin_force_verify(message, bot)
         return
     if command_text.startswith('/'):
         await state.clear()
@@ -3711,9 +3860,16 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
         else:
             await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
         return
-    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp'):
         await state.clear()
-        await (admin_add_order(message, bot) if command_text.startswith('/add_order') or command_text.startswith('/manual_order') else admin_force_verify(message, bot))
+        if command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
+            await admin_add_order(message, bot)
+        elif command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order'):
+            await admin_rebind_order_user(message, bot)
+        elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp'):
+            await admin_rebind_vp_user(message, bot)
+        else:
+            await admin_force_verify(message, bot)
         return
     if command_text.startswith('/'):
         await state.clear()

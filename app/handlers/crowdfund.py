@@ -49,7 +49,7 @@ from app.services.crowdfund import (
     reject_project,
     project_progress_text,
 )
-from app.services.payments import create_payment_order, friendly_verify_failure
+from app.services.payments import create_payment_order, friendly_verify_failure, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
 from app.states import BuyInfoCollect, CrowdfundCreate, ResourceUploadCollect
 from app.services.idempotency import begin_operation, finish_operation, fail_operation
 from app.services.system_events import record_event
@@ -1939,11 +1939,45 @@ async def admin_paid_users(call: CallbackQuery):
         p = await session.get(CrowdfundProject, project_id)
         res = await session.execute(select(PaymentOrder).where(PaymentOrder.project_id == project_id, PaymentOrder.status == 'paid').order_by(PaymentOrder.paid_at.desc()))
         orders = list(res.scalars().all())
+        snapshot = await project_payment_snapshot(session, project_id)
     lines = [f'✅ 已支付用户｜{project_title(p) if p else project_id}']
+    if p:
+        stored_paid = int(p.paid_seats or 0)
+        calc_paid = int(snapshot.get('paid_seats_calc') or 0)
+        lines.append(f'拼车进度：项目表 {stored_paid}/{int(p.required_seats or 0)}｜订单计算 {calc_paid}/{int(p.required_seats or 0)}')
+        if stored_paid != calc_paid:
+            lines.append(f'⚠️ 进度计数和已支付订单不一致，请发送 /audit_project P.{project_id:03d} 检查，确认后 /sync_project P.{project_id:03d} 修复。')
     for o in orders[:80]:
-        lines.append(f'{_ticket_no(o.id)}｜{o.username or o.user_id}｜{o.paid_amount or o.expected_amount:g} 元｜{o.faka_system_no or "-"}')
+        unit = '车主双车位' if o.order_type == 'crowdfunding_creator_prepay' else ('满员后补票' if o.order_type == 'crowdfunding_after_full' else '普通车位')
+        lines.append(f'{_ticket_no(o.id)}｜{o.username or o.user_id}｜{unit}｜{o.paid_amount or o.expected_amount:g} 元｜{o.faka_system_no or "-"}')
     await _edit_panel(call, '\n'.join(lines) if orders else '暂无已支付用户。', reply_markup=admin_project_detail_keyboard(project_id))
     await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:audit_project:'))
+async def admin_audit_project_callback(call: CallbackQuery):
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+    project_id = int(call.data.split(':')[-1])
+    async with SessionLocal() as session:
+        snapshot = await project_payment_snapshot(session, project_id)
+        text = project_payment_audit_text(snapshot)
+    await _edit_panel(call, text[:3900], reply_markup=admin_project_detail_keyboard(project_id))
+    await call.answer('检查完成')
+
+
+@router.callback_query(F.data.startswith('admin:sync_project:'))
+async def admin_sync_project_callback(call: CallbackQuery):
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+    project_id = int(call.data.split(':')[-1])
+    async with SessionLocal() as session:
+        ok, reason, snapshot = await sync_project_payment_closure(session, project_id)
+        text = ('✅ ' if ok else '❌ ') + reason + '\n\n' + project_payment_audit_text(snapshot)
+    await _edit_panel(call, text[:3900], reply_markup=admin_project_detail_keyboard(project_id))
+    await call.answer('已同步' if ok else '同步失败', show_alert=not ok)
 
 
 @router.callback_query(F.data.startswith('admin:pending_orders:'))
