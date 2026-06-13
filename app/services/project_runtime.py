@@ -93,7 +93,7 @@ def _single_channel_media_item(items: list[dict]) -> dict | None:
 
 
 def is_after_full_stage(project: CrowdfundProject) -> bool:
-    return project.status in (
+    return state_value(project.status) in (
         "full",
         "waiting_creator_resource",
         "waiting_buy_info",
@@ -133,7 +133,7 @@ async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
     markup = join_project_keyboard(
         project.id,
         full=is_after_full_stage(project),
-        cancelled=project.status in ("cancelled", "expired"),
+        cancelled=state_value(project.status) in ("cancelled", "expired"),
         seat_price=project.seat_price,
     )
     items = _load_description_items(project)
@@ -202,19 +202,18 @@ def full_success_channel_text(project: CrowdfundProject) -> str:
         "platform": "🤖 小掌柜代买",
         "owned": "📦 我已持有资源",
     }
-    current_status = state_value(project.status)
     status_map = {
-        state_value(ProjectState.FULL): "已满员",
-        state_value(ProjectState.WAITING_CREATOR_RESOURCE): "等待车主上传资源",
-        state_value(ProjectState.WAITING_BUY_INFO): "等待购买资料",
-        state_value(ProjectState.PLATFORM_PURCHASING): "小掌柜代买中",
-        state_value(ProjectState.ADMIN_UPLOADING): "等待小掌柜上传资源",
-        state_value(ProjectState.RESOURCE_UPLOADING): "资源上传中",
-        state_value(ProjectState.RESOURCE_SUBMITTED): "资源待审核",
-        state_value(ProjectState.RESOURCE_REVIEW): "资源审核中",
-        state_value(ProjectState.RESOURCE_REJECTED): "资源需重传",
-        state_value(ProjectState.RESOURCE_PUBLISHED): "资源可领取",
-        state_value(ProjectState.DELIVERED): "已交付",
+        ProjectState.FULL.value: "已满员",
+        ProjectState.WAITING_CREATOR_RESOURCE.value: "等待车主上传资源",
+        ProjectState.WAITING_BUY_INFO.value: "等待购买资料",
+        ProjectState.PLATFORM_PURCHASING.value: "小掌柜代买中",
+        ProjectState.ADMIN_UPLOADING.value: "等待小掌柜上传资源",
+        ProjectState.RESOURCE_UPLOADING.value: "资源上传中",
+        ProjectState.RESOURCE_SUBMITTED.value: "资源待审核",
+        ProjectState.RESOURCE_REVIEW.value: "资源审核中",
+        ProjectState.RESOURCE_REJECTED.value: "资源需重传",
+        ProjectState.RESOURCE_PUBLISHED.value: "资源可领取",
+        ProjectState.DELIVERED.value: "已交付",
     }
     return msg.project_full_success_card(
         project_no_text=project_no(project),
@@ -224,7 +223,7 @@ def full_success_channel_text(project: CrowdfundProject) -> str:
         required_seats=int(project.required_seats or 0),
         paid_seats=int(project.paid_seats or 0),
         purchase_mode_name=mode_map.get(project.purchase_mode, project.purchase_mode),
-        status_name=status_map.get(current_status, current_status),
+        status_name=status_map.get(state_value(project.status), state_value(project.status)),
         pending_extra=pending_extra,
     )
 

@@ -26,12 +26,6 @@ services:
       - ./payment_checker.session:/app/payment_checker.session
       - ./backups:/app/backups
     command: ["sh", "-c", "alembic upgrade head && python -m app.main"]
-    stop_grace_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
     restart: unless-stopped
 
 volumes:

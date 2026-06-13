@@ -1,7 +1,15 @@
 .env
 *.session
+*.session-journal
+*.db
+__pycache__/
+*.py[cod]
+backups/*.sql.gz
+backups/last_backup.txt
+.pytest_cache/
+.env
+*.session
 data/
 venv/
 __pycache__/
 *.pyc
-.env.example

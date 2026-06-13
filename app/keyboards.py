@@ -2,36 +2,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from app.config import get_settings
 
 
-
-def _state_value_for_button(value) -> str:
-    raw = str(value or '').strip()
-    if raw.startswith('ProjectState.'):
-        raw = raw.split('.', 1)[1].lower()
-        mapping = {
-            'pending_review': 'pending_review',
-            'rejected': 'rejected',
-            'approved_wait_creator': 'approved_wait_creator',
-            'active': 'active',
-            'full': 'full',
-            'waiting_creator_resource': 'waiting_creator_resource',
-            'waiting_buy_info': 'waiting_buy_info',
-            'platform_purchasing': 'platform_purchasing',
-            'admin_uploading': 'admin_uploading',
-            'resource_uploading': 'resource_uploading',
-            'resource_submitted': 'resource_submitted',
-            'resource_review': 'resource_review',
-            'resource_rejected': 'resource_rejected',
-            'resource_published': 'resource_published',
-            'delivered': 'delivered',
-            'cancelled': 'cancelled',
-            'expired': 'expired',
-            'refund_pending': 'refund_pending',
-            'refund_completed': 'refund_completed',
-        }
-        return mapping.get(raw, raw)
-    return raw
-
-
 def _join_deeplink(project_id: int) -> str:
     settings = get_settings()
     username = (settings.BOT_USERNAME or '').strip().lstrip('@')
@@ -229,16 +199,8 @@ def admin_project_full_keyboard(project_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def admin_project_detail_keyboard(project_id: int, status: str | None = None) -> InlineKeyboardMarkup:
-    normalized = _state_value_for_button(status)
-    rows = []
-    # 待审核项目在详情页必须直接给审核按钮；否则从管理后台列表进入后只能看详情，不能处理。
-    if normalized == 'pending_review':
-        rows.append([
-            InlineKeyboardButton(text='✅ 通过发车', callback_data=f'admin:approve:{project_id}'),
-            InlineKeyboardButton(text='❌ 拒绝', callback_data=f'admin:reject:{project_id}'),
-        ])
-    rows.extend([
+def admin_project_detail_keyboard(project_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='🔍 打开项目卡片', callback_data=f'admin:project:{project_id}')],
         [InlineKeyboardButton(text='✅ 已支付用户', callback_data=f'admin:paid_users:{project_id}')],
         [InlineKeyboardButton(text='💳 待付车票', callback_data=f'admin:pending_orders:{project_id}')],
@@ -250,7 +212,6 @@ def admin_project_detail_keyboard(project_id: int, status: str | None = None) ->
         [InlineKeyboardButton(text='⏰ 延长上传时间3小时', callback_data=f'admin:extend_resource:{project_id}:3')],
         [InlineKeyboardButton(text='❌ 手动取消项目', callback_data=f'admin:cancel_project:{project_id}')],
     ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def resource_upload_collect_keyboard(project_id: int) -> InlineKeyboardMarkup:
@@ -577,12 +538,19 @@ def admin_search_results_keyboard(projects=None, orders=None, refunds=None, tick
 
     for o in list(orders or [])[:5]:
         pid = int(getattr(o, 'project_id', 0) or 0)
-        if not pid:
+        oid = int(getattr(o, 'id', 0) or 0)
+        if not oid:
             continue
-        rows.append([
-            InlineKeyboardButton(text=f'🎫 车票 T.{int(getattr(o, "id", 0) or 0):03d} 对应项目', callback_data=f'admin:project:{pid}'),
-            InlineKeyboardButton(text='🎫 手动补票', callback_data=f'admin:manual_verify:{pid}'),
-        ])
+        rows.append([InlineKeyboardButton(text=f'🎫 打开车票 T.{oid:03d}', callback_data=f'admin:order:{oid}')])
+        row = []
+        if pid:
+            row.append(InlineKeyboardButton(text='🔍 对应项目', callback_data=f'admin:project:{pid}'))
+        if getattr(o, 'status', '') == 'pending':
+            row.append(InlineKeyboardButton(text='🛠 直接补单', callback_data=f'admin:manual_verify_select:{oid}'))
+        elif pid:
+            row.append(InlineKeyboardButton(text='💳 同项目待付', callback_data=f'admin:pending_orders:{pid}'))
+        if row:
+            rows.append(row)
 
     if refunds:
         rows.append([InlineKeyboardButton(text='🧾 打开退款小票列表', callback_data='admin:list:refunds')])

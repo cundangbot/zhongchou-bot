@@ -30,11 +30,6 @@ class Settings(BaseSettings):
     SUPPORT_BOT_USERNAME: str = '@jingpinhybot'
     SUPPORT_BOT_START_PREFIX: str = 'cf'
     SUPPORT_EXTERNAL_ONLY: bool = False
-    # 只有用户明确点击“联系小掌柜”才进入客服桥；会话超过该时间自动关闭。
-    SUPPORT_SESSION_TIMEOUT_MINUTES: int = 120
-    # 业务看板按本地业务日期统计，数据库仍保存 UTC naive。
-    BUSINESS_TIMEZONE: str = 'Asia/Shanghai'
-    LOG_LEVEL: str = 'INFO'
     # 机器人用户名，用于公开频道按钮跳转私聊深链，例如 @your_bot 或 your_bot。
     BOT_USERNAME: str = ''
     ADMIN_GROUP_ID: int

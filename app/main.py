@@ -22,8 +22,7 @@ from app.services.singleton import SingletonLease
 from app.db.models import SystemMetric
 from app import runtime
 from app.messages import cute as msg
-from app.services.logging_setup import setup_logging
-from app.services.project_state import InvalidProjectTransition
+from app.services.project_state import state_value
 
 
 def build_bot_proxy_url(settings) -> str | None:
@@ -83,7 +82,7 @@ async def refresh_public_join_buttons(bot: Bot, settings) -> tuple[int, int]:
         )
         projects = list(result.scalars().all())
     for project in projects:
-        full = project.status != 'active' or int(project.paid_seats or 0) >= int(project.required_seats or 0)
+        full = state_value(project.status) != 'active' or int(project.paid_seats or 0) >= int(project.required_seats or 0)
         try:
             await bot.edit_message_reply_markup(
                 chat_id=settings.PUBLIC_CHANNEL_ID,
@@ -163,8 +162,8 @@ async def ensure_admin_control_panel(bot: Bot, settings) -> None:
 
 
 async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     settings = get_settings()
-    setup_logging(getattr(settings, 'LOG_LEVEL', 'INFO'))
 
     lease = SingletonLease()
     if not await lease.acquire():
@@ -201,29 +200,6 @@ async def main() -> None:
             logging.exception("Telethon payment listener failed to start; bot will continue and retry in scheduler")
 
     dp = Dispatcher(storage=MemoryStorage())
-
-    @dp.errors()
-    async def on_error(event) -> bool:
-        exc = getattr(event, 'exception', None)
-        update = getattr(event, 'update', None)
-        if isinstance(exc, InvalidProjectTransition):
-            try:
-                callback = getattr(update, 'callback_query', None)
-                if callback:
-                    await callback.answer('⚠️ 当前状态不支持这个操作，请刷新面板后再试。', show_alert=True)
-                    return True
-                message = getattr(update, 'message', None)
-                if message:
-                    await message.answer('⚠️ 当前状态不支持这个操作，请刷新面板后再试。')
-                    return True
-            except Exception:
-                logging.exception('Failed to notify InvalidProjectTransition')
-            return True
-        if exc:
-            logging.error('Unhandled update error: %r', exc, exc_info=(type(exc), exc, exc.__traceback__))
-        else:
-            logging.error('Unhandled update error with no exception payload')
-        return False
     dp.include_router(start.router)
     dp.include_router(crowdfund.router)
     # fallback 必须最后注册，专门处理旧消息/漏接按钮，避免用户点击没反应。

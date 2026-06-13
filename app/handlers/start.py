@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import asyncio
 import re
-import logging
 from datetime import datetime, timedelta
 
 from aiogram import Router, F, Bot
@@ -61,12 +60,12 @@ from app.keyboards import (
     empty_orders_keyboard, empty_resources_keyboard, payment_error_keyboard, resource_progress_keyboard,
 )
 from app.services.crowdfund import project_public_text, project_title, project_label, project_no, project_progress_text
-from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order
-from app.states import PaymentSubmit, ProfitWithdrawCollect, RefundApplyCollect, ContactSupport, AdminContactReply, AdminSearch, AdminManualVerify, CrowdfundCreate
+from app.services.project_state import state_value, InvalidProjectTransition
+from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, move_paid_binding_to_order
+from app.states import PaymentSubmit, ProfitWithdrawCollect, RefundApplyCollect, ContactSupport, AdminContactReply, AdminSearch, AdminManualVerify
 from app.services.ledger import post_ledger
 from app.services.idempotency import begin_operation, finish_operation
 from app.services.system_events import record_event, get_metric
-from app.utils.timezone import business_today_start_utc, fmt_business_dt
 from app.services.payment_checker import faka_query_client
 from app.services.project_runtime import (
     load_resource_items,
@@ -76,76 +75,10 @@ from app.services.project_runtime import (
     update_public_project,
 )
 from app.services.payment_flow import confirm_payment_message
-from app.services.project_state import state_value
 from app.messages import cute as msg
 
 router = Router()
 settings = get_settings()
-
-
-USER_BUSINESS_TEXTS = {'/start', '🚗 发起众筹', '📋 众筹订单', '📋 我的众筹', '🔥 热门众筹', '📦 我的宝贝资源'}
-
-
-def _support_timeout_cutoff() -> datetime | None:
-    minutes = int(getattr(settings, 'SUPPORT_SESSION_TIMEOUT_MINUTES', 120) or 0)
-    if minutes <= 0:
-        return None
-    return datetime.utcnow() - timedelta(minutes=minutes)
-
-
-def _support_ticket_activity_time(ticket: ContactTicket) -> datetime:
-    return ticket.answered_at or ticket.created_at or datetime.utcnow()
-
-
-async def _admin_has_upload_session(admin_id: int) -> bool:
-    try:
-        from app.handlers.crowdfund import ADMIN_UPLOAD_USER_SESSIONS
-        sess = ADMIN_UPLOAD_USER_SESSIONS.get(int(admin_id))
-        return bool(sess and int(sess.get('project_id') or 0))
-    except Exception:
-        return False
-
-
-async def _route_admin_upload_private_message(message: Message, bot: Bot) -> bool:
-    if not (message.chat and message.chat.type == 'private' and message.from_user):
-        return False
-    if not await _admin_has_upload_session(message.from_user.id):
-        return False
-    try:
-        from app.handlers.crowdfund import collect_admin_upload_session
-        await collect_admin_upload_session(message, bot)
-        return True
-    except Exception:
-        logging.exception('Failed to route admin private upload message')
-        return False
-
-
-async def _exit_support_to_business(message: Message, state: FSMContext) -> bool:
-    text = (message.text or '').strip()
-    if text not in USER_BUSINESS_TEXTS:
-        return False
-    await state.clear()
-    if text == '🚗 发起众筹':
-        await state.set_state(CrowdfundCreate.blogger)
-        await message.answer(msg.crowdfunding_start(
-            creator_prepay_seats=settings.CREATOR_PREPAY_SEATS,
-            seat_price=settings.SEAT_PRICE,
-            creator_amount=settings.creator_prepay_amount,
-        ))
-    elif text in {'📋 众筹订单', '📋 我的众筹'}:
-        await message.answer(msg.order_center(), reply_markup=order_center_keyboard())
-    elif text == '🔥 热门众筹':
-        async with SessionLocal() as session:
-            projects = await _load_hot_projects(session)
-        if not projects:
-            await message.answer(msg.hot_empty(), reply_markup=main_menu())
-        else:
-            await message.answer(_hot_page_text(projects, 0), reply_markup=hot_projects_keyboard(projects, page=0))
-    elif text == '📦 我的宝贝资源':
-        await _send_my_resources_message(message)
-    else:
-        await message.answer(START_HELP, reply_markup=main_menu())
-    return True
 
 
 async def _edit_panel(call: CallbackQuery, text: str, reply_markup=None) -> None:
@@ -503,11 +436,6 @@ async def _get_support_admin_active_ticket_id(admin_id: int) -> int | None:
         active = res.scalar_one_or_none()
         if not active:
             return None
-        cutoff = _support_timeout_cutoff()
-        if cutoff and active.updated_at and active.updated_at < cutoff:
-            await session.delete(active)
-            await session.commit()
-            return None
         ticket = await session.get(ContactTicket, int(active.ticket_id))
         if not ticket or ticket.status == 'closed':
             await session.delete(active)
@@ -550,16 +478,7 @@ async def _support_active_ticket_for_user(session, user_id: int) -> ContactTicke
         .order_by(ContactTicket.created_at.desc())
         .limit(1)
     )
-    ticket = res.scalar_one_or_none()
-    if not ticket:
-        return None
-    cutoff = _support_timeout_cutoff()
-    if cutoff and _support_ticket_activity_time(ticket) < cutoff:
-        ticket.status = 'closed'
-        ticket.closed_at = datetime.utcnow()
-        await session.commit()
-        return None
-    return ticket
+    return res.scalar_one_or_none()
 
 
 async def _open_or_reuse_support_ticket_for_business(
@@ -716,6 +635,7 @@ async def _send_support_private_bridge_reply(
     *,
     ticket_id: int,
     clear_state: bool = False,
+    keep_state: bool = False,
 ) -> None:
     """客服管理员在机器人私聊里回复用户。"""
     if not _is_support_private_admin(message.from_user.id):
@@ -758,15 +678,18 @@ async def _send_support_private_bridge_reply(
                 ticket.answered_at = answered_at
                 ticket.last_error = None
                 await session.commit()
-        await state.update_data(contact_ticket_id=int(ticket_id), support_private_bridge=True)
-        await state.set_state(AdminContactReply.message)
+        if keep_state:
+            await state.update_data(contact_ticket_id=int(ticket_id), support_private_bridge=True)
+            await state.set_state(AdminContactReply.message)
+        elif clear_state:
+            await state.clear()
         await message.reply(msg.support_private_admin_sent(user_label=user_label, ticket_no=_support_no(ticket_id), delivery_method=delivery_method))
     except Exception as e:
         friendly_error = _friendly_support_delivery_error(e)
         await _mark_support_delivery_failed(int(ticket_id), friendly_error)
         await message.reply(msg.support_private_admin_failed(user_label=user_label, ticket_no=_support_no(ticket_id), error=friendly_error))
     finally:
-        if clear_state:
+        if clear_state and not keep_state:
             await state.clear()
 
 
@@ -823,7 +746,7 @@ async def _send_support_reply_core(
     """统一客服投递入口：按钮回复、/reply、直接回复工单卡片都走这里。"""
     if message.from_user.id not in settings.admin_id_list:
         await message.answer('无权限。')
-        if clear_state:
+        if clear_state and not keep_state:
             await state.clear()
         return
 
@@ -906,7 +829,7 @@ async def _send_support_reply_core(
             reply_markup=contact_admin_keyboard(ticket_id),
         )
     finally:
-        if clear_state:
+        if clear_state and not keep_state:
             await state.clear()
 
 
@@ -943,8 +866,8 @@ PROJECT_STATUS_LABELS = {
 
 
 def _status_label(status: str | None) -> str:
-    normalized = state_value(status)
-    return PROJECT_STATUS_LABELS.get(normalized or '', normalized or '-')
+    value = state_value(status)
+    return PROJECT_STATUS_LABELS.get(value or '', value or '-')
 
 
 async def _is_blacklisted(session, user_id: int) -> bool:
@@ -1062,13 +985,13 @@ def _order_status_label(o: PaymentOrder, project: CrowdfundProject | None = None
     if o.status == 'pending':
         return '待支付'
     if o.status == 'paid':
-        if project and project.status in ('resource_published', 'delivered'):
+        if project and state_value(project.status) in ('resource_published', 'delivered'):
             return '已完成'
-        if project and project.status in ('cancelled', 'expired', 'refund_pending'):
+        if project and state_value(project.status) in ('cancelled', 'expired', 'refund_pending'):
             return '已取消'
-        if project and project.status in ('resource_submitted', 'resource_review'):
+        if project and state_value(project.status) in ('resource_submitted', 'resource_review'):
             return '资源待审核'
-        if project and project.status in ('waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing', 'resource_uploading'):
+        if project and state_value(project.status) in ('waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing', 'resource_uploading'):
             return '等待资源中'
         return '已上车'
     if o.status == 'refunded':
@@ -1081,7 +1004,7 @@ def _order_status_label(o: PaymentOrder, project: CrowdfundProject | None = None
 
 
 def _is_after_full_stage(project: CrowdfundProject) -> bool:
-    return project.status in (
+    return state_value(project.status) in (
         'full', 'waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing',
         'resource_submitted', 'resource_rejected', 'resource_published', 'delivered'
     ) or project.paid_seats >= project.required_seats
@@ -1220,14 +1143,14 @@ async def _handle_join_deeplink(message: Message, project_id: int) -> None:
             await message.answer('⛔ 你的账号暂时被限制乘坐小车车了，有什么疑问找管理员吧 (╯︵╰)', reply_markup=main_menu())
             return
         project = await session.get(CrowdfundProject, project_id)
-        if not project or project.status in ('cancelled', 'expired', 'rejected'):
+        if not project or state_value(project.status) in ('cancelled', 'expired', 'rejected'):
             await message.answer('⛔ 这辆车车已经不能上啦～可以去「热门众筹」看看别的车位。', reply_markup=main_menu())
             return
 
-        if project.status == 'approved_wait_creator':
+        if state_value(project.status) == 'approved_wait_creator':
             await message.answer('⏳ 车主正在完成双车位验票，验票成功后就可以上车啦～', reply_markup=main_menu())
             return
-        if project.status not in ('active', 'full', 'waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing', 'admin_uploading', 'resource_uploading', 'resource_submitted', 'resource_rejected', 'resource_published', 'delivered'):
+        if state_value(project.status) not in ('active', 'full', 'waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing', 'admin_uploading', 'resource_uploading', 'resource_submitted', 'resource_rejected', 'resource_published', 'delivered'):
             await message.answer('这辆车当前暂不能参与，请稍后再试。', reply_markup=main_menu())
             return
         after_full = _is_after_full_stage(project) or project.paid_seats >= project.required_seats
@@ -1259,8 +1182,11 @@ async def _handle_join_deeplink(message: Message, project_id: int) -> None:
 
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext, command: CommandObject | None = None):
-    await state.clear()
+async def start(message: Message, command: CommandObject | None = None, state: FSMContext | None = None):
+    # /start 是用户脱离任何流程的安全出口。
+    # 先清 FSM，避免后来加入的客服桥/上传流程继续吞业务消息。
+    if state is not None:
+        await state.clear()
     args = (command.args or "").strip() if command else ""
     if args.startswith("join_"):
         try:
@@ -1696,12 +1622,12 @@ async def receive_system_no_for_order(message: Message, state: FSMContext, bot: 
                     await update_public_project(bot, project)
                     if order.order_type == 'crowdfunding_before_full':
                         await notify_creator_rider_progress(bot, project, order.user_id)
-                    if order.order_type in ('crowdfunding_before_full', 'crowdfunding_creator_prepay') and project.paid_seats >= project.required_seats and project.status == 'full':
+                    if order.order_type in ('crowdfunding_before_full', 'crowdfunding_creator_prepay') and project.paid_seats >= project.required_seats and state_value(project.status) == 'full':
                         await notify_project_full(bot, session, project)
                         await update_public_project(bot, project)
                     elif order.order_type == 'crowdfunding_after_full':
                         # 满员后补票：如果资源已经发布，立即补发领取按钮；否则通知审核群，避免用户支付后没动静。
-                        if project.status in ('resource_published', 'delivered'):
+                        if state_value(project.status) in ('resource_published', 'delivered'):
                             items = load_resource_items(project)
                             await bot.send_message(
                                 order.user_id,
@@ -1815,7 +1741,7 @@ async def hot_project_view(call: CallbackQuery, bot: Bot):
             await call.answer('项目不存在', show_alert=True)
             return
         text = project_public_text(project)
-        markup = join_project_keyboard(project.id, full=_is_after_full_stage(project), cancelled=project.status in ('cancelled', 'expired'), seat_price=project.seat_price)
+        markup = join_project_keyboard(project.id, full=_is_after_full_stage(project), cancelled=state_value(project.status) in ('cancelled', 'expired'), seat_price=project.seat_price)
     await _send_hot_project_panel(bot, call.message, project, text, markup)
     await call.answer()
 
@@ -2219,7 +2145,7 @@ async def _after_admin_force_verify(bot: Bot, session, order: PaymentOrder, admi
         if (
             order.order_type in ('crowdfunding_before_full', 'crowdfunding_creator_prepay')
             and project.paid_seats >= project.required_seats
-            and project.status == 'full'
+            and state_value(project.status) == 'full'
         ):
             await notify_project_full(bot, session, project)
             await update_public_project(bot, project)
@@ -2266,6 +2192,57 @@ async def _after_admin_force_verify(bot: Bot, session, order: PaymentOrder, admi
         f'金额：{order.expected_amount:g} 元\n'
         f'操作管理员：{admin_id}',
     )
+
+
+@router.callback_query(F.data.startswith('admin:order:'))
+async def admin_order_detail(call: CallbackQuery, state: FSMContext):
+    """Search-result order card: show exactly which local ticket owns a VP/payment record."""
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+    try:
+        order_id = int(call.data.split(':')[-1])
+    except ValueError:
+        await call.answer('车票编号错误', show_alert=True)
+        return
+    async with SessionLocal() as session:
+        order = await session.get(PaymentOrder, order_id)
+        if not order:
+            await call.answer('车票不存在或已被删除', show_alert=True)
+            return
+        project = await session.get(CrowdfundProject, order.project_id) if order.project_id else None
+    rows = []
+    if order.project_id:
+        rows.append([InlineKeyboardButton(text='🔍 打开项目卡片', callback_data=f'admin:project:{order.project_id}')])
+        rows.append([
+            InlineKeyboardButton(text='✅ 已支付用户', callback_data=f'admin:paid_users:{order.project_id}'),
+            InlineKeyboardButton(text='💳 待付车票', callback_data=f'admin:pending_orders:{order.project_id}'),
+        ])
+    if order.status == 'pending':
+        rows.append([InlineKeyboardButton(text='🛠 直接给这张车票补单', callback_data=f'admin:manual_verify_select:{order.id}')])
+    elif order.status == 'paid' and order.project_id:
+        rows.append([InlineKeyboardButton(text='↔️ 看同项目待付车票，必要时转绑', callback_data=f'admin:pending_orders:{order.project_id}')])
+    rows.append([InlineKeyboardButton(text='🔎 再搜一次', callback_data='admin:search_help')])
+    rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
+    text = (
+        f'🎫 车票详情｜{_ticket_no(order.id)}\n'
+        f'{msg.LINE}\n\n'
+        f'{project_label(project) if project else "项目：-"}\n'
+        f'用户：{order.username or order.user_id}\n'
+        f'状态：{order.status}\n'
+        f'类型：{_order_type_name(order.order_type)}\n'
+        f'应付：{float(order.expected_amount or 0):g} 元\n'
+        f'实付：{float(order.paid_amount or 0):g} 元\n'
+        f'系统单号：{order.faka_system_no or "-"}\n'
+        f'支付单号：{order.faka_pay_no or "-"}\n'
+        f'支付来源：{order.payment_source or "-"}\n'
+        f'支付时间：{_fmt_dt(order.paid_at)}\n\n'
+        f'{msg.LINE}\n'
+        '如果用户说 VP 重复，先看这里的“系统单号”是否已经占用。\n'
+        '未占用：给目标待付车票补单。已占用但绑错：同项目内用 /move_bind T.目标车票 T.占用车票 原因。'
+    )
+    await _edit_panel(call, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith('admin:manual_verify:'))
@@ -2345,17 +2322,24 @@ async def admin_manual_verify_select(call: CallbackQuery, state: FSMContext):
         )
     ]]
     default_label = '项目：-\n博主：-\n描述：-'
-    await _edit_panel(
-        call,
+    prompt_text = (
         f'🎫 手动补票确认\n\n'
         f'{project_label(project) if project else default_label}\n'
         f'车票：{_ticket_no(order.id)}\n'
         f'用户：{order.username or order.user_id}\n'
         f'金额：{order.expected_amount:g} 元\n\n'
-        f'请发送这张车票要绑定的 VP 开头系统单号。',
+        f'请发送这张车票要绑定的 VP 开头系统单号。'
+    )
+    await _edit_panel(
+        call,
+        prompt_text + '\n\n如果群里直接发 VP 没反应，请回复下一条“补票输入框”，或使用：/bind ' + _ticket_no(order.id) + ' VP系统单号',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
-    await call.answer()
+    await call.message.answer(
+        f'🎫 补票输入框｜{_ticket_no(order.id)}\n请直接回复这条消息发送 VP 系统单号。',
+        reply_markup=ForceReply(selective=True, input_field_placeholder='VP2026...'),
+    )
+    await call.answer('请回复补票输入框发送 VP 系统单号')
 
 
 @router.callback_query(F.data.startswith('admin:manual_verify_cancel:'))
@@ -2419,14 +2403,14 @@ async def admin_manual_verify_receive(message: Message, state: FSMContext, bot: 
     )
 
 
-@router.message(Command('force_verify'))
+@router.message(Command('force_verify', 'bind'))
 async def admin_force_verify(message: Message, bot: Bot):
     if message.from_user.id not in settings.admin_id_list:
         await message.answer('无权限。')
         return
     parts = (message.text or '').strip().split(maxsplit=2)
     if len(parts) != 3:
-        await message.answer('用法：/force_verify 订单ID 系统单号\n示例：/force_verify 12 VP2026060202331011743')
+        await message.answer('用法：/force_verify 订单ID 系统单号 或 /bind 车票 系统单号\n示例：/bind T.012 VP2026060202331011743')
         return
     raw_id = parts[1].upper().replace('T.', '').replace('T', '')
     try:
@@ -2438,10 +2422,62 @@ async def admin_force_verify(message: Message, bot: Bot):
     async with SessionLocal() as session:
         ok, reason, order = await force_verify_order(session, order_id, system_no, message.from_user.id)
         if not ok or not order:
-            await message.answer('❌ ' + reason)
+            extra = ''
+            if '占用车票' in reason:
+                extra = '\n\n处理方式：先 /search 这个 VP 系统单号，看占用车票是哪张；如果确认是绑错到同一项目旧车票，请用：\n/move_bind T.目标车票 T.占用车票 原因'
+            await message.answer('❌ ' + reason + extra)
             return
         await _after_admin_force_verify(bot, session, order, message.from_user.id)
     await message.answer(f'✅ 手动补单成功：{_ticket_no(order.id)} 已绑定 {order.faka_system_no}')
+
+
+@router.message(Command('move_bind', 'rebind'))
+async def admin_move_bind(message: Message, bot: Bot):
+    """管理员把已占用的付款凭证从一张车票转到另一张车票。"""
+    if message.from_user.id not in settings.admin_id_list:
+        await message.answer('无权限。')
+        return
+    parts = (message.text or '').strip().split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(
+            '用法：/move_bind T.目标车票 T.占用车票 [原因]\n'
+            '例：/move_bind T.012 T.005 用户提交时绑到了旧待付单\n\n'
+            '说明：目标车票必须是待验票，源车票必须是已支付，且必须属于同一个项目。'
+        )
+        return
+
+    def _parse_ticket(raw: str) -> int | None:
+        value = (raw or '').upper().replace('T.', '').replace('T', '').strip()
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    target_id = _parse_ticket(parts[1])
+    source_id = _parse_ticket(parts[2])
+    reason = parts[3].strip() if len(parts) >= 4 else None
+    if not target_id or not source_id:
+        await message.answer('车票格式错误，请使用 T.012 这种格式。')
+        return
+
+    async with SessionLocal() as session:
+        ok, reason_text, order = await move_paid_binding_to_order(
+            session,
+            source_order_id=source_id,
+            target_order_id=target_id,
+            admin_id=message.from_user.id,
+            reason=reason,
+        )
+        if not ok or not order:
+            await message.answer('❌ ' + reason_text)
+            return
+        await _after_admin_force_verify(bot, session, order, message.from_user.id)
+    await message.answer(
+        f'✅ 转绑成功：{_ticket_no(source_id)} → {_ticket_no(order.id)}\n'
+        f'系统单号：{order.faka_system_no or "-"}\n'
+        f'用户：{order.user_id}\n'
+        f'项目：P.{int(order.project_id or 0):03d}'
+    )
 
 
 @router.message(Command('admin'))
@@ -2655,7 +2691,8 @@ async def _send_admin_dashboard(message: Message):
     if message.from_user.id not in settings.admin_id_list:
         await message.answer('这个小掌柜面板只有管理员可以打开喔～')
         return
-    today_start = business_today_start_utc(settings)
+    from datetime import datetime, timedelta, time
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     async with SessionLocal() as session:
         def scalar(q):
             return session.execute(q)
@@ -2675,7 +2712,7 @@ async def _send_admin_dashboard(message: Message):
             )
         )).scalar() or 0
         full_projects = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.full_at >= today_start))).scalar() or 0
-        pending_review = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.status.in_(['pending_review', 'ProjectState.PENDING_REVIEW']), CrowdfundProject.created_at >= today_start))).scalar() or 0
+        pending_review = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start))).scalar() or 0
         wait_upload = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.status.in_(['waiting_creator_resource','waiting_buy_info','platform_purchasing','resource_uploading','resource_rejected']), CrowdfundProject.created_at >= today_start))).scalar() or 0
         pending_reimb = (await session.execute(select(func.count()).select_from(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.payout_type == 'reimbursement', ProfitWithdrawal.created_at >= today_start))).scalar() or 0
         pending_withdraw = (await session.execute(select(func.count()).select_from(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.payout_type != 'reimbursement', ProfitWithdrawal.created_at >= today_start))).scalar() or 0
@@ -2754,22 +2791,12 @@ async def admin_dashboard_list(call: CallbackQuery):
     if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
-    parts = (call.data or 'admin:list:unknown:0').split(':')
-    list_type = parts[2] if len(parts) > 2 else 'unknown'
-    try:
-        page = max(0, int(parts[3])) if len(parts) > 3 else 0
-    except Exception:
-        page = 0
-    page_size = 10
-    offset = page * page_size
-    has_next = False
-    today_start = business_today_start_utc(settings)
+    list_type = call.data.split(':')[-1]
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     async with SessionLocal() as session:
         if list_type == 'pending_review':
-            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status.in_(['pending_review', 'ProjectState.PENDING_REVIEW']), CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).offset(offset).limit(page_size + 1))
+            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).limit(10))
             projects = list(res.scalars().all())
-            has_next = len(projects) > page_size
-            projects = projects[:page_size]
             if not projects:
                 text = '🔍 暂无待审车车～'
                 markup = admin_dashboard_keyboard()
@@ -2779,18 +2806,12 @@ async def admin_dashboard_list(call: CallbackQuery):
                 for p in projects:
                     lines.append(f'\n项目：P.{int(p.id or 0):03d}\n博主：{p.blogger}\n描述：{p.description}\n原价：{p.original_price:g} 元\n状态：{_status_label(p.status)}')
                     rows.append([InlineKeyboardButton(text=f'🔍 P.{int(p.id or 0):03d}｜查看详情', callback_data=f'admin:project:{p.id}')])
-                    rows.append([
-                        InlineKeyboardButton(text=f'✅ 通过 P.{int(p.id or 0):03d}', callback_data=f'admin:approve:{p.id}'),
-                        InlineKeyboardButton(text=f'❌ 拒绝 P.{int(p.id or 0):03d}', callback_data=f'admin:reject:{p.id}'),
-                    ])
                 rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'wait_upload':
-            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status.in_(['waiting_creator_resource','waiting_buy_info','platform_purchasing','admin_uploading','resource_uploading','resource_rejected','resource_review']), CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).offset(offset).limit(page_size + 1))
+            res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status.in_(['waiting_creator_resource','waiting_buy_info','platform_purchasing','admin_uploading','resource_uploading','resource_rejected','resource_review']), CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).limit(10))
             projects = list(res.scalars().all())
-            has_next = len(projects) > page_size
-            projects = projects[:page_size]
             if not projects:
                 text = '📤 暂无待补资源～'
                 markup = admin_dashboard_keyboard()
@@ -2804,10 +2825,8 @@ async def admin_dashboard_list(call: CallbackQuery):
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'payouts':
-            res = await session.execute(select(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.created_at >= today_start).order_by(ProfitWithdrawal.created_at.desc()).offset(offset).limit(page_size + 1))
+            res = await session.execute(select(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.created_at >= today_start).order_by(ProfitWithdrawal.created_at.desc()).limit(10))
             payouts = list(res.scalars().all())
-            has_next = len(payouts) > page_size
-            payouts = payouts[:page_size]
             if not payouts:
                 text = '💰 暂无报销/提现待处理～'
                 markup = admin_dashboard_keyboard()
@@ -2826,10 +2845,8 @@ async def admin_dashboard_list(call: CallbackQuery):
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'refunds':
-            res = await session.execute(select(RefundRecord).where(RefundRecord.status.in_(['pending_info','pending_admin']), RefundRecord.created_at >= today_start).order_by(RefundRecord.created_at.desc()).offset(offset).limit(page_size + 1))
+            res = await session.execute(select(RefundRecord).where(RefundRecord.status.in_(['pending_info','pending_admin']), RefundRecord.created_at >= today_start).order_by(RefundRecord.created_at.desc()).limit(10))
             refunds = list(res.scalars().all())
-            has_next = len(refunds) > page_size
-            refunds = refunds[:page_size]
             if not refunds:
                 text = msg.admin_refund_empty()
                 markup = admin_dashboard_keyboard()
@@ -2864,11 +2881,9 @@ async def admin_dashboard_list(call: CallbackQuery):
                 select(ContactTicket)
                 .where(ContactTicket.status.in_(['open', 'answered']), ContactTicket.created_at >= today_start)
                 .order_by(ContactTicket.created_at.desc())
-                .offset(offset).limit(page_size + 1)
+                .limit(10)
             )
             tickets = list(res.scalars().all())
-            has_next = len(tickets) > page_size
-            tickets = tickets[:page_size]
             if not tickets:
                 text = '💬 暂无客服小纸条～\n\n用户点「联系小掌柜」后，会在这里生成客服小纸条；退款、报销、提现仍在各自业务列表处理。'
                 markup = admin_dashboard_keyboard()
@@ -2879,7 +2894,7 @@ async def admin_dashboard_list(call: CallbackQuery):
                     user_label = t.username or str(t.user_id)
                     status_label = {'open': '待回复', 'answered': '已回复', 'closed': '已关闭'}.get(t.status, t.status)
                     body = (t.user_message or '非文本消息')[:120]
-                    lines.append(f'\n工单：{_support_no(t.id)}｜{status_label}\n用户：{user_label}（{t.user_id}）\n时间：{fmt_business_dt(t.created_at, settings)}\n内容：{body}')
+                    lines.append(f'\n工单：{_support_no(t.id)}｜{status_label}\n用户：{user_label}（{t.user_id}）\n时间：{t.created_at:%Y-%m-%d %H:%M}\n内容：{body}')
                     rows.append([InlineKeyboardButton(text=f'💬 回复用户 {_support_no(t.id)}', callback_data=f'admin:support_reply:{t.id}')])
                     rows.append([InlineKeyboardButton(text=f'✅ 关闭 {_support_no(t.id)}', callback_data=f'admin:support_close:{t.id}')])
                 rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
@@ -2887,10 +2902,8 @@ async def admin_dashboard_list(call: CallbackQuery):
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'ledger':
             rows_data = list((await session.execute(
-                select(FinancialLedger).where(FinancialLedger.created_at >= today_start).order_by(FinancialLedger.created_at.desc()).offset(offset).limit(page_size + 1)
+                select(FinancialLedger).where(FinancialLedger.created_at >= today_start).order_by(FinancialLedger.created_at.desc()).limit(30)
             )).scalars().all())
-            has_next = len(rows_data) > page_size
-            rows_data = rows_data[:page_size]
             balance = (await session.execute(
                 select(func.coalesce(func.sum(
                     case((FinancialLedger.direction == 'income', FinancialLedger.amount),
@@ -2928,7 +2941,7 @@ async def admin_dashboard_list(call: CallbackQuery):
                 ).limit(10)
             )).scalars().all())
             events = list((await session.execute(
-                select(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start).order_by(SystemEvent.created_at.desc()).offset(offset).limit(page_size + 1)
+                select(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start).order_by(SystemEvent.created_at.desc()).limit(30)
             )).scalars().all())
             lines = ['🚨 今日运营异常面板']
             lines.append(f'\n验票失败次数过多用户：{len(high_risk_rows)}')
@@ -2957,34 +2970,19 @@ async def admin_dashboard_list(call: CallbackQuery):
             text = '\n'.join(lines)
             markup = admin_dashboard_keyboard()
         elif list_type == 'risks':
-            res = await session.execute(select(RiskLog).where(RiskLog.created_at >= today_start).order_by(RiskLog.created_at.desc()).offset(offset).limit(page_size + 1))
+            res = await session.execute(select(RiskLog).where(RiskLog.created_at >= today_start).order_by(RiskLog.created_at.desc()).limit(10))
             risks = list(res.scalars().all())
-            has_next = len(risks) > page_size
-            risks = risks[:page_size]
             if not risks:
                 text = '⚠️ 暂无风控记录～'
             else:
                 lines = ['⚠️ 今日风控记录']
                 for r in risks:
-                    lines.append(f'\n用户：{r.user_id}\n提交系统单号：{r.submitted_no or "-"}\n原因：{r.reason}\n时间：{fmt_business_dt(r.created_at, settings)}')
+                    lines.append(f'\n用户：{r.user_id}\n提交系统单号：{r.submitted_no or "-"}\n原因：{r.reason}\n时间：{r.created_at:%Y-%m-%d %H:%M}')
                 text = '\n'.join(lines)
             markup = admin_dashboard_keyboard()
         else:
             await call.answer('未知列表', show_alert=True)
             return
-    try:
-        rows_obj = locals().get('rows')
-        if isinstance(rows_obj, list) and (page > 0 or has_next):
-            nav = []
-            if page > 0:
-                nav.append(InlineKeyboardButton(text='⬅️ 上一页', callback_data=f'admin:list:{list_type}:{page-1}'))
-            if has_next:
-                nav.append(InlineKeyboardButton(text='➡️ 下一页', callback_data=f'admin:list:{list_type}:{page+1}'))
-            if nav:
-                rows_obj.append(nav)
-                markup = InlineKeyboardMarkup(inline_keyboard=rows_obj)
-    except Exception:
-        pass
     await _edit_panel(call, text, reply_markup=markup)
     await call.answer()
 
@@ -2994,7 +2992,8 @@ async def admin_dashboard_callback(call: CallbackQuery):
     if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
-    today_start = business_today_start_utc(settings)
+    from datetime import datetime, timedelta
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     async with SessionLocal() as session:
         new_projects = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.created_at >= today_start))).scalar() or 0
         paid_orders = (await session.execute(
@@ -3012,7 +3011,7 @@ async def admin_dashboard_callback(call: CallbackQuery):
             )
         )).scalar() or 0
         full_projects = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.full_at >= today_start))).scalar() or 0
-        pending_review = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.status.in_(['pending_review', 'ProjectState.PENDING_REVIEW']), CrowdfundProject.created_at >= today_start))).scalar() or 0
+        pending_review = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start))).scalar() or 0
         wait_upload = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.status.in_(['waiting_creator_resource','waiting_buy_info','platform_purchasing','resource_uploading','resource_rejected']), CrowdfundProject.created_at >= today_start))).scalar() or 0
         pending_reimb = (await session.execute(select(func.count()).select_from(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.payout_type == 'reimbursement', ProfitWithdrawal.created_at >= today_start))).scalar() or 0
         pending_withdraw = (await session.execute(select(func.count()).select_from(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.payout_type != 'reimbursement', ProfitWithdrawal.created_at >= today_start))).scalar() or 0
@@ -3147,9 +3146,31 @@ async def support_end_callback(call: CallbackQuery, state: FSMContext, bot: Bot)
 @router.message(ContactSupport.message)
 async def collect_support_message(message: Message, state: FSMContext, bot: Bot):
     """用户客服私聊桥：用户消息直接同步到指定客服管理员私聊，不进审核群。"""
-    # 客服桥只服务“联系小掌柜”。用户在客服态点击/发送主业务入口时，立即退出客服态并回到原业务流程。
-    if await _exit_support_to_business(message, state):
+    raw_text = (message.text or '').strip()
+    # 客服桥只服务“联系小掌柜”。用户在客服状态里点主菜单/业务命令时，
+    # 必须优先退出客服并进入原业务流程，不能把资料或按钮文字转发给客服。
+    if raw_text in {'/start', '开始', '首页'}:
+        await state.clear()
+        await message.answer(START_HELP, reply_markup=main_menu())
         return
+    if raw_text == '🚗 发起众筹':
+        await state.clear()
+        from app.handlers.crowdfund import _start_crowdfund_flow
+        await _start_crowdfund_flow(message, state)
+        return
+    if raw_text in {'📋 众筹订单', '📋 我的众筹'}:
+        await state.clear()
+        await order_center_text(message)
+        return
+    if raw_text == '🔥 热门众筹':
+        await state.clear()
+        await hot_projects_text(message)
+        return
+    if raw_text == '📦 我的宝贝资源':
+        await state.clear()
+        await my_resources_text(message)
+        return
+
     if bool(settings.SUPPORT_EXTERNAL_ONLY):
         await state.clear()
         await message.answer(
@@ -3158,7 +3179,7 @@ async def collect_support_message(message: Message, state: FSMContext, bot: Bot)
         )
         return
 
-    if (message.text or '').strip() in {'退出客服', '结束客服', '/end_support', '/support_end'}:
+    if raw_text in {'退出客服', '结束客服', '/end_support', '/support_end'}:
         data = await state.get_data()
         ticket_id = int(data.get('contact_ticket_id') or 0)
         if ticket_id:
@@ -3451,20 +3472,58 @@ async def admin_support_hold_private_dialog(call: CallbackQuery, state: FSMConte
 ))
 async def admin_support_private_reply_to_user(message: Message, state: FSMContext, bot: Bot):
     """管理员在私聊里直接回复某条用户消息：自动切换目标用户并发送。"""
-    if (message.text or '').lstrip().startswith('/'):
+    command_text = (message.text or '').strip()
+    if _is_admin_search_reply(message) or _looks_like_admin_search_query(command_text):
+        await state.clear()
+        await _run_admin_search(message, command_text)
+        return
+    if command_text.startswith('/search'):
+        await state.clear()
+        parts = command_text.split(maxsplit=1)
+        if len(parts) == 2:
+            await _run_admin_search(message, parts[1].strip())
+        else:
+            await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
+        return
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify'):
+        await state.clear()
+        await admin_force_verify(message, bot)
+        return
+    if command_text.startswith('/'):
+        await state.clear()
+        await message.answer('已退出客服回复状态。请重新发送刚才的命令。')
         return
     ticket_id = await _support_ticket_id_from_admin_reply_message(message)
     if not ticket_id:
         await message.reply('⚠️ 没识别出要回复哪个用户。请回复带 S.xxx 的用户消息，或点「保持这个对话」。')
         return
-    await _send_support_private_bridge_reply(message, state, bot, ticket_id=int(ticket_id), clear_state=True)
+    await _send_support_private_bridge_reply(message, state, bot, ticket_id=int(ticket_id), clear_state=False)
 
 
 @router.message(AdminContactReply.message)
 async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot):
-    if await _route_admin_upload_private_message(message, bot):
+    command_text = (message.text or '').strip()
+    if _is_admin_search_reply(message) or _looks_like_admin_search_query(command_text):
         await state.clear()
+        await _run_admin_search(message, command_text)
         return
+    if command_text.startswith('/search'):
+        await state.clear()
+        parts = command_text.split(maxsplit=1)
+        if len(parts) == 2:
+            await _run_admin_search(message, parts[1].strip())
+        else:
+            await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
+        return
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify'):
+        await state.clear()
+        await admin_force_verify(message, bot)
+        return
+    if command_text.startswith('/'):
+        await state.clear()
+        await message.answer('已退出客服回复状态。请重新发送刚才的命令。')
+        return
+
     data = await state.get_data()
     ticket_id = int(data.get('contact_ticket_id') or 0)
     if bool(data.get('support_private_bridge')) or (message.chat and message.chat.type == 'private' and _is_support_private_admin(message.from_user.id)):
@@ -3476,6 +3535,7 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
             bot,
             ticket_id=int(reply_ticket_id or ticket_id),
             clear_state=False,
+            keep_state=bool(data.get('support_private_bridge')),
         )
         return
     await _send_support_reply_core(
@@ -3490,16 +3550,10 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
     )
 
 
-# 注意：不要注册“管理员私聊任意消息 -> 当前客服用户”的宽泛兜底。
-# 这类 handler 会抢走管理员搜索、手动补票、资源上传等原有稳定流程。
-# 管理员客服回复只保留两种明确入口：
-# 1) 回复某条用户客服消息；2) 点击「保持这个对话」后进入 AdminContactReply.message 状态。
+@router.message(lambda message: False)
 async def admin_support_private_active_dialog(message: Message, state: FSMContext, bot: Bot):
     """管理员私聊里直接发送内容：发送给当前保持的用户，不依赖 FSM。"""
     if (message.text or '').lstrip().startswith('/'):
-        return
-    if await _route_admin_upload_private_message(message, bot):
-        await state.clear()
         return
     ticket_id = await _get_support_admin_active_ticket_id(message.from_user.id)
     if not ticket_id:
@@ -3800,7 +3854,14 @@ async def admin_project_state_history(call: CallbackQuery):
 
 
 async def _admin_group_allowed(user_id: int, chat_id: int) -> bool:
-    return int(user_id) in settings.admin_id_list and int(chat_id) == int(settings.ADMIN_GROUP_ID)
+    """Allow admin controls in the audit group and in the admin's bot private chat.
+
+    This keeps group buttons working, while making /search and /bind reliable even
+    when group ForceReply/privacy mode swallows the reply.
+    """
+    uid = int(user_id)
+    cid = int(chat_id)
+    return uid in settings.admin_id_list and (cid == int(settings.ADMIN_GROUP_ID) or cid == uid)
 
 
 async def _health_text(bot: Bot) -> str:
@@ -3870,22 +3931,37 @@ async def admin_health_command(message: Message, bot: Bot):
 
 
 @router.callback_query(F.data == 'admin:search_help')
-async def admin_search_help(call: CallbackQuery, state: FSMContext):
+async def admin_search_help(call: CallbackQuery, state: FSMContext, bot: Bot):
     if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
-        await call.answer('只能在审核群由管理员使用', show_alert=True)
+        await call.answer('只能在审核群或管理员私聊使用', show_alert=True)
         return
+    await state.clear()
     await state.set_state(AdminSearch.query)
+    prompt = msg.admin_search_help()
     await call.message.answer(
-        msg.admin_search_help(),
-        reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'),
+        prompt,
+        reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / T.012 / VP单号 / 用户ID / 博主名'),
     )
-    await call.answer('请回复搜索提示发送关键词')
+    if call.message.chat and call.message.chat.id != call.from_user.id:
+        try:
+            await bot.send_message(
+                call.from_user.id,
+                prompt + '\n\n也可以直接发送：/search 关键词',
+                reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / T.012 / VP单号 / 用户ID / 博主名'),
+                disable_web_page_preview=True,
+            )
+            await call.answer('搜索框已发到群里，也同步发到你的机器人私聊。')
+        except Exception:
+            await call.answer('请回复搜索提示，或直接发送 /search 关键词。')
+    else:
+        await call.answer('请回复搜索提示，或直接发送 /search 关键词。')
 
 
 @router.message(Command('search'))
 async def admin_search_command(message: Message, state: FSMContext):
     if not await _admin_group_allowed(message.from_user.id, message.chat.id):
         return
+    await state.clear()
     query = (message.text or '').split(maxsplit=1)
     if len(query) == 2:
         await _run_admin_search(message, query[1].strip())
@@ -3893,14 +3969,14 @@ async def admin_search_command(message: Message, state: FSMContext):
         await state.set_state(AdminSearch.query)
         await message.answer(
             msg.admin_search_help(),
-            reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'),
+            reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / T.012 / VP单号 / 用户ID / 博主名'),
         )
 
 
 def _is_admin_search_reply(message: Message) -> bool:
     reply = getattr(message, 'reply_to_message', None)
     text = (getattr(reply, 'text', None) or getattr(reply, 'caption', None) or '') if reply else ''
-    return text.startswith('🔎 项目搜索')
+    return '项目搜索' in text or '小掌柜放大镜' in text or '发送关键词' in text
 
 
 @router.message(lambda message: _is_admin_search_reply(message))
@@ -3921,8 +3997,56 @@ async def admin_search_state(message: Message, state: FSMContext):
     await state.clear()
 
 
+@router.message(lambda message: bool(
+    message.from_user
+    and message.chat
+    and message.from_user.id in settings.admin_id_list
+    and message.chat.type == 'private'
+    and _looks_like_admin_search_query(message.text)
+))
+async def admin_private_plain_search(message: Message, state: FSMContext):
+    await state.clear()
+    await _run_admin_search(message, (message.text or '').strip())
+
+
+def _parse_project_query(q: str) -> int | None:
+    raw = (q or '').strip().upper().replace(' ', '')
+    for prefix in ('P.', 'P-', 'P'):
+        if raw.startswith(prefix):
+            tail = raw[len(prefix):]
+            if tail.isdigit():
+                return int(tail)
+    return None
+
+
+def _parse_ticket_query(q: str) -> int | None:
+    raw = (q or '').strip().upper().replace(' ', '')
+    for prefix in ('T.', 'T-', 'T'):
+        if raw.startswith(prefix):
+            tail = raw[len(prefix):]
+            if tail.isdigit():
+                return int(tail)
+    return None
+
+
+def _looks_like_admin_search_query(text: str | None) -> bool:
+    raw = (text or '').strip()
+    if not raw or raw.startswith('/'):
+        return False
+    compact = raw.upper().replace(' ', '')
+    if _parse_project_query(raw) is not None or _parse_ticket_query(raw) is not None:
+        return True
+    if compact.startswith('VP') and len(compact) >= 8:
+        return True
+    if raw.isdigit() and len(raw) >= 3:
+        return True
+    # 普通博主名/描述搜索请用 /search 关键词或先点“项目搜索”进入搜索状态。
+    # 这里不要把“你好”等客服回复误判成搜索。
+    return False
+
+
 async def _run_admin_search(message: Message, query: str) -> None:
-    q = query.strip()
+    q = (query or '').strip()
     if not q:
         await message.answer(msg.admin_search_need_query(), reply_markup=admin_dashboard_keyboard())
         return
@@ -3936,16 +4060,22 @@ async def _run_admin_search(message: Message, query: str) -> None:
     payouts = []
     try:
         async with SessionLocal() as session:
+            q_upper = q.upper().strip()
             project_filters = []
-            if q.upper().startswith('P.') and q[2:].isdigit():
-                project_filters.append(CrowdfundProject.id == int(q[2:]))
+            project_id = _parse_project_query(q)
+            ticket_id = _parse_ticket_query(q)
+
+            if project_id:
+                project_filters.append(CrowdfundProject.id == project_id)
             if q.isdigit():
                 uid = int(q)
                 project_filters.append(CrowdfundProject.creator_id == uid)
+                project_filters.append(CrowdfundProject.id == uid)
             project_filters.append(CrowdfundProject.blogger.ilike(f'%{q}%'))
+            project_filters.append(CrowdfundProject.description.ilike(f'%{q}%'))
 
             projects = list((await session.execute(
-                select(CrowdfundProject).where(or_(*project_filters)).limit(10)
+                select(CrowdfundProject).where(or_(*project_filters)).order_by(CrowdfundProject.created_at.desc()).limit(10)
             )).scalars().all())
             if projects:
                 lines.append('\n🚗 项目小车：')
@@ -3954,28 +4084,38 @@ async def _run_admin_search(message: Message, query: str) -> None:
                         f'• {project_no(p)}｜{p.blogger}｜{_status_label(p.status)}｜{project_progress_text(p, compact=True)}'
                     )
 
-            order_filters = [PaymentOrder.faka_system_no == q.upper()]
+            order_filters = []
+            if ticket_id:
+                order_filters.append(PaymentOrder.id == ticket_id)
+            if q_upper.startswith('VP'):
+                order_filters.append(PaymentOrder.faka_system_no == q_upper)
+            order_filters.append(PaymentOrder.faka_system_no == q_upper)
+            order_filters.append(PaymentOrder.faka_pay_no == q_upper)
             if q.isdigit():
-                order_filters.append(PaymentOrder.user_id == int(q))
+                uid = int(q)
+                order_filters.append(PaymentOrder.user_id == uid)
+                order_filters.append(PaymentOrder.id == uid)
             orders = list((await session.execute(
-                select(PaymentOrder).where(or_(*order_filters)).limit(10)
+                select(PaymentOrder).where(or_(*order_filters)).order_by(PaymentOrder.created_at.desc()).limit(15)
             )).scalars().all())
             if orders:
                 lines.append('\n🎫 支付/验票记录：')
                 for o in orders:
                     marker = o.faka_system_no or f'T.{o.id:03d}'
-                    lines.append(f'• {marker}｜用户{o.user_id}｜{o.status}｜金额{(o.paid_amount or o.expected_amount or 0):g}元')
+                    lines.append(
+                        f'• {marker}｜车票T.{o.id:03d}｜用户{o.user_id}｜{o.status}｜项目P.{int(o.project_id or 0):03d}｜金额{(o.paid_amount or o.expected_amount or 0):g}元'
+                    )
 
             if q.isdigit():
                 uid = int(q)
                 refunds = list((await session.execute(
-                    select(RefundRecord).where(RefundRecord.user_id == uid).limit(10)
+                    select(RefundRecord).where(RefundRecord.user_id == uid).order_by(RefundRecord.created_at.desc()).limit(10)
                 )).scalars().all())
                 tickets = list((await session.execute(
-                    select(ContactTicket).where(ContactTicket.user_id == uid).limit(10)
+                    select(ContactTicket).where(ContactTicket.user_id == uid).order_by(ContactTicket.created_at.desc()).limit(10)
                 )).scalars().all())
                 risks = list((await session.execute(
-                    select(RiskLog).where(RiskLog.user_id == uid).limit(10)
+                    select(RiskLog).where(RiskLog.user_id == uid).order_by(RiskLog.created_at.desc()).limit(10)
                 )).scalars().all())
                 if refunds:
                     lines.append('\n🧾 退款小票：' + '、'.join(_refund_no(r.id) for r in refunds))
@@ -3983,11 +4123,18 @@ async def _run_admin_search(message: Message, query: str) -> None:
                     lines.append('\n💬 历史客服工单：' + '、'.join(_support_no(t.id) for t in tickets))
                 if risks:
                     lines.append(f'\n⚠️ 风控记录：{len(risks)} 条')
+            elif q_upper.startswith('VP'):
+                risks = list((await session.execute(
+                    select(RiskLog).where(RiskLog.submitted_no == q_upper).order_by(RiskLog.created_at.desc()).limit(10)
+                )).scalars().all())
+                if risks:
+                    lines.append(f'\n⚠️ 这个系统单号相关风控记录：{len(risks)} 条')
 
-            if projects:
-                ids = [p.id for p in projects]
+            project_ids = {int(p.id) for p in projects if p.id}
+            project_ids.update(int(o.project_id) for o in orders if o.project_id)
+            if project_ids:
                 payouts = list((await session.execute(
-                    select(ProfitWithdrawal).where(ProfitWithdrawal.project_id.in_(ids)).limit(10)
+                    select(ProfitWithdrawal).where(ProfitWithdrawal.project_id.in_(project_ids)).order_by(ProfitWithdrawal.created_at.desc()).limit(10)
                 )).scalars().all())
             if payouts:
                 lines.append('\n💰 报销/提现：' + '、'.join(_payout_no(w.id) for w in payouts))

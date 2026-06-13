@@ -15,7 +15,7 @@ from app.services.payments import expire_stale_pending_orders
 from app.config import get_settings
 from app.keyboards import join_project_keyboard, refund_apply_keyboard, pending_order_actions_keyboard
 from app.services.payment_checker import faka_query_client
-from app.services.project_state import ProjectState, transition_project
+from app.services.project_state import ProjectState, transition_project, state_value
 from app.services.system_events import record_event, record_or_update_event, resolve_events, set_metric
 
 settings = get_settings()
@@ -79,7 +79,7 @@ async def _create_refund_records(bot: Bot, session, project, reason: str) -> int
             await session.flush()
         records.append((rr, o))
     if records:
-        if project.status in (ProjectState.CANCELLED, ProjectState.EXPIRED):
+        if state_value(project.status) in (ProjectState.CANCELLED.value, ProjectState.EXPIRED.value):
             await transition_project(session, project, ProjectState.REFUND_PENDING, reason=reason, idempotency_key=f'project:{project.id}:refund-pending', force=True)
         await session.commit()
     if orders:

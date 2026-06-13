@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from enum import Enum
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 compatibility
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        def __str__(self) -> str:
+            return self.value
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import CrowdfundProject, ProjectStateHistory
 
 
-class ProjectState(str, Enum):
+class ProjectState(StrEnum):
     DRAFT = 'draft'
     PENDING_REVIEW = 'pending_review'
     REJECTED = 'rejected'
@@ -31,104 +39,108 @@ class ProjectState(str, Enum):
     REFUND_COMPLETED = 'refund_completed'
 
 
-def state_value(value: str | ProjectState | None) -> str:
-    """Normalize project status values.
+_LEGACY_STATE_ALIASES = {
+    'pending': ProjectState.PENDING_REVIEW.value,
+    'ProjectState.PENDING': ProjectState.PENDING_REVIEW.value,
+}
 
-    历史代码里有些地方会把 Enum 直接 str() 成 ``ProjectState.X``，
-    这里统一规整成数据库使用的 ``pending_review`` 这类字符串。
+
+def state_value(value: str | ProjectState | None) -> str:
+    """Return the canonical DB string for a project state.
+
+    This project has gone through several versions. Some older code/db rows may
+    contain enum repr strings such as ``ProjectState.PENDING_REVIEW`` while the DB
+    column is supposed to contain plain values like ``pending_review``. All state
+    checks and transitions should pass through this helper.
     """
     if value is None:
         return ''
     if isinstance(value, ProjectState):
         return value.value
     raw = str(value).strip()
+    if raw in _LEGACY_STATE_ALIASES:
+        return _LEGACY_STATE_ALIASES[raw]
     if raw.startswith('ProjectState.'):
         name = raw.split('.', 1)[1]
-        try:
-            return ProjectState[name].value
-        except Exception:
-            return raw
+        member = ProjectState.__members__.get(name)
+        if member:
+            return member.value
+    for member in ProjectState:
+        if raw == member.value:
+            return member.value
     return raw
 
 
-def _state_set(*values: str | ProjectState) -> set[str]:
-    return {state_value(v) for v in values}
+def normalize_project_status(project: CrowdfundProject | None) -> str:
+    """Normalize project.status in-place and return canonical status."""
+    if project is None:
+        return ''
+    normalized = state_value(getattr(project, 'status', None))
+    if normalized and getattr(project, 'status', None) != normalized:
+        project.status = normalized
+    return normalized
 
 
-ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    state_value(ProjectState.DRAFT): _state_set(ProjectState.PENDING_REVIEW, ProjectState.CANCELLED),
-    state_value(ProjectState.PENDING_REVIEW): _state_set(
-        ProjectState.REJECTED,
-        ProjectState.APPROVED_WAIT_CREATOR,
-        ProjectState.ACTIVE,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.REJECTED): _state_set(ProjectState.CANCELLED),
-    state_value(ProjectState.APPROVED_WAIT_CREATOR): _state_set(ProjectState.ACTIVE, ProjectState.CANCELLED),
-    state_value(ProjectState.ACTIVE): _state_set(ProjectState.FULL, ProjectState.CANCELLED, ProjectState.EXPIRED),
-    state_value(ProjectState.FULL): _state_set(
-        ProjectState.WAITING_CREATOR_RESOURCE,
-        ProjectState.WAITING_BUY_INFO,
-        ProjectState.PLATFORM_PURCHASING,
-        ProjectState.RESOURCE_UPLOADING,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.WAITING_CREATOR_RESOURCE): _state_set(
-        ProjectState.RESOURCE_UPLOADING,
-        ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.RESOURCE_REJECTED,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.WAITING_BUY_INFO): _state_set(ProjectState.PLATFORM_PURCHASING, ProjectState.CANCELLED),
-    state_value(ProjectState.PLATFORM_PURCHASING): _state_set(
-        ProjectState.ADMIN_UPLOADING,
-        ProjectState.RESOURCE_UPLOADING,
-        ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.ADMIN_UPLOADING): _state_set(
-        ProjectState.PLATFORM_PURCHASING,
-        ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.RESOURCE_UPLOADING,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.RESOURCE_UPLOADING): _state_set(
-        ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.RESOURCE_REJECTED,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.RESOURCE_SUBMITTED): _state_set(
-        ProjectState.RESOURCE_PUBLISHED,
-        ProjectState.DELIVERED,
-        ProjectState.RESOURCE_REJECTED,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.RESOURCE_REVIEW): _state_set(
-        ProjectState.RESOURCE_UPLOADING,
-        ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.RESOURCE_REJECTED,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.RESOURCE_REJECTED): _state_set(
-        ProjectState.RESOURCE_UPLOADING,
-        ProjectState.RESOURCE_SUBMITTED,
-        ProjectState.CANCELLED,
-    ),
-    state_value(ProjectState.RESOURCE_PUBLISHED): _state_set(
-        ProjectState.DELIVERED,
-        ProjectState.RESOURCE_REVIEW,
-        ProjectState.CANCELLED,
-    ),
-    # 后台“手动取消项目”是管理兜底动作，允许已交付项目走取消/退款清单流程。
-    state_value(ProjectState.DELIVERED): _state_set(ProjectState.RESOURCE_REVIEW, ProjectState.CANCELLED),
-    state_value(ProjectState.CANCELLED): _state_set(ProjectState.REFUND_PENDING),
-    state_value(ProjectState.EXPIRED): _state_set(ProjectState.REFUND_PENDING),
-    state_value(ProjectState.REFUND_PENDING): _state_set(ProjectState.REFUND_COMPLETED),
-    state_value(ProjectState.REFUND_COMPLETED): set(),
+TERMINAL_STATES = {
+    ProjectState.REFUND_COMPLETED.value,
 }
 
 
-TERMINAL_STATES = _state_set(ProjectState.REFUND_COMPLETED)
+ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    ProjectState.DRAFT.value: {ProjectState.PENDING_REVIEW.value},
+    # 管理员后台可以拒绝、通过，也可以直接取消误提交/违规投稿。
+    ProjectState.PENDING_REVIEW.value: {
+        ProjectState.REJECTED.value,
+        ProjectState.APPROVED_WAIT_CREATOR.value,
+        ProjectState.ACTIVE.value,
+        ProjectState.CANCELLED.value,
+    },
+    # 被拒项目允许后台转取消，方便进入统一的异常/退款闭环。
+    ProjectState.REJECTED.value: {ProjectState.CANCELLED.value},
+    ProjectState.APPROVED_WAIT_CREATOR.value: {ProjectState.ACTIVE.value, ProjectState.CANCELLED.value},
+    ProjectState.ACTIVE.value: {ProjectState.FULL.value, ProjectState.CANCELLED.value, ProjectState.EXPIRED.value},
+    ProjectState.FULL.value: {
+        ProjectState.WAITING_CREATOR_RESOURCE.value, ProjectState.WAITING_BUY_INFO.value,
+        ProjectState.PLATFORM_PURCHASING.value, ProjectState.RESOURCE_UPLOADING.value,
+        ProjectState.CANCELLED.value,
+    },
+    ProjectState.WAITING_CREATOR_RESOURCE.value: {
+        ProjectState.RESOURCE_UPLOADING.value, ProjectState.RESOURCE_SUBMITTED.value,
+        ProjectState.RESOURCE_REJECTED.value, ProjectState.CANCELLED.value,
+    },
+    ProjectState.WAITING_BUY_INFO.value: {ProjectState.PLATFORM_PURCHASING.value, ProjectState.CANCELLED.value},
+    ProjectState.PLATFORM_PURCHASING.value: {
+        ProjectState.ADMIN_UPLOADING.value, ProjectState.RESOURCE_UPLOADING.value,
+        ProjectState.RESOURCE_SUBMITTED.value, ProjectState.CANCELLED.value,
+    },
+    ProjectState.ADMIN_UPLOADING.value: {
+        ProjectState.PLATFORM_PURCHASING.value, ProjectState.RESOURCE_SUBMITTED.value,
+        ProjectState.RESOURCE_UPLOADING.value, ProjectState.CANCELLED.value,
+    },
+    ProjectState.RESOURCE_UPLOADING.value: {
+        ProjectState.RESOURCE_SUBMITTED.value, ProjectState.RESOURCE_REJECTED.value,
+        ProjectState.CANCELLED.value,
+    },
+    ProjectState.RESOURCE_SUBMITTED.value: {
+        ProjectState.RESOURCE_PUBLISHED.value, ProjectState.DELIVERED.value,
+        ProjectState.RESOURCE_REJECTED.value, ProjectState.CANCELLED.value,
+    },
+    ProjectState.RESOURCE_REVIEW.value: {
+        ProjectState.RESOURCE_UPLOADING.value, ProjectState.RESOURCE_SUBMITTED.value,
+        ProjectState.RESOURCE_REJECTED.value, ProjectState.CANCELLED.value,
+    },
+    ProjectState.RESOURCE_REJECTED.value: {
+        ProjectState.RESOURCE_UPLOADING.value, ProjectState.RESOURCE_SUBMITTED.value,
+        ProjectState.CANCELLED.value,
+    },
+    ProjectState.RESOURCE_PUBLISHED.value: {ProjectState.DELIVERED.value, ProjectState.RESOURCE_REVIEW.value, ProjectState.CANCELLED.value},
+    # 已交付项目后台仍可取消，用于误发/违规下架后统一进入退款/补救流程。
+    ProjectState.DELIVERED.value: {ProjectState.RESOURCE_REVIEW.value, ProjectState.CANCELLED.value},
+    ProjectState.CANCELLED.value: {ProjectState.REFUND_PENDING.value},
+    ProjectState.EXPIRED.value: {ProjectState.REFUND_PENDING.value},
+    ProjectState.REFUND_PENDING.value: {ProjectState.REFUND_COMPLETED.value},
+    ProjectState.REFUND_COMPLETED.value: set(),
+}
 
 
 class InvalidProjectTransition(ValueError):
@@ -138,19 +150,18 @@ class InvalidProjectTransition(ValueError):
 async def initialize_project_state(
     session: AsyncSession,
     project: CrowdfundProject,
-    state: str | ProjectState = ProjectState.PENDING_REVIEW,
-    *,
-    actor_id: int | None = None,
+    state: str = ProjectState.PENDING_REVIEW.value,
+    *, actor_id: int | None = None,
     reason: str = '创建项目',
 ) -> None:
-    normalized = state_value(state)
-    project.status = normalized
+    target = state_value(state)
+    project.status = target
     project.status_version = 1
     await session.flush()
     session.add(ProjectStateHistory(
         project_id=project.id,
         from_status=None,
-        to_status=normalized,
+        to_status=target,
         reason=reason,
         actor_id=actor_id,
         idempotency_key=f'project:{project.id}:initial',
@@ -176,15 +187,12 @@ async def transition_project(
         select(CrowdfundProject).where(CrowdfundProject.id == project.id).with_for_update()
     )).scalar_one()
     target = state_value(new_status)
-    current = state_value(project.status)
-    if project.status != current:
-        # 兼容历史脏数据，例如 ProjectState.PENDING_REVIEW。
-        project.status = current
+    current = normalize_project_status(project)
     if current == target:
         return False
     allowed = ALLOWED_TRANSITIONS.get(current, set())
     if not force and target not in allowed:
-        raise InvalidProjectTransition(f'项目状态不能从 {current or project.status} 变更为 {target}')
+        raise InvalidProjectTransition(f'项目状态不能从 {current or "-"} 变更为 {target or "-"}')
 
     if idempotency_key:
         existing = await session.execute(
@@ -197,9 +205,9 @@ async def transition_project(
     project.status = target
     project.status_version = int(project.status_version or 0) + 1
     now = datetime.utcnow()
-    if target == state_value(ProjectState.FULL) and project.full_at is None:
+    if target == ProjectState.FULL.value and project.full_at is None:
         project.full_at = now
-    if target in _state_set(ProjectState.CANCELLED, ProjectState.EXPIRED):
+    if target in (ProjectState.CANCELLED.value, ProjectState.EXPIRED.value):
         project.expired_at = now
         if reason:
             project.cancel_reason = reason

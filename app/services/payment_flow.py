@@ -9,6 +9,7 @@ from app.db.models import CrowdfundProject
 from app.keyboards import resource_claim_keyboard, verify_failure_keyboard
 from app.services.crowdfund import project_label
 from app.services.payments import confirm_order_by_system_no, friendly_verify_failure
+from app.services.project_state import state_value
 from app.services.project_runtime import (
     load_resource_items,
     notify_creator_rider_progress,
@@ -65,12 +66,12 @@ async def confirm_payment_message(
                             "crowdfunding_creator_prepay",
                         )
                         and project.paid_seats >= project.required_seats
-                        and project.status == "full"
+                        and state_value(project.status) == "full"
                     ):
                         await notify_project_full(bot, session, project)
                         await update_public_project(bot, project)
                     elif order.order_type == "crowdfunding_after_full":
-                        if project.status in ("resource_published", "delivered"):
+                        if state_value(project.status) in ("resource_published", "delivered"):
                             items = load_resource_items(project)
                             await safe_send(
                                 bot,
@@ -92,7 +93,7 @@ async def confirm_payment_message(
                                 f"用户：{order.user_id}\n"
                                 f"待绑定车票：T.{int(order.id or 0):03d}\n"
                                 f"发卡平台系统单号：{order.faka_system_no or '-'}\n"
-                                f"当前资源状态：{project.status}\n\n"
+                                f"当前资源状态：{state_value(project.status)}\n\n"
                                 "资源审核通过后，该用户会拥有领取资格。",
                             )
 
