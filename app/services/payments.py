@@ -541,6 +541,93 @@ async def move_paid_binding_to_order(
     return True, '转绑成功', target
 
 
+async def force_create_paid_order_for_user(
+    session: AsyncSession,
+    *,
+    project_id: int,
+    user_id: int,
+    system_no: str,
+    admin_id: int,
+    username: str | None = None,
+) -> tuple[bool, str, PaymentOrder | None]:
+    """Create a paid local ticket directly for a user when no pending ticket exists.
+
+    This is the admin "补订单" path. It deliberately attaches the payment to
+    the supplied user_id and project_id, then runs the same paid effects as a
+    normal verified order so the user can receive resources when the project is
+    delivered.
+    """
+    from app.services.project_state import state_value
+
+    system_no = normalize_system_no(system_no)
+    if not re.fullmatch(r'VP\d{10,}', system_no, flags=re.I):
+        return False, '系统单号格式错误，应为 VP 开头的那串数字', None
+
+    project = (await session.execute(
+        select(CrowdfundProject).where(CrowdfundProject.id == int(project_id)).with_for_update()
+    )).scalar_one_or_none()
+    if not project:
+        return False, f'项目 {_project_no(project_id)} 不存在', None
+
+    duplicate = await find_duplicate_payment_order(session, system_no=system_no)
+    if duplicate:
+        return False, _duplicate_order_message(duplicate, kind='系统单号'), duplicate
+
+    status = state_value(project.status)
+    if status in ('cancelled', 'expired', 'refund_pending', 'refund_completed', 'rejected'):
+        return False, f'项目当前状态为 {status}，不适合补订单；如要重新拼车，请让车主点击「重新拼车」。', None
+
+    if status in ('active', 'approved_wait_creator') and int(project.paid_seats or 0) < int(project.required_seats or 0):
+        order_type = 'crowdfunding_before_full'
+    elif status in ('full', 'waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing', 'admin_uploading', 'resource_uploading', 'resource_submitted', 'resource_rejected', 'resource_published', 'delivered') or int(project.paid_seats or 0) >= int(project.required_seats or 0):
+        order_type = 'crowdfunding_after_full'
+    else:
+        return False, f'项目当前状态为 {status}，暂不能补订单。', None
+
+    operation_key = f'force-create-paid:{project.id}:{int(user_id)}:{system_no}'
+    if not await begin_operation(session, operation_key, 'force_create_paid_order'):
+        return False, '这笔补订单正在处理或已经处理过，请不要重复点击。', None
+
+    now = datetime.utcnow()
+    order = PaymentOrder(
+        user_id=int(user_id),
+        username=username,
+        project_id=project.id,
+        expected_amount=_money(project.seat_price or settings.SEAT_PRICE),
+        paid_amount=_money(project.seat_price or settings.SEAT_PRICE),
+        order_type=order_type,
+        status='paid',
+        payment_source='manual',
+        faka_system_no=system_no,
+        faka_pay_no=f'MANUAL-CREATE-{int(user_id)}-{project.id}-{int(now.timestamp())}',
+        paid_channel='MANUAL',
+        paid_method=f'管理员补订单:{admin_id}',
+        product_name='管理员补订单',
+        faka_buyer_user_id=int(user_id),
+        faka_order_bot=settings.EXPECTED_FAKA_ORDER_BOT,
+        raw_response=f'管理员 {admin_id} 为用户 {int(user_id)} 补订单',
+        paid_at=now,
+        expires_at=now,
+    )
+    session.add(order)
+    await session.flush()
+    await apply_paid_effects(session, order)
+    await post_ledger(
+        session, idempotency_key=f'payment:{order.id}', direction='income', category=order.order_type,
+        amount=order.paid_amount, payment_source='manual', project_id=order.project_id, order_id=order.id,
+        user_id=order.user_id, operator_id=admin_id, description='管理员补订单',
+    )
+    await finish_operation(session, operation_key, {'order_id': order.id, 'system_no': system_no})
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        duplicate = await find_duplicate_payment_order(session, system_no=system_no)
+        return False, _duplicate_order_message(duplicate, kind='订单号'), duplicate
+    await session.refresh(order)
+    return True, '补订单成功，已接到用户车票与资源资格上', order
+
+
 async def get_fund_balance(session: AsyncSession) -> float:
     from app.db.models import FinancialLedger
     value = (await session.execute(select(func.coalesce(func.sum(

@@ -391,8 +391,10 @@ def participated_detail_keyboard(project_id: int, can_claim: bool = False, has_r
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def refund_detail_keyboard(refund_id: int, can_apply: bool = False) -> InlineKeyboardMarkup:
+def refund_detail_keyboard(refund_id: int, can_apply: bool = False, relaunch_project_id: int | None = None) -> InlineKeyboardMarkup:
     rows = []
+    if relaunch_project_id:
+        rows.append([InlineKeyboardButton(text='🔁 重新拼车', callback_data=f'creator:relaunch:{relaunch_project_id}')])
     if can_apply:
         rows.append([InlineKeyboardButton(text='💸 申请退款', callback_data=f'refund:apply:{refund_id}')])
     rows.append([support_contact_button('💬 联系小掌柜', 'refund', refund_id)])
@@ -400,12 +402,16 @@ def refund_detail_keyboard(refund_id: int, can_apply: bool = False) -> InlineKey
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def creator_project_detail_keyboard(project_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def creator_project_detail_keyboard(project_id: int, *, can_relaunch: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if can_relaunch:
+        rows.append([InlineKeyboardButton(text='🔁 重新拼车', callback_data=f'creator:relaunch:{project_id}')])
+    rows.extend([
         [InlineKeyboardButton(text='💸 申请提现', callback_data=f'creator:withdraw:{project_id}')],
         [InlineKeyboardButton(text='📊 收益明细', callback_data=f'creator:income:{project_id}')],
         [InlineKeyboardButton(text='⬅️ 返回车主记录', callback_data='orders:created:0')],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def support_start_keyboard() -> InlineKeyboardMarkup:
