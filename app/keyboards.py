@@ -138,6 +138,17 @@ def hot_projects_keyboard(projects, page: int = 0, page_size: int = 10) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+
+def carpool_price_keyboard() -> InlineKeyboardMarkup:
+    settings = get_settings()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f'🎟️ {settings.CARPOOL_PRICE_30:g} 元车位', callback_data=f'cf:seat_price:{int(settings.CARPOOL_PRICE_30)}'),
+            InlineKeyboardButton(text=f'🎟️ {settings.CARPOOL_PRICE_60:g} 元车位', callback_data=f'cf:seat_price:{int(settings.CARPOOL_PRICE_60)}'),
+        ],
+        [InlineKeyboardButton(text='⛔ 不发了', callback_data='cf:price_cancel')],
+    ])
+
 def purchase_mode_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='🙋 我来垫付', callback_data='cf:mode:prepaid')],

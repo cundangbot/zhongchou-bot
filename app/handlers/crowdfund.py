@@ -36,6 +36,7 @@ from app.keyboards import (
     refund_apply_keyboard,
     resource_next_page_keyboard,
     verify_failure_keyboard,
+    carpool_price_keyboard,
 )
 from app.services.crowdfund import (
     approve_project,
@@ -986,12 +987,15 @@ async def _publish_project_resource(bot: Bot, session, project: CrowdfundProject
 async def _start_crowdfund_flow(target, state: FSMContext):
     # 发起众筹属于业务主流程，进入前必须清掉客服桥/退款/上传等旧状态。
     await state.clear()
-    await state.set_state(CrowdfundCreate.blogger)
-    await target.answer(msg.crowdfunding_start(
-        creator_prepay_seats=settings.CREATOR_PREPAY_SEATS,
-        seat_price=settings.SEAT_PRICE,
-        creator_amount=settings.creator_prepay_amount,
-    ))
+    await state.set_state(CrowdfundCreate.seat_price)
+    await target.answer(
+        '🎟️ 先选择这辆车的拼车单价～\n\n'
+        '为了避免支付链接混乱，目前只开放两个固定档位：\n'
+        f'• {settings.CARPOOL_PRICE_30:g} 元车位\n'
+        f'• {settings.CARPOOL_PRICE_60:g} 元车位\n\n'
+        '选好后，小掌柜会按这个单价计算车位数、车主预付金额和后续补票金额。',
+        reply_markup=carpool_price_keyboard(),
+    )
 
 
 @router.message(F.text == '🚗 发起众筹')
@@ -1006,6 +1010,32 @@ async def cf_start_text(message: Message, state: FSMContext, bot: Bot):
 @router.callback_query(F.data == 'cf:start')
 async def cf_start(call: CallbackQuery, state: FSMContext, bot: Bot):
     await _start_crowdfund_flow(call.message, state)
+    await call.answer()
+
+
+@router.callback_query(CrowdfundCreate.seat_price, F.data.startswith('cf:seat_price:'))
+async def cf_choose_seat_price(call: CallbackQuery, state: FSMContext):
+    raw = call.data.split(':')[-1]
+    seat_price = settings.normalize_seat_price(raw)
+    if seat_price not in settings.carpool_price_options:
+        await call.answer('车位价格无效，请重新选择', show_alert=True)
+        return
+    await state.update_data(seat_price=seat_price)
+    await state.set_state(CrowdfundCreate.blogger)
+    await call.message.answer(
+        msg.crowdfunding_start(
+            creator_prepay_seats=settings.CREATOR_PREPAY_SEATS,
+            seat_price=seat_price,
+            creator_amount=settings.creator_prepay_amount_for_price(seat_price),
+        )
+    )
+    await call.answer(f'已选择 {seat_price:g} 元车位')
+
+
+@router.callback_query(CrowdfundCreate.seat_price, F.data == 'cf:price_cancel')
+async def cf_price_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer(msg.crowdfunding_cancelled())
     await call.answer()
 
 
@@ -1064,17 +1094,19 @@ async def cf_price(message: Message, state: FSMContext):
     except Exception:
         await message.answer(msg.crowdfunding_price_invalid())
         return
-    await state.update_data(original_price=price)
-    seats = calc_required_seats(price)
+    data = await state.get_data()
+    seat_price = settings.normalize_seat_price(data.get('seat_price'))
+    await state.update_data(original_price=price, seat_price=seat_price)
+    seats = calc_required_seats(price, seat_price)
     total = calc_total_collect_amount(price)
     await state.set_state(CrowdfundCreate.purchase_mode)
     await message.answer(
         msg.crowdfunding_price_calc(
             price=price,
             total=float(total),
-            base_seats=__import__('math').ceil(price / settings.SEAT_PRICE),
+            base_seats=__import__('math').ceil(price / seat_price),
             seats=seats,
-            seat_price=settings.SEAT_PRICE,
+            seat_price=seat_price,
             creator_prepay_seats=settings.CREATOR_PREPAY_SEATS,
         ),
         reply_markup=purchase_mode_keyboard(),
@@ -1087,7 +1119,8 @@ async def cf_mode(call: CallbackQuery, state: FSMContext):
     await state.update_data(purchase_mode=mode)
     data = await state.get_data()
     price = float(data['original_price'])
-    seats = calc_required_seats(price)
+    seat_price = settings.normalize_seat_price(data.get('seat_price'))
+    seats = calc_required_seats(price, seat_price)
     total = calc_total_collect_amount(price)
     mode_name = {'prepaid': '🙋 我来垫付', 'platform': '🤖 平台代购资源', 'owned': '📦 我已持有资源'}[mode]
     await state.set_state(CrowdfundCreate.confirm)
@@ -1100,8 +1133,8 @@ async def cf_mode(call: CallbackQuery, state: FSMContext):
             price=price,
             total=float(total),
             seats=seats,
-            seat_price=settings.SEAT_PRICE,
-            creator_amount=settings.CREATOR_PREPAY_SEATS * settings.SEAT_PRICE,
+            seat_price=seat_price,
+            creator_amount=settings.creator_prepay_amount_for_price(seat_price),
             mode_name=mode_name,
         ),
         reply_markup=confirm_project_keyboard(),
@@ -1131,6 +1164,7 @@ async def cf_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
             description_chat_id=data.get('description_chat_id'),
             description_message_id=data.get('description_message_id'),
             description_items=json.dumps(data.get('description_items') or [], ensure_ascii=False),
+            seat_price=settings.normalize_seat_price(data.get('seat_price')),
         )
     text = msg.crowdfunding_admin_new(
         creator=_username(call.from_user) or str(call.from_user.id),
@@ -1139,6 +1173,7 @@ async def cf_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
         description=project.description,
         price=float(project.original_price),
         seats=project.required_seats,
+        seat_price=float(project.seat_price or settings.SEAT_PRICE),
         mode=project.purchase_mode,
     )
     await bot.send_message(settings.ADMIN_GROUP_ID, text, reply_markup=admin_review_keyboard(project.id))
@@ -1203,7 +1238,7 @@ async def admin_approve(call: CallbackQuery, bot: Bot):
                 session,
                 user_id=project.creator_id,
                 username=project.creator_username,
-                expected_amount=settings.creator_prepay_amount,
+                expected_amount=settings.creator_prepay_amount_for_price(project.seat_price),
                 order_type='crowdfunding_creator_prepay',
                 project_id=project.id,
             )
@@ -1214,9 +1249,9 @@ async def admin_approve(call: CallbackQuery, bot: Bot):
             msg.crowdfunding_creator_approved(
                 project_title=project_title(project),
                 prepay_seats=settings.CREATOR_PREPAY_SEATS,
-                amount=settings.creator_prepay_amount,
+                amount=float(creator_order.expected_amount or settings.creator_prepay_amount_for_price(project.seat_price)),
             ),
-            reply_markup=payment_order_keyboard(creator_order.id, settings.creator_pay_url),
+            reply_markup=payment_order_keyboard(creator_order.id, settings.payment_link_for_order_amount(creator_order.expected_amount, creator_prepay=True)),
         )
         await finish_operation(session, operation_key, {'channel_message_id': sent.message_id})
         await session.commit()
@@ -1267,7 +1302,7 @@ async def join_project(call: CallbackQuery, bot: Bot):
             await _dm_or_temp(
                 call,
                 bot,
-                f'🚫 该车已满员：{project_title(project)}\n\n你仍可支付 {settings.SEAT_PRICE:g} 元获取该资源。满员后额外支付将作为平台与发起人的分润收入，请从机器人私聊入口继续操作。',
+                f'🚫 该车已满员：{project_title(project)}\n\n你仍可支付 {float(project.seat_price or settings.SEAT_PRICE):g} 元获取该资源。满员后额外支付将作为平台与发起人的分润收入，请从机器人私聊入口继续操作。',
             )
             await call.answer()
             return
@@ -1275,7 +1310,7 @@ async def join_project(call: CallbackQuery, bot: Bot):
             session,
             user_id=call.from_user.id,
             username=_username(call.from_user),
-            expected_amount=settings.SEAT_PRICE,
+            expected_amount=float(project.seat_price or settings.SEAT_PRICE),
             order_type='crowdfunding_before_full',
             project_id=project.id,
         )
@@ -1286,10 +1321,10 @@ async def join_project(call: CallbackQuery, bot: Bot):
             project_no=f'P.{int(project.id or 0):03d}',
             blogger=project.blogger,
             description=project.description,
-            amount=settings.SEAT_PRICE,
+            amount=float(order.expected_amount or project.seat_price or settings.SEAT_PRICE),
             ticket_no=f'T.{int(order.id or 0):03d}',
         ),
-        reply_markup=payment_order_keyboard(order.id, settings.normal_pay_url),
+        reply_markup=payment_order_keyboard(order.id, settings.payment_link_for_order_amount(order.expected_amount)),
     )
     if not sent:
         async with SessionLocal() as session:
@@ -1320,7 +1355,7 @@ async def join_after_full(call: CallbackQuery, bot: Bot):
             session,
             user_id=call.from_user.id,
             username=_username(call.from_user),
-            expected_amount=settings.SEAT_PRICE,
+            expected_amount=float(project.seat_price or settings.SEAT_PRICE),
             order_type='crowdfunding_after_full',
             project_id=project.id,
         )
@@ -1330,10 +1365,10 @@ async def join_after_full(call: CallbackQuery, bot: Bot):
         f'🔓 已为你生成满员后获取资源小票～\n\n'
         f'项目：P.{int(project.id or 0):03d}\n'
         f'博主：{project.blogger}\n描述：{project.description}\n'
-        f'待绑定车票：T.{int(order.id or 0):03d}\n金额：{settings.SEAT_PRICE:g} 元\n\n'
+        f'待绑定车票：T.{int(order.id or 0):03d}\n金额：{float(order.expected_amount or project.seat_price or settings.SEAT_PRICE):g} 元\n\n'
         f'这笔钱会计入车主额外小奖励，鼓励更多优质资源发起。\n'
         f'支付完成后点击「✅ 我已支付，去验票」，再提交发卡平台系统单号验票。',
-        reply_markup=payment_order_keyboard(order.id, settings.normal_pay_url),
+        reply_markup=payment_order_keyboard(order.id, settings.payment_link_for_order_amount(order.expected_amount)),
     )
     if not sent:
         async with SessionLocal() as session:

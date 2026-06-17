@@ -66,11 +66,19 @@ class Settings(BaseSettings):
     TG_PROXY_USERNAME: str = ''
     TG_PROXY_PASSWORD: str = ''
 
+    # 默认车位价格。新发起项目固定可选 30 / 60 元；旧项目继续使用项目表里的 seat_price。
     SEAT_PRICE: int = 30
-    # 发起人需支付双车位，默认 2 个车位 = 60 元。
+    CARPOOL_PRICE_30: int = 30
+    CARPOOL_PRICE_60: int = 60
+    # 发起人需支付双车位：30 元车为 60 元，60 元车为 120 元。
     CREATOR_PREPAY_SEATS: int = 2
     CREATOR_DOUBLE_SEAT_MULTIPLIER: int = 2  # 兼容旧代码别名
-    # 普通拼车 30 元支付链接 / 发起人 60 元支付链接，可在 .env 中修改。
+    # 支付链接配置：普通用户 30/60 元，车主预付 60/120 元。
+    # 旧字段 NORMAL_PAYMENT_LINK / CREATOR_PAYMENT_LINK 继续作为 30/60 元链接的 fallback。
+    NORMAL_PAYMENT_LINK_30: str = ''
+    NORMAL_PAYMENT_LINK_60: str = ''
+    CREATOR_PAYMENT_LINK_60: str = ''
+    CREATOR_PAYMENT_LINK_120: str = ''
     NORMAL_PAYMENT_LINK: str = ''
     CREATOR_PAYMENT_LINK: str = ''
     SEAT_PAYMENT_URL: str = ''  # 兼容旧代码别名
@@ -110,8 +118,50 @@ class Settings(BaseSettings):
 
     @property
     def creator_prepay_amount(self) -> float:
+        return self.creator_prepay_amount_for_price(self.SEAT_PRICE)
+
+    @property
+    def carpool_price_options(self) -> list[int]:
+        # 只开放固定档位，避免自定义价格和支付链接混乱。
+        return [int(self.CARPOOL_PRICE_30 or 30), int(self.CARPOOL_PRICE_60 or 60)]
+
+    def normalize_seat_price(self, price: int | float | str | None) -> int:
+        try:
+            value = int(float(price))
+        except Exception:
+            value = int(self.SEAT_PRICE or 30)
+        allowed = set(self.carpool_price_options)
+        if value not in allowed:
+            value = int(self.SEAT_PRICE or 30)
+        return value
+
+    def creator_prepay_amount_for_price(self, seat_price: int | float | str | None) -> float:
         seats = self.CREATOR_PREPAY_SEATS or self.CREATOR_DOUBLE_SEAT_MULTIPLIER or 2
-        return float(self.SEAT_PRICE) * int(seats)
+        return float(self.normalize_seat_price(seat_price)) * int(seats)
+
+    def normal_pay_url_for_amount(self, amount: int | float | str | None) -> str:
+        try:
+            value = int(round(float(amount or 0)))
+        except Exception:
+            value = int(self.SEAT_PRICE or 30)
+        if value == int(self.CARPOOL_PRICE_60 or 60):
+            return self.NORMAL_PAYMENT_LINK_60 or self.NORMAL_PAYMENT_LINK or self.SEAT_PAYMENT_URL
+        return self.NORMAL_PAYMENT_LINK_30 or self.NORMAL_PAYMENT_LINK or self.SEAT_PAYMENT_URL
+
+    def creator_pay_url_for_amount(self, amount: int | float | str | None) -> str:
+        try:
+            value = int(round(float(amount or 0)))
+        except Exception:
+            value = int(self.creator_prepay_amount)
+        seats = int(self.CREATOR_PREPAY_SEATS or self.CREATOR_DOUBLE_SEAT_MULTIPLIER or 2)
+        if value == int((self.CARPOOL_PRICE_60 or 60) * seats):
+            return self.CREATOR_PAYMENT_LINK_120 or self.CREATOR_PAYMENT_LINK or self.CREATOR_PAYMENT_URL
+        return self.CREATOR_PAYMENT_LINK_60 or self.CREATOR_PAYMENT_LINK or self.CREATOR_PAYMENT_URL
+
+    def payment_link_for_order_amount(self, amount: int | float | str | None, *, creator_prepay: bool = False) -> str:
+        if creator_prepay:
+            return self.creator_pay_url_for_amount(amount)
+        return self.normal_pay_url_for_amount(amount)
 
     @property
     def admin_id_list(self) -> List[int]:

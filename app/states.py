@@ -2,6 +2,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class CrowdfundCreate(StatesGroup):
+    seat_price = State()
     blogger = State()
     description = State()
     original_price = State()

@@ -263,7 +263,7 @@ def crowdfunding_submitted(project_no: str) -> str:
     )
 
 
-def crowdfunding_admin_new(*, creator: str, project_no: str, blogger: str, description: str, price: float, seats: int, mode: str) -> str:
+def crowdfunding_admin_new(*, creator: str, project_no: str, blogger: str, description: str, price: float, seats: int, mode: str, seat_price: float = 30) -> str:
     return (
         '📝 新众筹待审核｜小掌柜发车单\n'
         f'{LINE}\n'
@@ -273,6 +273,7 @@ def crowdfunding_admin_new(*, creator: str, project_no: str, blogger: str, descr
         f'描述：{description}\n'
         f'原价：{price:g} 元\n'
         f'车位：{seats} 人\n'
+        f'单价：{seat_price:g} 元/座\n'
         f'模式：{mode}\n\n'
         '请审核资料是否清晰、价格是否合理、资源类型是否允许发布。\n'
         '通过后会发布到频道，并通知发起人支付双车位验票。'
@@ -1237,10 +1238,10 @@ def crowdfunding_submitted(project_no: str) -> str:
     )
 
 
-def crowdfunding_admin_new(*, creator: str, project_no: str, blogger: str, description: str, price: float, seats: int, mode: str) -> str:
+def crowdfunding_admin_new(*, creator: str, project_no: str, blogger: str, description: str, price: float, seats: int, mode: str, seat_price: float = 30) -> str:
     return _panel(
         '📝 新众筹待审核｜小掌柜发车单',
-        _body(f'发起人：{creator}', f'项目：{project_no}', f'博主：{blogger}', f'描述：{description}', f'原价：{price:g} 元', f'车位：{seats} 人', f'模式：{mode}'),
+        _body(f'发起人：{creator}', f'项目：{project_no}', f'博主：{blogger}', f'描述：{description}', f'原价：{price:g} 元', f'车位：{seats} 人', f'单价：{seat_price:g} 元/座', f'模式：{mode}'),
         '请审核资料是否清晰、价格是否合理、资源类型是否允许发布。\n通过后会发布到频道，并通知发起人支付双车位验票。',
     )
 

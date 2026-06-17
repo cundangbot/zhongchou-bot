@@ -1085,11 +1085,10 @@ def _is_after_full_stage(project: CrowdfundProject) -> bool:
 
 
 def _payment_link_for_order(o: PaymentOrder) -> str | None:
-    if o.order_type == 'crowdfunding_creator_prepay':
-        return settings.creator_pay_url
-    if o.order_type in ('crowdfunding_before_full', 'crowdfunding_after_full'):
-        return settings.normal_pay_url
-    return settings.normal_pay_url
+    return settings.payment_link_for_order_amount(
+        o.expected_amount or o.paid_amount or settings.SEAT_PRICE,
+        creator_prepay=(o.order_type == 'crowdfunding_creator_prepay'),
+    )
 
 
 def _ticket_seed(order_id: int | None) -> str:
@@ -1237,7 +1236,7 @@ async def _handle_join_deeplink(message: Message, project_id: int) -> None:
                 session,
                 user_id=message.from_user.id,
                 username=_username(message.from_user),
-                expected_amount=settings.SEAT_PRICE,
+                expected_amount=float(project.seat_price or settings.SEAT_PRICE),
                 order_type=order_type,
                 project_id=project.id,
             )
@@ -1247,7 +1246,7 @@ async def _handle_join_deeplink(message: Message, project_id: int) -> None:
             project_no=project_no(project),
             blogger=project.blogger,
             description=project.description,
-            amount=float(settings.SEAT_PRICE),
+            amount=float(order.expected_amount or project.seat_price or settings.SEAT_PRICE),
             ticket_no=_ticket_no(order.id),
         ),
         reply_markup=pending_order_actions_keyboard(order.id, _payment_link_for_order(order)),
@@ -1569,6 +1568,7 @@ async def creator_relaunch_project(call: CallbackQuery, bot: Bot):
             description_chat_id=old.description_chat_id,
             description_message_id=old.description_message_id,
             description_items=old.description_items,
+            seat_price=old.seat_price or settings.SEAT_PRICE,
         )
 
     admin_text = msg.crowdfunding_admin_new(
@@ -1578,6 +1578,7 @@ async def creator_relaunch_project(call: CallbackQuery, bot: Bot):
         description=(new_project.description or '') + f'\n\n🔁 由旧项目 P.{old_project_id:03d} 重新拼车提交',
         price=float(new_project.original_price or 0),
         seats=int(new_project.required_seats or 0),
+        seat_price=float(new_project.seat_price or settings.SEAT_PRICE),
         mode=new_project.purchase_mode,
     )
     await bot.send_message(settings.ADMIN_GROUP_ID, admin_text, reply_markup=admin_review_keyboard(new_project.id))

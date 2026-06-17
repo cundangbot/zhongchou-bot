@@ -148,7 +148,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
                     f'剩余时间：约 {remind_minutes} 分钟',
                     reply_markup=pending_order_actions_keyboard(
                         order.id,
-                        settings.creator_pay_url if order.order_type == 'crowdfunding_creator_prepay' else settings.normal_pay_url,
+                        settings.payment_link_for_order_amount(order.expected_amount, creator_prepay=(order.order_type == 'crowdfunding_creator_prepay')),
                     ),
                 )
                 if sent:

@@ -18,9 +18,11 @@ def calc_total_collect_amount(original_price: float | Decimal) -> Decimal:
     return (original * (Decimal('1') + Decimal(str(settings.total_fee_rate)))).quantize(Decimal('0.01'))
 
 
-def calc_required_seats(original_price: float | Decimal) -> int:
+def calc_required_seats(original_price: float | Decimal, seat_price: float | Decimal | int | None = None) -> int:
     total = calc_total_collect_amount(original_price)
-    seat = Decimal(str(settings.SEAT_PRICE))
+    seat = Decimal(str(seat_price if seat_price is not None else settings.SEAT_PRICE))
+    if seat <= 0:
+        seat = Decimal(str(settings.SEAT_PRICE))
     return max(1, math.ceil(total / seat))
 
 
@@ -35,6 +37,7 @@ async def create_project(
     description_chat_id: int | None = None,
     description_message_id: int | None = None,
     description_items: str | None = None,
+    seat_price: float | int | Decimal | None = None,
 ) -> CrowdfundProject:
     from app.services.project_state import ProjectState, initialize_project_state, transition_project
     project = CrowdfundProject(
@@ -46,8 +49,8 @@ async def create_project(
         description_message_id=description_message_id,
         description_items=description_items,
         original_price=Decimal(str(original_price)),
-        seat_price=Decimal(str(settings.SEAT_PRICE)),
-        required_seats=calc_required_seats(original_price),
+        seat_price=Decimal(str(settings.normalize_seat_price(seat_price))),
+        required_seats=calc_required_seats(original_price, settings.normalize_seat_price(seat_price)),
         purchase_mode=purchase_mode,
         status=ProjectState.PENDING_REVIEW.value,
     )
@@ -289,7 +292,7 @@ def project_public_text(project: CrowdfundProject) -> str:
         total_amount=float(total),
         required_seats=int(project.required_seats or 0),
         creator_prepay_seats=int(settings.CREATOR_PREPAY_SEATS),
-        creator_prepay_amount=float(settings.creator_prepay_amount),
+        creator_prepay_amount=float(settings.creator_prepay_amount_for_price(project.seat_price)),
         mode_name=mode_map.get(project.purchase_mode, project.purchase_mode),
         status_name=status_map.get(status, status),
         after_full=status in after_full_statuses,
