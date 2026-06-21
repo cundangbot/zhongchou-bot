@@ -58,11 +58,12 @@ from app.keyboards import (
     external_support_keyboard,
     support_bot_display_name,
     verify_failure_keyboard,
+    admin_tools_keyboard,
     empty_orders_keyboard, empty_resources_keyboard, payment_error_keyboard, resource_progress_keyboard,
 )
 from app.services.crowdfund import create_project, project_public_text, project_title, project_label, project_no, project_progress_text
 from app.services.project_state import ProjectState, state_value, transition_project, InvalidProjectTransition
-from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, restore_cancelled_order_as_paid, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
+from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, restore_cancelled_order_as_paid, migrate_project_paid_orders, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
 from app.states import PaymentSubmit, ProfitWithdrawCollect, RefundApplyCollect, ContactSupport, AdminContactReply, AdminSearch, AdminManualVerify
 from app.services.ledger import post_ledger
 from app.services.idempotency import begin_operation, finish_operation
@@ -82,8 +83,16 @@ router = Router()
 settings = get_settings()
 
 
+def _panel_safe_text(text: str, limit: int = 3900) -> str:
+    value = str(text or '')
+    if len(value) <= limit:
+        return value
+    return value[:limit - 80] + '\n\n……内容太长，已自动截断，请使用分页/搜索查看详情。'
+
+
 async def _edit_panel(call: CallbackQuery, text: str, reply_markup=None) -> None:
     """在当前按钮面板内刷新；失败时兜底新发，避免按钮点击后刷屏。"""
+    text = _panel_safe_text(text)
     try:
         await call.message.edit_text(text, reply_markup=reply_markup, disable_web_page_preview=True)
     except TelegramBadRequest as e:
@@ -2644,6 +2653,48 @@ async def admin_sync_project(message: Message):
         text = reason + '\n\n' + project_payment_audit_text(snapshot)
     await message.answer(('✅ ' if ok else '❌ ') + text[:3850], reply_markup=admin_project_detail_keyboard(project_id))
 
+
+
+@router.message(Command('migrate_project', 'move_project_users'))
+async def admin_migrate_project(message: Message):
+    """Move paid riders from an unfinished old project to a replacement project."""
+    if message.from_user.id not in settings.admin_id_list:
+        await message.answer('无权限。')
+        return
+    parts = (message.text or '').strip().split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(
+            '用法：/migrate_project P.旧项目 P.新项目 原因\n'
+            '示例：/migrate_project P.009 P.015 旧车未完成，迁移到新车\n\n'
+            '说明：会把旧项目里已支付的上车车票迁移到新项目，保留用户ID和VP单号，并同步新旧项目人数/资源权限。'
+        )
+        return
+    source_project_id = _parse_project_token(parts[1])
+    target_project_id = _parse_project_token(parts[2])
+    reason = parts[3].strip() if len(parts) >= 4 else '管理员迁移未完成拼车用户'
+    if not source_project_id or not target_project_id:
+        await message.answer('项目编号格式错误。示例：/migrate_project P.009 P.015 旧车未完成，迁移到新车')
+        return
+    async with SessionLocal() as session:
+        ok, reason_text, data = await migrate_project_paid_orders(
+            session,
+            source_project_id=source_project_id,
+            target_project_id=target_project_id,
+            admin_id=message.from_user.id,
+            reason=reason,
+        )
+        target = data.get('target') if data else None
+        source = data.get('source') if data else None
+    text = ('✅ ' if ok else '❌ ') + reason_text
+    if ok:
+        text += (
+            '\n\n下一步建议：\n'
+            f'/audit_project P.{int(source_project_id):03d}\n'
+            f'/audit_project P.{int(target_project_id):03d}\n'
+            '确认新旧项目人数、车票和资源权限是否一致。'
+        )
+    await message.answer(text[:3900], reply_markup=admin_project_detail_keyboard(int(target_project_id)))
+
 @router.message(Command('force_verify', 'bind'))
 async def admin_force_verify(message: Message, bot: Bot):
     if message.from_user.id not in settings.admin_id_list:
@@ -3123,7 +3174,7 @@ async def _send_admin_dashboard(message: Message):
         pending_withdraw = (await session.execute(select(func.count()).select_from(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.payout_type != 'reimbursement', ProfitWithdrawal.created_at >= today_start))).scalar() or 0
         risks = (await session.execute(select(func.count()).select_from(RiskLog).where(RiskLog.created_at >= today_start))).scalar() or 0
         support_open = (await session.execute(select(func.count()).select_from(ContactTicket).where(ContactTicket.status.in_(['open','answered']), ContactTicket.created_at >= today_start))).scalar() or 0
-        pending_refunds = (await session.execute(select(func.count()).select_from(RefundRecord).where(RefundRecord.status.in_(['pending_info','pending_admin']), RefundRecord.created_at >= today_start))).scalar() or 0
+        pending_refunds = (await session.execute(select(func.count()).select_from(RefundRecord).where(RefundRecord.status == 'pending_admin'))).scalar() or 0
         unresolved_events = (await session.execute(select(func.count()).select_from(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start))).scalar() or 0
     await message.answer(
         msg.admin_dashboard_text(
@@ -3250,13 +3301,13 @@ async def admin_dashboard_list(call: CallbackQuery):
                 text = '\n'.join(lines)
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
         elif list_type == 'refunds':
-            res = await session.execute(select(RefundRecord).where(RefundRecord.status.in_(['pending_info','pending_admin'])).order_by(RefundRecord.created_at.asc()).limit(30))
+            res = await session.execute(select(RefundRecord).where(RefundRecord.status == 'pending_admin').order_by(RefundRecord.created_at.asc()).limit(12))
             refunds = list(res.scalars().all())
             if not refunds:
                 text = msg.admin_refund_empty()
                 markup = admin_dashboard_keyboard()
             else:
-                lines = [msg.admin_refund_list_header(len(refunds)) + '\n说明：这里显示所有未完成退款，不再只看当天；管理员确认退款完成后才会消失。']
+                lines = [msg.admin_refund_list_header(len(refunds)) + '\n说明：只显示用户已提交收款资料、等待管理员处理的退款；未申请资料的不在这里显示。' ]
                 rows = []
                 for r in refunds:
                     o = await session.get(PaymentOrder, r.order_id)
@@ -3422,7 +3473,7 @@ async def admin_dashboard_callback(call: CallbackQuery):
         pending_withdraw = (await session.execute(select(func.count()).select_from(ProfitWithdrawal).where(ProfitWithdrawal.status == 'pending_admin', ProfitWithdrawal.payout_type != 'reimbursement', ProfitWithdrawal.created_at >= today_start))).scalar() or 0
         risks = (await session.execute(select(func.count()).select_from(RiskLog).where(RiskLog.created_at >= today_start))).scalar() or 0
         support_open = (await session.execute(select(func.count()).select_from(ContactTicket).where(ContactTicket.status.in_(['open','answered']), ContactTicket.created_at >= today_start))).scalar() or 0
-        pending_refunds = (await session.execute(select(func.count()).select_from(RefundRecord).where(RefundRecord.status.in_(['pending_info','pending_admin']), RefundRecord.created_at >= today_start))).scalar() or 0
+        pending_refunds = (await session.execute(select(func.count()).select_from(RefundRecord).where(RefundRecord.status == 'pending_admin'))).scalar() or 0
         unresolved_events = (await session.execute(select(func.count()).select_from(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start))).scalar() or 0
     text = msg.admin_dashboard_text(
         new_projects=new_projects,
@@ -3890,12 +3941,14 @@ async def admin_support_private_reply_to_user(message: Message, state: FSMContex
         else:
             await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
         return
-    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid') or command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users'):
         await state.clear()
         if command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
             await admin_add_order(message, bot)
         elif command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order'):
             await admin_rebind_order_user(message, bot)
+        elif command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users'):
+            await admin_migrate_project(message)
         elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
             await admin_rebind_vp_user(message, bot)
         else:
@@ -3927,12 +3980,14 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
         else:
             await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
         return
-    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid') or command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users'):
         await state.clear()
         if command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
             await admin_add_order(message, bot)
         elif command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order'):
             await admin_rebind_order_user(message, bot)
+        elif command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users'):
+            await admin_migrate_project(message)
         elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
             await admin_rebind_vp_user(message, bot)
         else:
@@ -4357,6 +4412,101 @@ async def _health_text(bot: Bot) -> str:
         + '\n'.join(f'{key}：{value}' for key, value in checks.items())
         + f'\n待执行任务：{jobs}\n最后成功验票：{last_verify}\n最后数据库备份：{last_backup}'
     )
+
+
+
+ADMIN_TOOL_HELP = {
+    'search': (
+        '🔎 搜索工具\n\n'
+        '用法：/search 关键词\n'
+        '示例：/search P.009｜/search T.060｜/search VP2026...｜/search 用户ID\n\n'
+        '用途：查项目、车票、VP系统单号、用户订单。遇到重复/找不到记录，先搜。'
+    ),
+    'audit': (
+        '🧾 项目闭环检查\n\n'
+        '用法：/audit_project P.项目号\n'
+        '示例：/audit_project P.009\n\n'
+        '用途：检查项目进度、已支付车票、用户ID、资源权限是否对得上。'
+    ),
+    'sync': (
+        '🔧 同步项目\n\n'
+        '用法：/sync_project P.项目号\n'
+        '示例：/sync_project P.009\n\n'
+        '用途：以已支付车票为准，修复项目人数和资源权限。'
+    ),
+    'migrate': (
+        '🔁 迁移旧车上车用户\n\n'
+        '用法：/migrate_project P.旧项目 P.新项目 原因\n'
+        '示例：/migrate_project P.009 P.015 旧车未完成，迁移到新车\n\n'
+        '用途：旧拼车没完成时，把旧项目已支付车票迁移到新项目，保留用户ID和VP单号。'
+    ),
+    'bind': (
+        '✅ 绑定待付车票\n\n'
+        '用法：/bind T.车票号 VP系统单号\n'
+        '示例：/bind T.060 VP2026061020432036803\n\n'
+        '用途：用户有待付车票，但自动验票失败时，管理员手动绑定。'
+    ),
+    'add_order': (
+        '➕ 补已支付订单\n\n'
+        '用法：/add_order P.项目号 用户ID VP系统单号\n'
+        '示例：/add_order P.009 7199279387 VP2026061020432036803\n\n'
+        '用途：用户确实付款，但系统没有待付车票时，直接补一张已支付车票。'
+    ),
+    'restore': (
+        '♻️ 恢复取消车票\n\n'
+        '用法：/restore_order T.车票号 原因\n'
+        '示例：/restore_order T.060 用户付款已确认但车票被取消\n\n'
+        '用途：车票、用户、VP都对，但状态是 cancelled/expired，用户看不到拼车记录。'
+    ),
+    'rebind_user': (
+        '👤 已支付车票改用户\n\n'
+        '用法：/rebind_user T.车票号 正确用户ID 原因\n'
+        '示例：/rebind_user T.060 7199279387 订单挂错用户\n\n'
+        '用途：车票和VP都对，但挂到了错误用户身上。'
+    ),
+    'rebind_vp': (
+        '🔐 按 VP 改正确用户\n\n'
+        '用法：/rebind_vp VP系统单号 正确用户ID 原因\n'
+        '示例：/rebind_vp VP2026061020432036803 7199279387 订单挂错用户\n\n'
+        '用途：只知道 VP，不知道 T.几时，先按 VP 找车票再改用户。'
+    ),
+    'move_bind': (
+        '↔️ 转移付款到另一张车票\n\n'
+        '用法：/move_bind T.目标车票 T.占用车票 原因\n'
+        '示例：/move_bind T.088 T.060 付款绑错车票\n\n'
+        '用途：VP 被错误车票占用，需要转到正确的待付车票。一般用于同项目内转票。'
+    ),
+    'reply': (
+        '💬 回复客服\n\n'
+        '用法：/reply S.工单号 回复内容\n'
+        '示例：/reply S.012 好的，我帮你看一下～\n\n'
+        '用途：把管理员消息发给对应客服用户。'
+    ),
+}
+
+
+@router.callback_query(F.data == 'admin:tools')
+async def admin_tools_panel(call: CallbackQuery):
+    if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+        await call.answer('只能在审核群或管理员私聊使用', show_alert=True)
+        return
+    await _edit_panel(
+        call,
+        '🧰 常用命令工具\n\n点下面按钮查看命令格式和使用场景。\n这些按钮不会直接执行危险操作，只会显示用法，避免误触。',
+        reply_markup=admin_tools_keyboard(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:tool:'))
+async def admin_tool_help(call: CallbackQuery):
+    if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+        await call.answer('只能在审核群或管理员私聊使用', show_alert=True)
+        return
+    key = (call.data or '').split(':')[-1]
+    text = ADMIN_TOOL_HELP.get(key, '未找到这个工具说明。')
+    await _edit_panel(call, text, reply_markup=admin_tools_keyboard())
+    await call.answer('已打开命令说明')
 
 
 @router.callback_query(F.data == 'admin:health')

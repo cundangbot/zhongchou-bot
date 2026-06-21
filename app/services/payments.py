@@ -981,6 +981,168 @@ async def sync_project_payment_closure(session: AsyncSession, project_id: int) -
         return True, '检查完成：项目计数器、已支付订单和资源权限一致。', repaired
     return True, '已修复：' + '；'.join(changed), repaired
 
+async def migrate_project_paid_orders(
+    session: AsyncSession,
+    *,
+    source_project_id: int,
+    target_project_id: int,
+    admin_id: int,
+    reason: str | None = None,
+) -> tuple[bool, str, dict]:
+    """Move paid local tickets from one unfinished project to a new project.
+
+    Operational use case: an old crowdfunding project did not complete, the
+    creator starts a replacement project, and admins need to carry over paid
+    riders without asking them to repay or re-submit VP numbers.
+
+    This does not create duplicate payments. It rewrites the paid
+    ``PaymentOrder.project_id`` to the target project, removes old resource
+    access rows tied to those tickets, creates target access rows, and then
+    re-syncs both project counters from paid orders.
+    """
+    from app.services.project_state import ProjectState, state_value, transition_project, InvalidProjectTransition
+
+    try:
+        source_project_id = int(source_project_id)
+        target_project_id = int(target_project_id)
+    except Exception:
+        return False, '项目编号格式错误，应为 P.旧项目 P.新项目', {}
+    if source_project_id <= 0 or target_project_id <= 0:
+        return False, '项目编号必须大于 0', {}
+    if source_project_id == target_project_id:
+        return False, '旧项目和新项目不能是同一个项目', {}
+
+    source = (await session.execute(
+        select(CrowdfundProject).where(CrowdfundProject.id == source_project_id).with_for_update()
+    )).scalar_one_or_none()
+    target = (await session.execute(
+        select(CrowdfundProject).where(CrowdfundProject.id == target_project_id).with_for_update()
+    )).scalar_one_or_none()
+    if not source:
+        return False, f'旧项目 {_project_no(source_project_id)} 不存在', {}
+    if not target:
+        return False, f'新项目 {_project_no(target_project_id)} 不存在', {}
+
+    source_status = state_value(source.status)
+    target_status = state_value(target.status)
+    if source_status in ('delivered', 'resource_published'):
+        return False, f'旧项目 {_project_no(source.id)} 已交付，不建议迁移；如确需处理请人工核账。', {}
+    if target_status in ('cancelled', 'expired', 'refund_pending', 'refund_completed', 'rejected', 'delivered', 'resource_published'):
+        return False, f'新项目 {_project_no(target.id)} 当前状态为 {target_status}，不适合作为迁移目标。', {}
+
+    paid_orders = list((await session.execute(
+        select(PaymentOrder)
+        .where(PaymentOrder.project_id == source.id, PaymentOrder.status == 'paid')
+        .order_by(PaymentOrder.order_type.asc(), PaymentOrder.id.asc())
+        .with_for_update()
+    )).scalars().all())
+    if not paid_orders:
+        return False, f'旧项目 {_project_no(source.id)} 没有可迁移的已支付车票。', {'source': source, 'target': target, 'orders': []}
+
+    source_user_ids = {int(o.user_id) for o in paid_orders}
+    duplicate_target_users = list((await session.execute(
+        select(PaymentOrder)
+        .where(
+            PaymentOrder.project_id == target.id,
+            PaymentOrder.status == 'paid',
+            PaymentOrder.user_id.in_(source_user_ids),
+        )
+        .order_by(PaymentOrder.id.asc())
+        .limit(20)
+    )).scalars().all())
+    if duplicate_target_users:
+        detail = '、'.join(f'{_no(o.id)}(用户{o.user_id})' for o in duplicate_target_users[:10])
+        return False, (
+            f'新项目 {_project_no(target.id)} 已经存在同一批用户的已支付车票：{detail}。\n'
+            f'为避免重复加人数，已停止迁移。请先 /audit_project {_project_no(target.id)} 核对。'
+        ), {'source': source, 'target': target, 'orders': paid_orders}
+
+    operation_key = f'migrate-project-paid:{source.id}:{target.id}'
+    if not await begin_operation(session, operation_key, 'migrate_project_paid_orders'):
+        return False, '这组项目迁移正在处理或已经处理过，请先 /audit_project 检查。', {'source': source, 'target': target, 'orders': paid_orders}
+
+    now = datetime.utcnow()
+    moved = []
+    for order in paid_orders:
+        old_project_id = int(order.project_id or 0)
+        # Move the order itself. Keep the original user, VP number, amount and
+        # order type so creator prepay still counts as two seats.
+        order.project_id = target.id
+        order.raw_response = (order.raw_response or '') + (
+            f'\n\n[管理员迁移项目] {admin_id} 将车票从 {_project_no(old_project_id)} 迁移到 {_project_no(target.id)}'
+            + (f'｜{reason}' if reason else '')
+        )
+        order.paid_method = (f'项目迁移:{admin_id}; {order.paid_method or ""}')[:64]
+        # Effects will be rebuilt by sync_project_payment_closure.
+        order.effects_applied_at = order.effects_applied_at or now
+        moved.append(order)
+
+        # Remove old access that came from this ticket, then create target access.
+        await session.execute(delete(ResourceAccess).where(
+            ResourceAccess.project_id == old_project_id,
+            ResourceAccess.user_id == order.user_id,
+            ResourceAccess.source_order_id == order.id,
+        ))
+        exists = (await session.execute(select(ResourceAccess.id).where(
+            ResourceAccess.project_id == target.id,
+            ResourceAccess.user_id == order.user_id,
+        ))).scalar_one_or_none()
+        if exists is None:
+            session.add(ResourceAccess(user_id=order.user_id, project_id=target.id, source_order_id=order.id))
+
+        await post_ledger(
+            session,
+            idempotency_key=f'order-migrate:{order.id}:{old_project_id}:{target.id}',
+            direction='neutral',
+            category='project_migration',
+            amount=0,
+            payment_source='manual_migration',
+            project_id=target.id,
+            order_id=order.id,
+            user_id=order.user_id,
+            operator_id=admin_id,
+            description=f'管理员迁移车票 {_no(order.id)}：{_project_no(old_project_id)} -> {_project_no(target.id)}',
+            metadata={'source_project_id': old_project_id, 'target_project_id': target.id, 'reason': reason},
+        )
+
+    await finish_operation(session, operation_key, {
+        'source_project_id': source.id,
+        'target_project_id': target.id,
+        'order_ids': [o.id for o in moved],
+        'reason': reason,
+    })
+    await session.commit()
+
+    # Recalculate counters/access from paid orders after the project_id move.
+    await sync_project_payment_closure(session, source.id)
+    ok, target_sync_msg, target_snapshot = await sync_project_payment_closure(session, target.id)
+
+    # If target now meets full condition, close it into full using the normal
+    # state machine where possible. This keeps the later resource-upload flow intact.
+    target_after = target_snapshot.get('project') if target_snapshot else await session.get(CrowdfundProject, target.id)
+    full_notice = ''
+    if target_after:
+        current = state_value(target_after.status)
+        if int(target_after.paid_seats or 0) >= int(target_after.required_seats or 0) and current in (ProjectState.ACTIVE.value, ProjectState.APPROVED_WAIT_CREATOR.value):
+            try:
+                if current == ProjectState.APPROVED_WAIT_CREATOR.value:
+                    await transition_project(session, target_after, ProjectState.ACTIVE, reason='迁移已支付车票后激活', actor_id=admin_id, idempotency_key=f'project:{target_after.id}:migrate-active')
+                await transition_project(session, target_after, ProjectState.FULL, reason='迁移已支付车票后达到满员', actor_id=admin_id, idempotency_key=f'project:{target_after.id}:migrate-full')
+                full_notice = f'\n新项目已达到满员，状态已推进为 full。'
+            except InvalidProjectTransition:
+                target_after.status = ProjectState.FULL.value
+                full_notice = f'\n新项目已达到满员，已直接标记为 full。'
+            await session.commit()
+            await sync_project_payment_closure(session, target_after.id)
+
+    msg = (
+        f'已迁移 {len(moved)} 张已支付车票：{_project_no(source.id)} → {_project_no(target.id)}。\n'
+        f'迁移车票：' + '、'.join(_no(o.id) for o in moved[:30]) +
+        (f' 等共 {len(moved)} 张' if len(moved) > 30 else '') +
+        f'\n{target_sync_msg}' + full_notice
+    )
+    return True, msg, {'source': source, 'target': target_after or target, 'orders': moved}
+
 
 async def get_fund_balance(session: AsyncSession) -> float:
     from app.db.models import FinancialLedger

@@ -63,7 +63,15 @@ router = Router()
 settings = get_settings()
 
 
+def _panel_safe_text(text: str, limit: int = 3900) -> str:
+    value = str(text or '')
+    if len(value) <= limit:
+        return value
+    return value[:limit - 80] + '\n\n……内容太长，已自动截断，请使用分页/搜索查看详情。'
+
+
 async def _edit_panel(call: CallbackQuery, text: str, reply_markup=None) -> None:
+    text = _panel_safe_text(text)
     try:
         await call.message.edit_text(text, reply_markup=reply_markup, disable_web_page_preview=True)
     except TelegramBadRequest as e:
