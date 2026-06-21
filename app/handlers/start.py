@@ -944,6 +944,32 @@ def _status_label(status: str | None) -> str:
     return PROJECT_STATUS_LABELS.get(value or '', value or '-')
 
 
+def _creator_project_hint(project: CrowdfundProject) -> str:
+    status = state_value(project.status)
+    hints = {
+        'pending_review': '操作提示：等待小掌柜审核，暂时不用操作。',
+        'rejected': '操作提示：本次审核未通过，可联系小掌柜或重新拼车。',
+        'approved_wait_creator': '操作提示：等待车主完成双车位预付，完成后会公开发车。',
+        'active': '操作提示：当前正在拼车，先等车友上车，不需要提现。',
+        'full': '操作提示：已满员，系统会引导你上传资源或填写购买资料。',
+        'waiting_creator_resource': '操作提示：请点击下方「上传资源」，发送链接、文字、图片、视频或文件。',
+        'waiting_buy_info': '操作提示：请点击下方「填写购买渠道资料」。',
+        'platform_purchasing': '操作提示：小掌柜正在按资料代购，等待资源上传。',
+        'admin_uploading': '操作提示：小掌柜正在上传资源。',
+        'resource_uploading': '操作提示：资源上传中，发完后记得点击提交审核。',
+        'resource_submitted': '操作提示：资源已提交，等待小掌柜审核。',
+        'resource_review': '操作提示：资源审核中，请等待结果。',
+        'resource_rejected': '操作提示：资源被打回，请点击下方重新上传。',
+        'resource_published': '操作提示：资源已发布，可以查看收益和申请提现。',
+        'delivered': '操作提示：已交付，可以查看收益和申请提现。',
+        'cancelled': '操作提示：本车已取消，可重新拼车或联系小掌柜。',
+        'expired': '操作提示：本车已超时取消，可重新拼车或联系小掌柜。',
+        'refund_pending': '操作提示：退款处理中，可查看退款进度或重新拼车。',
+        'refund_completed': '操作提示：退款已完成，可重新拼车。',
+    }
+    return hints.get(status, '操作提示：如状态异常，请联系小掌柜。')
+
+
 async def _is_blacklisted(session, user_id: int) -> bool:
     res = await session.execute(select(UserBlacklist).where(UserBlacklist.user_id == int(user_id)))
     return res.scalar_one_or_none() is not None
@@ -1525,13 +1551,13 @@ async def created_project_detail(call: CallbackQuery):
             project_no=project_no(p),
             blogger=p.blogger,
             description=p.description,
-            progress_text=project_progress_text(p),
+            progress_text=f'当前状态：{_status_label(p.status)}\n{project_progress_text(p)}\n\n{_creator_project_hint(p)}',
             original_price=float(p.original_price or 0),
             seat_price=float(p.seat_price or settings.SEAT_PRICE),
             extra_count=pending_extra,
             batches=batches,
         )
-    await _edit_panel(call, text, reply_markup=creator_project_detail_keyboard(p.id, can_relaunch=_can_relaunch_project(p)))
+    await _edit_panel(call, text, reply_markup=creator_project_detail_keyboard(p.id, status=state_value(p.status), can_relaunch=_can_relaunch_project(p)))
     await call.answer()
 
 
@@ -1590,7 +1616,7 @@ async def creator_relaunch_project(call: CallbackQuery, bot: Bot):
     await _edit_panel(
         call,
         f'🔁 已重新提交拼车审核～\n\n旧项目：P.{old_project_id:03d}\n新项目：{project_no(new_project)}\n\n管理员通过后，会和正常发起众筹一样，通知你先支付 {settings.CREATOR_PREPAY_SEATS} 个车位。',
-        reply_markup=creator_project_detail_keyboard(new_project.id),
+        reply_markup=creator_project_detail_keyboard(new_project.id, status=state_value(new_project.status)),
     )
     await call.answer('已重新提交审核')
 
@@ -2007,7 +2033,7 @@ async def creator_withdraw_request(call: CallbackQuery, state: FSMContext):
             await _edit_panel(
                 call,
                 f'💰 分润申请处理中\n\n{project_label(p)}\n申请单：{_payout_no(active_request.id)}\n状态：{label}\n金额：{active_request.creator_amount:g} 元',
-                reply_markup=creator_project_detail_keyboard(p.id),
+                reply_markup=creator_project_detail_keyboard(p.id, status=state_value(p.status)),
             )
             return
         pending_extra = max(0, int(p.extra_fund_count or 0) - int(p.extra_withdrawn_count or 0))

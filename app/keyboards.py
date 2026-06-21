@@ -415,15 +415,40 @@ def refund_detail_keyboard(refund_id: int, can_apply: bool = False, relaunch_pro
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def creator_project_detail_keyboard(project_id: int, *, can_relaunch: bool = False) -> InlineKeyboardMarkup:
+def creator_project_detail_keyboard(project_id: int, *, status: str | None = None, can_relaunch: bool = False) -> InlineKeyboardMarkup:
+    """Buttons for the creator project detail card.
+
+    The creator center is used across many project states. Showing the same
+    "withdraw / income" actions for every state confuses users and caused
+    the resource-upload entry to be hidden after a project became full. Keep the
+    actions tied to the actual business stage instead.
+    """
+    value = str(status or '').strip()
     rows = []
+
+    if value in {'waiting_creator_resource', 'resource_rejected', 'resource_uploading'}:
+        text = '📤 上传资源' if value != 'resource_rejected' else '📤 重新上传资源'
+        rows.append([InlineKeyboardButton(text=text, callback_data=f'creator:upload_resource:{project_id}')])
+
+    if value == 'waiting_buy_info':
+        rows.append([InlineKeyboardButton(text='📝 填写购买渠道资料', callback_data=f'creator:buyinfo:{project_id}')])
+
+    if value in {'active', 'approved_wait_creator', 'full', 'waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing', 'resource_submitted', 'resource_review', 'resource_rejected'}:
+        rows.append([InlineKeyboardButton(text='🔄 刷新车车进度', callback_data=f'orders:created_detail:{project_id}')])
+
+    if value in {'resource_published', 'delivered'}:
+        rows.append([InlineKeyboardButton(text='💸 申请提现', callback_data=f'creator:withdraw:{project_id}')])
+        rows.append([InlineKeyboardButton(text='📊 收益明细', callback_data=f'creator:income:{project_id}')])
+        rows.append([InlineKeyboardButton(text='📦 查看我的资源', callback_data='resources:mine')])
+
+    if value == 'refund_pending':
+        rows.append([InlineKeyboardButton(text='💸 查看退款进度', callback_data='orders:refunds:0')])
+
     if can_relaunch:
         rows.append([InlineKeyboardButton(text='🔁 重新拼车', callback_data=f'creator:relaunch:{project_id}')])
-    rows.extend([
-        [InlineKeyboardButton(text='💸 申请提现', callback_data=f'creator:withdraw:{project_id}')],
-        [InlineKeyboardButton(text='📊 收益明细', callback_data=f'creator:income:{project_id}')],
-        [InlineKeyboardButton(text='⬅️ 返回车主记录', callback_data='orders:created:0')],
-    ])
+
+    rows.append([support_contact_button('💬 联系小掌柜', 'project', project_id)])
+    rows.append([InlineKeyboardButton(text='⬅️ 返回车主记录', callback_data='orders:created:0')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

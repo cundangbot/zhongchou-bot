@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import random
+import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot, F, Router
@@ -291,7 +292,7 @@ def _filter_resource_items(items: list[dict], kind: str) -> list[dict]:
 
 
 def _upload_status_text(project: CrowdfundProject, items: list[dict], role: str) -> str:
-    counts = _resource_counts(items)
+    counts = _resource_counts_dict(items)
     return msg.resource_upload_panel(
         project_no=f'P.{int(project.id or 0):03d}',
         blogger=project.blogger,
@@ -1494,26 +1495,50 @@ async def collect_buyinfo(message: Message, state: FSMContext, bot: Bot):
 
 
 @router.callback_query(F.data.startswith('creator:upload_resource:'))
-async def creator_upload_resource_prompt(call: CallbackQuery, state: FSMContext):
+async def creator_upload_resource_prompt(call: CallbackQuery, state: FSMContext, bot: Bot):
     project_id = int(call.data.split(':')[-1])
-    async with SessionLocal() as session:
-        project = await session.get(CrowdfundProject, project_id)
-        if not project:
-            await call.answer('项目不存在', show_alert=True)
+    try:
+        async with SessionLocal() as session:
+            project = await session.get(CrowdfundProject, project_id)
+            if not project:
+                await call.answer('项目不存在', show_alert=True)
+                return
+            if project.creator_id != call.from_user.id:
+                await call.answer('你不是该项目发起人，不能上传', show_alert=True)
+                return
+            status = state_value(project.status)
+            if status in ('cancelled', 'expired', 'refund_pending', 'refund_completed', 'delivered', 'resource_published'):
+                await call.answer('当前状态不需要上传资源。请回车主记录查看详情。', show_alert=True)
+                return
+            items = _load_resource_items(project)
+            panel_text = _upload_status_text(project, items, 'creator')
+
+        await state.clear()
+        await state.update_data(project_id=project_id, upload_role='creator')
+        await state.set_state(ResourceUploadCollect.resource)
+
+        # Upload should always happen in the creator's private chat. Some old
+        # messages/buttons may live in a group or stale context; sending the
+        # panel directly to the creator prevents "button clicked but nothing
+        # appears" when the source message is not a usable private chat.
+        panel = await _safe_send(
+            bot,
+            call.from_user.id,
+            panel_text,
+            reply_markup=resource_upload_collect_keyboard(project_id),
+        )
+        if not panel and call.message:
+            panel = await call.message.answer(panel_text, reply_markup=resource_upload_collect_keyboard(project_id))
+        if not panel:
+            await state.clear()
+            await call.answer('上传面板发送失败，请先私聊机器人 /start 后再试。', show_alert=True)
             return
-        if project.creator_id != call.from_user.id:
-            await call.answer('你不是该项目发起人，不能上传', show_alert=True)
-            return
-        items = _load_resource_items(project)
-    await state.clear()
-    await state.update_data(project_id=project_id, upload_role='creator')
-    await state.set_state(ResourceUploadCollect.resource)
-    panel = await call.message.answer(
-        _upload_status_text(project, items, 'creator'),
-        reply_markup=resource_upload_collect_keyboard(project_id),
-    )
-    await state.update_data(upload_status_chat_id=panel.chat.id, upload_status_message_id=panel.message_id)
-    await call.answer('上传面板已打开')
+        await state.update_data(upload_status_chat_id=panel.chat.id, upload_status_message_id=panel.message_id)
+        await call.answer('上传面板已发送到你的私聊')
+    except Exception:
+        logging.exception('creator upload resource prompt failed: project_id=%s user_id=%s', project_id, getattr(call.from_user, 'id', None))
+        await state.clear()
+        await call.answer('上传入口暂时打不开，请点 /start 后从车主记录重新进入。', show_alert=True)
 
 
 async def _get_active_admin_upload_project(session) -> CrowdfundProject | None:
