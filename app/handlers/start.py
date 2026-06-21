@@ -63,7 +63,7 @@ from app.keyboards import (
 )
 from app.services.crowdfund import create_project, project_public_text, project_title, project_label, project_no, project_progress_text
 from app.services.project_state import ProjectState, state_value, transition_project, InvalidProjectTransition
-from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, restore_cancelled_order_as_paid, migrate_project_paid_orders, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
+from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, restore_cancelled_order_as_paid, migrate_project_paid_orders, migrate_single_order_to_project, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
 from app.states import PaymentSubmit, ProfitWithdrawCollect, RefundApplyCollect, ContactSupport, AdminContactReply, AdminSearch, AdminManualVerify
 from app.services.ledger import post_ledger
 from app.services.idempotency import begin_operation, finish_operation
@@ -1087,6 +1087,7 @@ def _refund_status_label(status: str | None) -> str:
         'pending_admin': '申请退款审核中',
         'refunded': '退款完成',
         'rejected': '退款被驳回',
+        'migrated': '已转入新车',
     }.get(status or '', status or '-')
 
 
@@ -2695,6 +2696,45 @@ async def admin_migrate_project(message: Message):
         )
     await message.answer(text[:3900], reply_markup=admin_project_detail_keyboard(int(target_project_id)))
 
+
+@router.message(Command('migrate_order', 'move_order_to_project'))
+async def admin_migrate_order(message: Message):
+    """Move one paid ticket to another project."""
+    if message.from_user.id not in settings.admin_id_list:
+        await message.answer('无权限。')
+        return
+    parts = (message.text or '').strip().split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(
+            '用法：/migrate_order T.旧车票 P.新项目 原因\n'
+            '示例：/migrate_order T.060 P.015 用户申请退款后改为转入新车\n\n'
+            '说明：只迁移这一张已支付车票，保留用户ID和VP系统单号；如存在未完成退款申请，会自动标记为已转入新车。'
+        )
+        return
+    order_id = _parse_order_token(parts[1])
+    target_project_id = _parse_project_token(parts[2])
+    reason = parts[3].strip() if len(parts) >= 4 else '管理员迁移单张车票到新项目'
+    if not order_id or not target_project_id:
+        await message.answer('编号格式错误。示例：/migrate_order T.060 P.015 用户申请退款后改为转入新车')
+        return
+    async with SessionLocal() as session:
+        ok, reason_text, data = await migrate_single_order_to_project(
+            session,
+            order_id=order_id,
+            target_project_id=target_project_id,
+            admin_id=message.from_user.id,
+            reason=reason,
+        )
+    text = ('✅ ' if ok else '❌ ') + reason_text
+    text += (
+        '\n\n下一步建议：\n'
+        f'/audit_project P.{int(target_project_id):03d}\n'
+        f'/search T.{int(order_id):03d}\n'
+        '确认目标项目人数、车票归属和资源权限是否一致。'
+    ) if ok else ''
+    await message.answer(text[:3900], reply_markup=admin_project_detail_keyboard(int(target_project_id)))
+
+
 @router.message(Command('force_verify', 'bind'))
 async def admin_force_verify(message: Message, bot: Bot):
     if message.from_user.id not in settings.admin_id_list:
@@ -3941,7 +3981,7 @@ async def admin_support_private_reply_to_user(message: Message, state: FSMContex
         else:
             await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
         return
-    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid') or command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users'):
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid') or command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users') or command_text.startswith('/migrate_order') or command_text.startswith('/move_order_to_project'):
         await state.clear()
         if command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
             await admin_add_order(message, bot)
@@ -3949,6 +3989,8 @@ async def admin_support_private_reply_to_user(message: Message, state: FSMContex
             await admin_rebind_order_user(message, bot)
         elif command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users'):
             await admin_migrate_project(message)
+        elif command_text.startswith('/migrate_order') or command_text.startswith('/move_order_to_project'):
+            await admin_migrate_order(message)
         elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
             await admin_rebind_vp_user(message, bot)
         else:
@@ -3980,7 +4022,7 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
         else:
             await message.answer(msg.admin_search_help(), reply_markup=ForceReply(selective=True, input_field_placeholder='P.012 / VP单号 / 用户ID / 博主名'))
         return
-    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid') or command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users'):
+    if command_text.startswith('/bind') or command_text.startswith('/force_verify') or command_text.startswith('/add_order') or command_text.startswith('/manual_order') or command_text.startswith('/rebind_user') or command_text.startswith('/reassign_order') or command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid') or command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users') or command_text.startswith('/migrate_order') or command_text.startswith('/move_order_to_project'):
         await state.clear()
         if command_text.startswith('/add_order') or command_text.startswith('/manual_order'):
             await admin_add_order(message, bot)
@@ -3988,6 +4030,8 @@ async def admin_support_reply_send(message: Message, state: FSMContext, bot: Bot
             await admin_rebind_order_user(message, bot)
         elif command_text.startswith('/migrate_project') or command_text.startswith('/move_project_users'):
             await admin_migrate_project(message)
+        elif command_text.startswith('/migrate_order') or command_text.startswith('/move_order_to_project'):
+            await admin_migrate_order(message)
         elif command_text.startswith('/rebind_vp') or command_text.startswith('/reassign_vp') or command_text.startswith('/restore_order') or command_text.startswith('/restore_paid') or command_text.startswith('/mark_paid'):
             await admin_rebind_vp_user(message, bot)
         else:
@@ -4440,6 +4484,12 @@ ADMIN_TOOL_HELP = {
         '示例：/migrate_project P.009 P.015 旧车未完成，迁移到新车\n\n'
         '用途：旧拼车没完成时，把旧项目已支付车票迁移到新项目，保留用户ID和VP单号。'
     ),
+    'migrate_order': (
+        '🎫 迁移单张车票\n\n'
+        '用法：/migrate_order T.旧车票 P.新项目 原因\n'
+        '示例：/migrate_order T.060 P.015 用户申请退款后改为转入新车\n\n'
+        '用途：只迁移一个已支付用户到另一个项目，保留用户ID和VP系统单号；如这张票有待处理退款，会标记为已转入新车。'
+    ),
     'bind': (
         '✅ 绑定待付车票\n\n'
         '用法：/bind T.车票号 VP系统单号\n'
@@ -4624,6 +4674,12 @@ def _parse_ticket_query(q: str) -> int | None:
     return None
 
 
+def _fits_int32(value: int) -> bool:
+    # PostgreSQL INTEGER range. Telegram user IDs are BIGINT and must not be
+    # compared against integer project/order primary keys, or searches can crash.
+    return -2147483648 <= int(value) <= 2147483647
+
+
 def _looks_like_admin_search_query(text: str | None) -> bool:
     raw = (text or '').strip()
     if not raw or raw.startswith('/'):
@@ -4664,8 +4720,11 @@ async def _run_admin_search(message: Message, query: str) -> None:
                 project_filters.append(CrowdfundProject.id == project_id)
             if q.isdigit():
                 uid = int(q)
+                # creator_id is BIGINT, but project.id is INTEGER. Telegram user IDs
+                # can exceed INTEGER range, so only search project.id when safe.
                 project_filters.append(CrowdfundProject.creator_id == uid)
-                project_filters.append(CrowdfundProject.id == uid)
+                if _fits_int32(uid):
+                    project_filters.append(CrowdfundProject.id == uid)
             project_filters.append(CrowdfundProject.blogger.ilike(f'%{q}%'))
             project_filters.append(CrowdfundProject.description.ilike(f'%{q}%'))
 
@@ -4688,8 +4747,11 @@ async def _run_admin_search(message: Message, query: str) -> None:
             order_filters.append(PaymentOrder.faka_pay_no == q_upper)
             if q.isdigit():
                 uid = int(q)
+                # user_id is BIGINT, but order.id is INTEGER. Avoid integer overflow
+                # when admins search a Telegram user ID such as 8663495244.
                 order_filters.append(PaymentOrder.user_id == uid)
-                order_filters.append(PaymentOrder.id == uid)
+                if _fits_int32(uid):
+                    order_filters.append(PaymentOrder.id == uid)
             orders = list((await session.execute(
                 select(PaymentOrder).where(or_(*order_filters)).order_by(PaymentOrder.created_at.desc()).limit(15)
             )).scalars().all())

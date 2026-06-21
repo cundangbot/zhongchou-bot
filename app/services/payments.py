@@ -7,7 +7,7 @@ from sqlalchemy import select, func, case, or_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from app.config import get_settings
-from app.db.models import PaymentOrder, CrowdfundProject, ResourceAccess, RiskLog, UserBlacklist, SystemMetric
+from app.db.models import PaymentOrder, CrowdfundProject, ResourceAccess, RiskLog, UserBlacklist, SystemMetric, RefundRecord
 from app.services.payment_checker import FakaOrderResult, faka_query_client
 from app.services.ledger import post_ledger, money
 from app.services.idempotency import begin_operation, finish_operation
@@ -1143,6 +1143,160 @@ async def migrate_project_paid_orders(
     )
     return True, msg, {'source': source, 'target': target_after or target, 'orders': moved}
 
+
+
+async def migrate_single_order_to_project(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    target_project_id: int,
+    admin_id: int,
+    reason: str | None = None,
+) -> tuple[bool, str, dict]:
+    """Move one paid ticket from its current project to another project.
+
+    Use case: a single user asked for refund / old car was not completed, but the
+    admin decides to move only this ticket to a replacement or already-full
+    project. This command keeps the same VP/system number and user_id; it only
+    changes the local project binding and rebuilds counters/resource access.
+    """
+    from app.services.project_state import ProjectState, state_value, transition_project, InvalidProjectTransition
+
+    try:
+        order_id = int(order_id)
+        target_project_id = int(target_project_id)
+    except Exception:
+        return False, '车票或项目编号格式错误，应为 /migrate_order T.旧车票 P.新项目 原因', {}
+    if order_id <= 0 or target_project_id <= 0:
+        return False, '车票和项目编号必须大于 0', {}
+
+    order = (await session.execute(
+        select(PaymentOrder).where(PaymentOrder.id == order_id).with_for_update()
+    )).scalar_one_or_none()
+    if not order:
+        return False, f'旧车票 {_no(order_id)} 不存在', {}
+    if not order.project_id:
+        return False, f'旧车票 {_no(order.id)} 没有关联项目，不能迁移', {'order': order}
+    if int(order.project_id) == target_project_id:
+        return False, f'旧车票 {_no(order.id)} 已经在目标项目 {_project_no(target_project_id)}，无需迁移', {'order': order}
+    if order.status != 'paid':
+        return False, f'旧车票 {_no(order.id)} 当前状态为 {order.status}，只有已支付车票才能迁移。若是 cancelled 且已付款，请先 /restore_order。', {'order': order}
+    if order.order_type == 'crowdfunding_creator_prepay':
+        return False, f'旧车票 {_no(order.id)} 是发起人双车位预付，不建议单张迁移。整车迁移请用 /migrate_project。', {'order': order}
+
+    source_project_id = int(order.project_id)
+    source = (await session.execute(
+        select(CrowdfundProject).where(CrowdfundProject.id == source_project_id).with_for_update()
+    )).scalar_one_or_none()
+    target = (await session.execute(
+        select(CrowdfundProject).where(CrowdfundProject.id == target_project_id).with_for_update()
+    )).scalar_one_or_none()
+    if not source:
+        return False, f'旧项目 {_project_no(source_project_id)} 不存在', {'order': order}
+    if not target:
+        return False, f'新项目 {_project_no(target_project_id)} 不存在', {'order': order}
+
+    target_status = state_value(target.status)
+    if target_status in ('cancelled', 'expired', 'refund_pending', 'refund_completed', 'rejected'):
+        return False, f'新项目 {_project_no(target.id)} 当前状态为 {target_status}，不适合作为迁移目标。', {'order': order, 'source': source, 'target': target}
+
+    existing = (await session.execute(select(PaymentOrder).where(
+        PaymentOrder.project_id == target.id,
+        PaymentOrder.user_id == order.user_id,
+        PaymentOrder.status == 'paid',
+        PaymentOrder.id != order.id,
+    ).limit(1))).scalar_one_or_none()
+    if existing:
+        return False, (
+            f'目标项目 {_project_no(target.id)} 已经有该用户的已支付车票 {_no(existing.id)}。\n'
+            f'为避免重复加人数，已停止迁移。请先 /audit_project {_project_no(target.id)} 核对。'
+        ), {'order': order, 'source': source, 'target': target}
+
+    order_amount = _money(order.paid_amount or order.expected_amount)
+    target_price = _money(getattr(target, 'seat_price', None) or settings.SEAT_PRICE)
+    if abs(order_amount - target_price) > _money(settings.PAYMENT_AMOUNT_TOLERANCE):
+        return False, (
+            f'金额不匹配，旧车票金额 {order_amount} 元，目标项目单价 {target_price} 元。\n'
+            f'为避免 30/60 档位串单，已拒绝迁移。'
+        ), {'order': order, 'source': source, 'target': target}
+
+    operation_key = f'migrate-order:{order.id}:{source_project_id}:{target.id}'
+    if not await begin_operation(session, operation_key, 'migrate_single_order_to_project'):
+        return False, '这张车票迁移正在处理或已经处理过，请先 /audit_project 检查。', {'order': order, 'source': source, 'target': target}
+
+    # Cancel pending refund ticket if the user had already applied but admin has not refunded yet.
+    refund_rows = list((await session.execute(select(RefundRecord).where(
+        RefundRecord.order_id == order.id,
+        RefundRecord.status.in_(['pending', 'pending_info', 'pending_admin']),
+    ).with_for_update())).scalars().all())
+    for refund in refund_rows:
+        refund.status = 'migrated'
+        refund.admin_id = admin_id
+        refund.payout_info = (refund.payout_info or '') + f'\n[管理员迁移车票] 已转入 {_project_no(target.id)}，不再走退款。原因：{reason or "-"}'
+
+    # Remove old local effects and rebuild on the target project.
+    await _rollback_paid_effects_for_transfer(session, order)
+    old_order_type = order.order_type
+    target_stage = state_value(target.status)
+    if target_stage in ('full', 'waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing', 'admin_uploading', 'resource_uploading', 'resource_submitted', 'resource_rejected', 'resource_published', 'delivered') or int(target.paid_seats or 0) >= int(target.required_seats or 0):
+        order.order_type = 'crowdfunding_after_full'
+    else:
+        order.order_type = 'crowdfunding_before_full'
+    order.project_id = target.id
+    order.raw_response = (order.raw_response or '') + (
+        f'\n\n[管理员迁移单张车票] {admin_id} 将车票从 {_project_no(source_project_id)} 迁移到 {_project_no(target.id)}；'
+        f'订单类型 {old_order_type} -> {order.order_type}' + (f'｜{reason}' if reason else '')
+    )
+    order.paid_method = (f'单票迁移:{admin_id}; {order.paid_method or ""}')[:64]
+    order.effects_applied_at = None
+    await apply_paid_effects(session, order)
+
+    await post_ledger(
+        session,
+        idempotency_key=f'order-migrate-single:{order.id}:{source_project_id}:{target.id}',
+        direction='neutral',
+        category='order_migration',
+        amount=0,
+        payment_source='manual_migration',
+        project_id=target.id,
+        order_id=order.id,
+        user_id=order.user_id,
+        operator_id=admin_id,
+        description=f'管理员迁移单张车票 {_no(order.id)}：{_project_no(source_project_id)} -> {_project_no(target.id)}',
+        metadata={'source_project_id': source_project_id, 'target_project_id': target.id, 'reason': reason, 'old_order_type': old_order_type, 'new_order_type': order.order_type},
+    )
+    await finish_operation(session, operation_key, {'order_id': order.id, 'source_project_id': source_project_id, 'target_project_id': target.id, 'reason': reason})
+    await session.commit()
+
+    await sync_project_payment_closure(session, source_project_id)
+    ok, target_sync_msg, target_snapshot = await sync_project_payment_closure(session, target.id)
+
+    target_after = target_snapshot.get('project') if target_snapshot else await session.get(CrowdfundProject, target.id)
+    full_notice = ''
+    if target_after:
+        current = state_value(target_after.status)
+        if int(target_after.paid_seats or 0) >= int(target_after.required_seats or 0) and current in (ProjectState.ACTIVE.value, ProjectState.APPROVED_WAIT_CREATOR.value):
+            try:
+                if current == ProjectState.APPROVED_WAIT_CREATOR.value:
+                    await transition_project(session, target_after, ProjectState.ACTIVE, reason='迁移单张车票后激活', actor_id=admin_id, idempotency_key=f'project:{target_after.id}:migrate-order-active')
+                await transition_project(session, target_after, ProjectState.FULL, reason='迁移单张车票后达到满员', actor_id=admin_id, idempotency_key=f'project:{target_after.id}:migrate-order-full')
+                full_notice = '\n目标项目已达到满员，状态已推进为 full。'
+            except InvalidProjectTransition:
+                target_after.status = ProjectState.FULL.value
+                full_notice = '\n目标项目已达到满员，已直接标记为 full。'
+            await session.commit()
+            await sync_project_payment_closure(session, target_after.id)
+
+    refund_note = f'\n已关闭待处理退款单：{len(refund_rows)} 个。' if refund_rows else ''
+    msg = (
+        f'已迁移车票 {_no(order.id)}：{_project_no(source_project_id)} → {_project_no(target.id)}。\n'
+        f'用户：{order.user_id}\n'
+        f'系统单号：{order.faka_system_no or "-"}\n'
+        f'金额：{float(order_amount):g} 元\n'
+        f'{target_sync_msg}{refund_note}{full_notice}'
+    )
+    await session.refresh(order)
+    return True, msg, {'order': order, 'source': source, 'target': target_after or target, 'refunds': refund_rows}
 
 async def get_fund_balance(session: AsyncSession) -> float:
     from app.db.models import FinancialLedger

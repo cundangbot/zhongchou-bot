@@ -618,6 +618,6 @@ def admin_tools_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text='✅ 绑定待付车票', callback_data='admin:tool:bind'), InlineKeyboardButton(text='➕ 补已付订单', callback_data='admin:tool:add_order')],
         [InlineKeyboardButton(text='♻️ 恢复取消车票', callback_data='admin:tool:restore'), InlineKeyboardButton(text='👤 车票改用户', callback_data='admin:tool:rebind_user')],
         [InlineKeyboardButton(text='🔐 VP改用户', callback_data='admin:tool:rebind_vp'), InlineKeyboardButton(text='↔️ 转移付款车票', callback_data='admin:tool:move_bind')],
-        [InlineKeyboardButton(text='💬 回复客服', callback_data='admin:tool:reply'), InlineKeyboardButton(text='🩺 系统健康', callback_data='admin:health')],
+        [InlineKeyboardButton(text='💬 回复客服', callback_data='admin:tool:reply'), InlineKeyboardButton(text='🎫 迁移单张车票', callback_data='admin:tool:migrate_order')],
         [InlineKeyboardButton(text='⬅️ 返回管理面板', callback_data='admin:dashboard')],
     ])
