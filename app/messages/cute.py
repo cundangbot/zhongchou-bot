@@ -1900,7 +1900,12 @@ def support_private_user_forward_failed(*, error: object) -> str:
 
 
 def support_private_admin_incoming_header(*, ticket_no: str, user_label: str, user_id: int, context_text: str, message_kind: str) -> str:
-    return context_text or '来源页面：通用客服入口'
+    return (
+        f'客服对话 {ticket_no}\n'
+        f'{context_text or "来源页面：通用客服入口"}\n'
+        f'用户名称：{user_label}\n'
+        f'用户ID：{user_id}'
+    )
 
 
 def support_private_admin_text(*, header: str, user_message: str) -> str:
@@ -1915,10 +1920,11 @@ def support_private_admin_caption(*, header: str, user_caption: str | None = Non
     return caption
 
 
-def support_private_admin_hold(*, user_label: str, ticket_no: str) -> str:
+def support_private_admin_hold(*, user_name: str, user_id: int, ticket_no: str) -> str:
     return (
         f'📌 已保持对话 {ticket_no}\n'
-        f'当前回复对象：{user_label}'
+        f'当前回复对象：{user_name}\n'
+        f'用户ID：{user_id}'
     )
 
 

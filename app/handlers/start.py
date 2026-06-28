@@ -83,6 +83,7 @@ from app.messages import cute as msg
 
 router = Router()
 settings = get_settings()
+SUPPORT_ACTIVE_TIMEOUT = timedelta(minutes=30)
 
 
 def _panel_safe_text(text: str, limit: int = 3900) -> str:
@@ -525,12 +526,39 @@ async def _get_support_admin_active_ticket_id(admin_id: int) -> int | None:
         active = res.scalar_one_or_none()
         if not active:
             return None
+        if active.updated_at and datetime.utcnow() - active.updated_at > SUPPORT_ACTIVE_TIMEOUT:
+            await session.delete(active)
+            await session.commit()
+            return None
         ticket = await session.get(ContactTicket, int(active.ticket_id))
         if not ticket or ticket.status == 'closed':
             await session.delete(active)
             await session.commit()
             return None
         return int(active.ticket_id)
+
+
+async def _support_admin_has_fresh_session(admin_id: int, ticket_id: int, *, touch: bool = False) -> bool:
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(SupportAdminSession)
+            .where(
+                SupportAdminSession.admin_id == int(admin_id),
+                SupportAdminSession.ticket_id == int(ticket_id),
+            )
+            .limit(1)
+        )
+        active = res.scalar_one_or_none()
+        if not active:
+            return False
+        if active.updated_at and datetime.utcnow() - active.updated_at > SUPPORT_ACTIVE_TIMEOUT:
+            await session.delete(active)
+            await session.commit()
+            return False
+        if touch:
+            active.updated_at = datetime.utcnow()
+            await session.commit()
+        return True
 
 
 async def _clear_support_admin_active_session(admin_id: int, ticket_id: int | None = None) -> None:
@@ -631,6 +659,13 @@ def _support_user_display(user_id: int, username: str | None = None) -> str:
         return f'@{name}（{uid}）'
     return uid
 
+
+def _support_username_only(user_id: int, username: str | None = None) -> str:
+    name = (username or '').strip()
+    if name.startswith('@'):
+        name = name[1:].strip()
+    return f'@{name}' if name else str(user_id)
+
 def _support_simple_context(project=None, source_label: str = '通用客服入口') -> str:
     if project is not None:
         return (
@@ -665,11 +700,37 @@ async def _copy_support_user_message_to_admin(
 ) -> int | None:
     """把用户消息同步到客服管理员私聊，并返回管理员侧那条消息 ID。"""
     user_label = _support_user_display(int(ticket.user_id), ticket.username)
+    user_name_label = _support_username_only(int(ticket.user_id), ticket.username)
     ticket_no = _support_no(ticket.id)
     plain_text = (user_message.text or user_message.caption or '').strip()
+    is_held_dialog = await _support_admin_has_fresh_session(admin_id, int(ticket.id), touch=True)
+
+    if is_held_dialog:
+        # 管理员已经点过“保持这个对话”：后续只推送用户发来的原始内容，不再重复来源页面/按钮。
+        if not _message_has_media_payload(user_message):
+            sent = await bot.send_message(
+                admin_id,
+                plain_text or '（空消息）',
+                parse_mode=None,
+                disable_web_page_preview=True,
+            )
+            return sent.message_id
+        try:
+            copied = await bot.copy_message(
+                admin_id,
+                user_message.chat.id,
+                user_message.message_id,
+                caption=plain_text[:1024] if plain_text else None,
+                parse_mode=None,
+            )
+            return getattr(copied, 'message_id', None)
+        except Exception:
+            copied = await bot.copy_message(admin_id, user_message.chat.id, user_message.message_id)
+            return getattr(copied, 'message_id', None)
+
     header = msg.support_private_admin_incoming_header(
         ticket_no=ticket_no,
-        user_label=user_label,
+        user_label=user_name_label,
         user_id=int(ticket.user_id),
         context_text=context_text or '来源页面：通用客服入口',
         message_kind=_support_reply_kind(user_message),
@@ -701,7 +762,7 @@ async def _copy_support_user_message_to_admin(
         # 部分消息类型不支持改 caption，改成先发路由头，再原样复制。管理员回复路由头或复制消息都尽量能识别。
         header_msg = await bot.send_message(
             admin_id,
-            header + '\n\n请回复这条消息，或点「保持这个对话」后直接输入回复。',
+            header,
             reply_markup=keyboard,
             parse_mode=None,
             disable_web_page_preview=True,
@@ -767,6 +828,14 @@ async def _send_support_private_bridge_reply(
     if not reply_text and not has_media:
         await message.reply('❌ 回复内容不能为空，请发送文字、图片、视频、文件或语音。')
         return
+
+    # 管理员点“保持对话”后，半小时内双方没有交流就自动切断，避免误发给旧用户。
+    if message.chat and message.chat.type == 'private' and not message.reply_to_message:
+        active_ticket_id = await _get_support_admin_active_ticket_id(message.from_user.id)
+        if active_ticket_id != int(ticket_id):
+            await state.clear()
+            await message.reply('⚠️ 这个客服对话已超过 30 分钟未交流，已自动切断。请回到上一条客服卡片重新点「保持这个对话」。')
+            return
 
     async with SessionLocal() as session:
         ticket = await session.get(ContactTicket, int(ticket_id))
@@ -4411,12 +4480,13 @@ async def admin_support_hold_private_dialog(call: CallbackQuery, state: FSMConte
             await call.answer('这个客服对话不存在或已结束', show_alert=True)
             return
         user_label = _support_user_display(int(ticket.user_id), ticket.username)
+        user_name = _support_username_only(int(ticket.user_id), ticket.username)
         user_id = int(ticket.user_id)
     await _set_support_admin_active_session(admin_id=call.from_user.id, ticket_id=ticket_id, user_id=user_id, source='hold', ref_id=ticket_id)
     await state.clear()
     await state.update_data(contact_ticket_id=ticket_id, support_private_bridge=True)
     await state.set_state(AdminContactReply.message)
-    await call.message.answer(msg.support_private_admin_hold(user_label=user_label, ticket_no=_support_no(ticket_id)))
+    await call.message.answer(msg.support_private_admin_hold(user_name=user_name, user_id=user_id, ticket_no=_support_no(ticket_id)))
     await call.answer('已保持这个对话。')
 
 
