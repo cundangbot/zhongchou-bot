@@ -1361,7 +1361,7 @@ def refund_detail(*, refund_no: str, project_no: str, blogger: str, description:
     order_no = system_no or payment_label or refund_no
     return _panel(
         '💸 退款小票',
-        _body(f'用户：{user_id or '-'}', f'金额：{amount:g} 元', f'订单号：{order_no}'),
+        _body(f"用户：{user_id or '-'}", f'金额：{amount:g} 元', f'订单号：{order_no}'),
     )
 
 
