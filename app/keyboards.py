@@ -219,7 +219,7 @@ def admin_project_detail_keyboard(project_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text='🔍 打开项目卡片', callback_data=f'admin:project:{project_id}')],
         [InlineKeyboardButton(text='✅ 已支付用户', callback_data=f'admin:paid_users:{project_id}')],
         [InlineKeyboardButton(text='💳 待付车票', callback_data=f'admin:pending_orders:{project_id}')],
-        [InlineKeyboardButton(text='🎫 手动补票', callback_data=f'admin:manual_verify:{project_id}')],
+        [InlineKeyboardButton(text='✅ 绑定待付车票', callback_data=f'admin:bind_pending_project:{project_id}')],
         [InlineKeyboardButton(text='🧾 支付闭环检查', callback_data=f'admin:audit_project:{project_id}')],
         [InlineKeyboardButton(text='🔧 同步进度/权限', callback_data=f'admin:sync_project:{project_id}')],
         [InlineKeyboardButton(text='📦 查看/修改上传资源', callback_data=f'admin:view_resources:{project_id}')],

@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import asyncio
 import re
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import Router, F, Bot
-from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, InputMediaPhoto, InputMediaVideo, InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
 from sqlalchemy import select, func, case, or_, cast, String, text, update
@@ -64,7 +65,7 @@ from app.keyboards import (
 )
 from app.services.crowdfund import create_project, project_public_text, project_title, project_label, project_no, project_progress_text
 from app.services.project_state import ProjectState, state_value, transition_project, InvalidProjectTransition
-from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, restore_cancelled_order_as_paid, migrate_project_paid_orders, migrate_single_order_to_project, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure
+from app.services.payments import create_payment_order, friendly_verify_failure, force_verify_order, force_create_paid_order_for_user, move_paid_binding_to_order, reassign_paid_order_to_user, reassign_paid_order_by_system_no, restore_cancelled_order_as_paid, migrate_project_paid_orders, migrate_single_order_to_project, project_payment_snapshot, project_payment_audit_text, sync_project_payment_closure, confirm_order_by_system_no, find_duplicate_payment_order, normalize_system_no
 from app.states import PaymentSubmit, ProfitWithdrawCollect, RefundApplyCollect, ContactSupport, AdminContactReply, AdminSearch, AdminManualVerify
 from app.services.ledger import post_ledger
 from app.services.idempotency import begin_operation, finish_operation
@@ -1820,6 +1821,320 @@ async def submit_order_prompt(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+
+# 用户直接发送 VP/订单号的自动核票兜底流程。
+VP_NEED_PROJECT_TEXT = (
+    '🎀小掌柜已找到你的付款记录 \n'
+    '━━━━━━━━━━━━━━\n\n\n\n'
+    '现在需要你告诉我，\n'
+    '这笔钱想绑定到哪一辆小车车上？\n'
+    '请在下方的项目列表里选一个就好～\n\n'
+    '━━━━━━━━━━━━━━\n'
+    '选完马上帮你绑好座位 ✨'
+)
+
+VP_DUPLICATE_TEXT = (
+    '🔍 小掌柜核票结果 \n'
+    '━━━━━━━━━━━━━━\n\n'
+    '这个订单号已经绑定过车票啦～\n\n'
+    '不用重复提交哦\n'
+    '━━━━━━━━━━━━━━'
+)
+
+VP_OWNER_MISMATCH_TEXT = (
+    '🔍 小掌柜对不上～\n'
+    '━━━━━━━━━━━━━━\n\n'
+    '这个订单号不是你当前账号的付款记录哦，\n'
+    '跟你的账号对不上呢 😔\n\n'
+    '请使用你自己付款时收到的订单号再试一次～\n\n'
+    '━━━━━━━━━━━━━━'
+)
+
+VP_AMOUNT_MISMATCH_TEXT = (
+    '🔍 金额对不上～\n'
+    '━━━━━━━━━━━━━━\n\n'
+    '你的付款金额和这个项目的车票金额不一致呢，\n'
+    '暂时没法自动上车 😔\n\n'
+    '去核对一下：\n'
+    '💰 你付的金额\n'
+    '💰 项目要求的票价\n\n'
+    '确认无误后可以联系小掌柜手动帮你处理 🎀\n'
+    '━━━━━━━━━━━━━━'
+)
+
+
+def _extract_vp_system_no(text: str | None) -> str | None:
+    m = re.search(r'VP\s*\d{10,}', text or '', flags=re.I)
+    return normalize_system_no(m.group(0)) if m else None
+
+
+def _as_money(value) -> Decimal:
+    try:
+        return Decimal(str(value)).quantize(Decimal('0.01'))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal('0.00')
+
+
+def _money_matches(a, b) -> bool:
+    return abs(_as_money(a) - _as_money(b)) <= _as_money(settings.PAYMENT_AMOUNT_TOLERANCE)
+
+
+def _vp_bind_project_keyboard(projects: list[CrowdfundProject], system_no: str) -> InlineKeyboardMarkup:
+    rows = []
+    for p in projects[:20]:
+        price = _as_money(getattr(p, 'seat_price', 0))
+        rows.append([
+            InlineKeyboardButton(
+                text=f'🚗 P.{int(p.id):03d}｜{p.blogger}｜{price:g}元'[:60],
+                callback_data=f'pay:auto_project:{int(p.id)}:{system_no}',
+            )
+        ])
+    rows.append([InlineKeyboardButton(text='📋 返回我的众筹', callback_data='orders:center')])
+    rows.append([InlineKeyboardButton(text='💬 联系小掌柜', callback_data='support:start:payment:0')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _vp_bind_pending_keyboard(orders: list[PaymentOrder], projects_by_id: dict[int, CrowdfundProject], system_no: str) -> InlineKeyboardMarkup:
+    rows = []
+    for o in orders[:20]:
+        p = projects_by_id.get(int(o.project_id or 0))
+        blogger = getattr(p, 'blogger', None) or f'项目 P.{int(o.project_id or 0):03d}'
+        rows.append([
+            InlineKeyboardButton(
+                text=f'🚗 P.{int(o.project_id or 0):03d}｜{blogger}｜{_as_money(o.expected_amount):g}元'[:60],
+                callback_data=f'pay:auto_pending:{int(o.id)}:{system_no}',
+            )
+        ])
+    rows.append([InlineKeyboardButton(text='📋 返回我的众筹', callback_data='orders:center')])
+    rows.append([InlineKeyboardButton(text='💬 联系小掌柜', callback_data='support:start:payment:0')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _paid_order_audit_keyboard(order: PaymentOrder, project: CrowdfundProject | None) -> InlineKeyboardMarkup:
+    rows = []
+    if project:
+        rows.append([InlineKeyboardButton(text='🔍 查看项目', callback_data=f'admin:project:{project.id}')])
+    if order:
+        rows.append([InlineKeyboardButton(text='🎫 查看车票', callback_data=f'admin:order:{order.id}')])
+    rows.append([InlineKeyboardButton(text='⬅️ 返回管理员首页', callback_data='admin:dashboard')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _notify_paid_order_audit_group(bot: Bot, order: PaymentOrder, project: CrowdfundProject | None) -> None:
+    if not settings.ADMIN_GROUP_ID or not order:
+        return
+    user_label = _support_user_display(int(order.user_id), order.username)
+    project_name = f'P.{int(project.id):03d}' if project else '-'
+    blogger = getattr(project, 'blogger', None) or '-'
+    text = (
+        '用户已上车\n\n'
+        f'用户：{user_label}\n'
+        f'项目：{project_name}\n'
+        f'博主：{blogger}'
+    )
+    try:
+        await bot.send_message(
+            settings.ADMIN_GROUP_ID,
+            text,
+            reply_markup=_paid_order_audit_keyboard(order, project),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        # 审核群通知失败不能影响用户上车流程。
+        pass
+
+
+async def _candidate_projects_for_vp(session, amount) -> list[CrowdfundProject]:
+    candidate_states = [
+        ProjectState.ACTIVE.value,
+        ProjectState.FULL.value,
+        ProjectState.WAITING_CREATOR_RESOURCE.value,
+        ProjectState.WAITING_BUY_INFO.value,
+        ProjectState.PLATFORM_PURCHASING.value,
+        ProjectState.ADMIN_UPLOADING.value,
+        ProjectState.RESOURCE_UPLOADING.value,
+        ProjectState.RESOURCE_SUBMITTED.value,
+        ProjectState.RESOURCE_REVIEW.value,
+        ProjectState.RESOURCE_REJECTED.value,
+        ProjectState.RESOURCE_PUBLISHED.value,
+        ProjectState.DELIVERED.value,
+    ]
+    rows = list((await session.execute(
+        select(CrowdfundProject)
+        .where(CrowdfundProject.status.in_(candidate_states))
+        .order_by(CrowdfundProject.created_at.desc())
+        .limit(80)
+    )).scalars().all())
+    return [p for p in rows if _money_matches(getattr(p, 'seat_price', 0), amount)]
+
+
+async def _after_successful_payment(bot: Bot, session, order: PaymentOrder) -> None:
+    if not order or not order.project_id:
+        return
+    project = await session.get(CrowdfundProject, order.project_id)
+    if not project:
+        return
+    from app.keyboards import resource_claim_keyboard
+    await _notify_paid_order_audit_group(bot, order, project)
+    if getattr(order, 'paid_method', '') == '管理员冷启动暗号验票':
+        await bot.send_message(
+            settings.ADMIN_GROUP_ID,
+            f'🧪 冷启动验票记录\n\n'
+            f'{project_label(project)}\n'
+            f'用户：{_tg_code(order.user_id)}\n'
+            f'待绑定车票：{_ticket_no(order.id)}\n'
+            f'金额：{(order.paid_amount or order.expected_amount):g} 元\n'
+            f'方式：管理员/白名单暗号验票\n'
+            f'内部系统单号：{order.faka_system_no or "-"}'
+        )
+    await update_public_project(bot, project)
+    if order.order_type == 'crowdfunding_before_full':
+        await notify_creator_rider_progress(bot, project, order.user_id)
+    if order.order_type in ('crowdfunding_before_full', 'crowdfunding_creator_prepay') and project.paid_seats >= project.required_seats and state_value(project.status) == 'full':
+        await notify_project_full(bot, session, project)
+        await update_public_project(bot, project)
+    elif order.order_type == 'crowdfunding_after_full':
+        if state_value(project.status) in ('resource_published', 'delivered'):
+            items = load_resource_items(project)
+            await bot.send_message(
+                order.user_id,
+                f'📦 你参与的资源已审核通过～\n\n{project_label(project)}\n\n点击下方按钮把宝贝带回家。',
+                reply_markup=resource_claim_keyboard(project.id, resource_counts_dict(items)),
+            )
+        else:
+            await bot.send_message(
+                settings.ADMIN_GROUP_ID,
+                f'🔓 满员后补票已支付\n{project_label(project)}\n用户：{order.user_id}\n{_payment_display_label(order)}\n发卡平台系统单号：{order.faka_system_no or "-"}\n当前资源状态：{_status_label(project.status)}\n\n资源审核通过后，该用户会拥有领取资格。'
+            )
+
+
+async def _validate_vp_basic_and_prompt(message: Message, bot: Bot, system_no: str) -> None:
+    await message.answer(msg.verifying(system_no))
+    try:
+        async with SessionLocal() as session:
+            duplicate = await find_duplicate_payment_order(session, system_no=system_no)
+            if duplicate:
+                await message.answer(VP_DUPLICATE_TEXT, reply_markup=order_center_keyboard())
+                return
+
+            result = await faka_query_client.query_order(system_no)
+            returned_no = normalize_system_no(result.system_no or system_no)
+            if result.system_no and returned_no != system_no:
+                await message.answer('订单号返回结果不一致，请核对后再试。', reply_markup=external_support_keyboard('payment', 0))
+                return
+            duplicate = await find_duplicate_payment_order(session, system_no=returned_no)
+            if duplicate:
+                await message.answer(VP_DUPLICATE_TEXT, reply_markup=order_center_keyboard())
+                return
+            if result.status != '已支付':
+                await message.answer('这张小票暂时查不到已支付状态，请确认支付完成后再发订单号。', reply_markup=external_support_keyboard('payment', 0))
+                return
+            if result.buyer_user_id is not None and int(result.buyer_user_id) != int(message.from_user.id):
+                await message.answer(VP_OWNER_MISMATCH_TEXT, reply_markup=external_support_keyboard('payment', 0))
+                return
+            if result.buyer_user_id is None:
+                await message.answer('小掌柜暂时没查到这个订单号对应的 Telegram 账号，请联系小掌柜手动核对。', reply_markup=external_support_keyboard('payment', 0))
+                return
+            if result.amount is None:
+                await message.answer('小掌柜暂时没查到付款金额，请联系小掌柜手动核对。', reply_markup=external_support_keyboard('payment', 0))
+                return
+
+            pending_orders = list((await session.execute(
+                select(PaymentOrder)
+                .where(PaymentOrder.user_id == message.from_user.id, PaymentOrder.status == 'pending')
+                .order_by(PaymentOrder.created_at.desc())
+                .limit(20)
+            )).scalars().all())
+            matching_pending = [o for o in pending_orders if _money_matches(o.expected_amount, result.amount)]
+            if len(matching_pending) == 1:
+                ok, reason, order = await confirm_order_by_system_no(session, message.from_user.id, system_no, order_id=matching_pending[0].id)
+                if ok and order:
+                    await _after_successful_payment(bot, session, order)
+                    await message.answer(msg.verify_success(reason), reply_markup=main_menu())
+                else:
+                    text = friendly_verify_failure(reason)
+                    if '金额不匹配' in reason:
+                        await message.answer(VP_AMOUNT_MISMATCH_TEXT, reply_markup=external_support_keyboard('payment', 0))
+                    elif '用户' in reason and ('不一致' in reason or 'Telegram ID' in reason):
+                        await message.answer(VP_OWNER_MISMATCH_TEXT, reply_markup=external_support_keyboard('payment', 0))
+                    elif '已被使用' in reason or '重复' in reason or '占用车票' in reason:
+                        await message.answer(VP_DUPLICATE_TEXT, reply_markup=order_center_keyboard())
+                    else:
+                        await message.answer(msg.verify_failed(text), reply_markup=external_support_keyboard('payment', 0))
+                return
+            if len(matching_pending) > 1:
+                project_ids = [int(o.project_id or 0) for o in matching_pending if o.project_id]
+                projects = {}
+                if project_ids:
+                    for p in (await session.execute(select(CrowdfundProject).where(CrowdfundProject.id.in_(project_ids)))).scalars().all():
+                        projects[int(p.id)] = p
+                await message.answer(VP_NEED_PROJECT_TEXT, reply_markup=_vp_bind_pending_keyboard(matching_pending, projects, system_no))
+                return
+
+            projects = await _candidate_projects_for_vp(session, result.amount)
+            if not projects:
+                await message.answer(VP_AMOUNT_MISMATCH_TEXT, reply_markup=external_support_keyboard('payment', 0))
+                return
+            await message.answer(VP_NEED_PROJECT_TEXT, reply_markup=_vp_bind_project_keyboard(projects, system_no))
+    except Exception as exc:
+        await message.answer(msg.verify_service_error(), reply_markup=external_support_keyboard('payment', 0))
+
+
+async def _auto_bind_existing_pending(call: CallbackQuery, bot: Bot, order_id: int, system_no: str) -> None:
+    async with SessionLocal() as session:
+        ok, reason, order = await confirm_order_by_system_no(session, call.from_user.id, system_no, order_id=order_id)
+        if ok and order:
+            await _after_successful_payment(bot, session, order)
+            await _edit_panel(call, msg.verify_success(reason), reply_markup=main_menu())
+        else:
+            if '金额不匹配' in reason:
+                await _edit_panel(call, VP_AMOUNT_MISMATCH_TEXT, reply_markup=external_support_keyboard('payment', 0))
+            elif '用户' in reason and ('不一致' in reason or 'Telegram ID' in reason):
+                await _edit_panel(call, VP_OWNER_MISMATCH_TEXT, reply_markup=external_support_keyboard('payment', 0))
+            elif '已被使用' in reason or '重复' in reason or '占用车票' in reason:
+                await _edit_panel(call, VP_DUPLICATE_TEXT, reply_markup=order_center_keyboard())
+            else:
+                await _edit_panel(call, msg.verify_failed(friendly_verify_failure(reason)), reply_markup=external_support_keyboard('payment', 0))
+
+
+async def _auto_bind_project(call: CallbackQuery, bot: Bot, project_id: int, system_no: str) -> None:
+    async with SessionLocal() as session:
+        project = await session.get(CrowdfundProject, project_id)
+        if not project:
+            await _edit_panel(call, '这个项目不存在或已被删除。', reply_markup=order_center_keyboard())
+            return
+        status = state_value(project.status)
+        unavailable = status in ('cancelled', 'expired', 'refund_pending', 'refund_completed')
+        if unavailable:
+            await _edit_panel(call, '当前项目已关闭，暂时不能绑定这笔付款。', reply_markup=external_support_keyboard('payment', 0))
+            return
+        order_type = 'crowdfunding_before_full' if int(project.paid_seats or 0) < int(project.required_seats or 0) and status == ProjectState.ACTIVE.value else 'crowdfunding_after_full'
+        order = await create_payment_order(
+            session,
+            user_id=call.from_user.id,
+            username=call.from_user.username,
+            expected_amount=float(project.seat_price),
+            order_type=order_type,
+            project_id=project.id,
+        )
+        ok, reason, order = await confirm_order_by_system_no(session, call.from_user.id, system_no, order_id=order.id)
+        if ok and order:
+            await _after_successful_payment(bot, session, order)
+            await _edit_panel(call, msg.verify_success(reason), reply_markup=main_menu())
+        else:
+            if order and order.status == 'pending':
+                order.status = 'cancelled'
+                order.fail_reason = reason
+                await session.commit()
+            if '金额不匹配' in reason:
+                await _edit_panel(call, VP_AMOUNT_MISMATCH_TEXT, reply_markup=external_support_keyboard('payment', 0))
+            elif '用户' in reason and ('不一致' in reason or 'Telegram ID' in reason):
+                await _edit_panel(call, VP_OWNER_MISMATCH_TEXT, reply_markup=external_support_keyboard('payment', 0))
+            elif '已被使用' in reason or '重复' in reason or '占用车票' in reason:
+                await _edit_panel(call, VP_DUPLICATE_TEXT, reply_markup=order_center_keyboard())
+            else:
+                await _edit_panel(call, msg.verify_failed(friendly_verify_failure(reason)), reply_markup=external_support_keyboard('payment', 0))
+
 @router.message(PaymentSubmit.system_no)
 async def receive_system_no_for_order(message: Message, state: FSMContext, bot: Bot):
     from app.services.payments import confirm_order_by_system_no
@@ -1841,40 +2156,7 @@ async def receive_system_no_for_order(message: Message, state: FSMContext, bot: 
         async with SessionLocal() as session:
             ok, reason, order = await confirm_order_by_system_no(session, message.from_user.id, system_no, order_id=order_id)
             if ok and order and order.project_id:
-                project = await session.get(CrowdfundProject, order.project_id)
-                if project:
-                    from app.keyboards import resource_claim_keyboard
-                    if getattr(order, 'paid_method', '') == '管理员冷启动暗号验票':
-                        await bot.send_message(
-                            settings.ADMIN_GROUP_ID,
-                            f'🧪 冷启动验票记录\n\n'
-                            f'{project_label(project)}\n'
-                            f'用户：{_tg_code(order.user_id)}\n'
-                            f'待绑定车票：{_ticket_no(order.id)}\n'
-                            f'金额：{(order.paid_amount or order.expected_amount):g} 元\n'
-                            f'方式：管理员/白名单暗号验票\n'
-                            f'内部系统单号：{order.faka_system_no or "-"}'
-                        )
-                    await update_public_project(bot, project)
-                    if order.order_type == 'crowdfunding_before_full':
-                        await notify_creator_rider_progress(bot, project, order.user_id)
-                    if order.order_type in ('crowdfunding_before_full', 'crowdfunding_creator_prepay') and project.paid_seats >= project.required_seats and state_value(project.status) == 'full':
-                        await notify_project_full(bot, session, project)
-                        await update_public_project(bot, project)
-                    elif order.order_type == 'crowdfunding_after_full':
-                        # 满员后补票：如果资源已经发布，立即补发领取按钮；否则通知审核群，避免用户支付后没动静。
-                        if state_value(project.status) in ('resource_published', 'delivered'):
-                            items = load_resource_items(project)
-                            await bot.send_message(
-                                order.user_id,
-                                f'📦 你参与的资源已审核通过～\n\n{project_label(project)}\n\n点击下方按钮把宝贝带回家。',
-                                reply_markup=resource_claim_keyboard(project.id, resource_counts_dict(items)),
-                            )
-                        else:
-                            await bot.send_message(
-                                settings.ADMIN_GROUP_ID,
-                                f'🔓 满员后补票已支付\n{project_label(project)}\n用户：{order.user_id}\n{_payment_display_label(order)}\n发卡平台系统单号：{order.faka_system_no or "-"}\n当前资源状态：{_status_label(project.status)}\n\n资源审核通过后，该用户会拥有领取资格。'
-                            )
+                await _after_successful_payment(bot, session, order)
         await state.clear()
         if ok:
             await message.answer(msg.verify_success(reason), reply_markup=main_menu())
@@ -1894,6 +2176,54 @@ async def receive_system_no_for_order(message: Message, state: FSMContext, bot: 
             reply_markup=verify_failure_keyboard(),
         )
 
+
+@router.callback_query(F.data.startswith('pay:auto_pending:'))
+async def auto_bind_pending_from_vp(call: CallbackQuery, bot: Bot):
+    parts = (call.data or '').split(':', 3)
+    try:
+        order_id = int(parts[2])
+        system_no = normalize_system_no(parts[3])
+    except Exception:
+        await call.answer('参数失效，请重新发送订单号。', show_alert=True)
+        return
+    await call.answer('小掌柜正在核票～')
+    await _auto_bind_existing_pending(call, bot, order_id, system_no)
+
+
+@router.callback_query(F.data.startswith('pay:auto_project:'))
+async def auto_bind_project_from_vp(call: CallbackQuery, bot: Bot):
+    parts = (call.data or '').split(':', 3)
+    try:
+        project_id = int(parts[2])
+        system_no = normalize_system_no(parts[3])
+    except Exception:
+        await call.answer('参数失效，请重新发送订单号。', show_alert=True)
+        return
+    await call.answer('小掌柜正在绑座位～')
+    await _auto_bind_project(call, bot, project_id, system_no)
+
+
+@router.message(StateFilter(None), lambda message: bool(
+    message.from_user
+    and message.chat
+    and message.chat.type == 'private'
+    and message.from_user.id not in settings.admin_id_list
+    and _extract_vp_system_no(message.text)
+))
+async def user_plain_vp_auto_verify(message: Message, bot: Bot, state: FSMContext):
+    """Only handle the fallback case where a user sends a VP directly in idle private chat.
+
+    The normal flow stays unchanged:
+    project -> 完成支付 -> 提交订单号 -> PaymentSubmit.system_no -> receive_system_no_for_order().
+    This handler is intentionally limited to StateFilter(None), and the explicit state check below
+    prevents it from taking over any active submit/reply/admin input flow.
+    """
+    if await state.get_state():
+        return
+    system_no = _extract_vp_system_no(message.text)
+    if not system_no:
+        return
+    await _validate_vp_basic_and_prompt(message, bot, system_no)
 
 def _matches_seed_secret(message: Message) -> bool:
     secret = (settings.ADMIN_VERIFY_SECRET or '').strip().upper()
@@ -2489,15 +2819,9 @@ async def admin_order_detail(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.callback_query(F.data.startswith('admin:manual_verify:'))
-async def admin_manual_verify_project(call: CallbackQuery, state: FSMContext):
-    """项目详情进入手动补票。
-
-    旧逻辑只列待付车票；实际运营里更常见的是用户已经付款但没生成/没保留待付车票，
-    因此这里改成两条路：
-    1）有待付车票时可以点车票补单；
-    2）没有待付车票时，管理员直接回复“用户ID VP系统单号”，系统会创建已支付车票并接到该用户身上。
-    """
+@router.callback_query(F.data.startswith('admin:bind_pending_project:'))
+async def admin_bind_pending_project(call: CallbackQuery, state: FSMContext):
+    """只绑定用户已经存在的待付车票；没有待付车票时不再自动进入补单。"""
     if call.from_user.id not in settings.admin_id_list:
         await call.answer('无权限', show_alert=True)
         return
@@ -2516,32 +2840,58 @@ async def admin_manual_verify_project(call: CallbackQuery, state: FSMContext):
         )
         orders = list(result.scalars().all())
 
-    await state.update_data(admin_manual_project_id=project_id, admin_manual_order_id=0)
-    await state.set_state(AdminManualVerify.system_no)
-
     rows = []
     for order in orders[:30]:
         user_label = _support_user_display(int(order.user_id), order.username)
         rows.append([
             InlineKeyboardButton(
-                text=f'用现有车票 {_ticket_no(order.id)}｜{user_label}｜{order.expected_amount:g}元'[:60],
+                text=f'绑定 {_ticket_no(order.id)}｜{user_label}｜{order.expected_amount:g}元'[:60],
                 callback_data=f'admin:manual_verify_select:{order.id}',
             )
         ])
+    rows.append([InlineKeyboardButton(text='➕ 没有待付车票，改补已付订单', callback_data=f'admin:add_paid_order_project:{project_id}')])
     rows.append([InlineKeyboardButton(text='⬅️ 返回项目详情', callback_data=f'admin:project:{project_id}')])
 
-    pending_hint = (
-        f'\n\n系统也找到了 {len(orders)} 张待付车票，可以点下面某一张绑定。'
-        if orders else
-        '\n\n当前没有待付车票也没关系：这通常正是需要管理员补订单的场景。'
-    )
+    if not orders:
+        panel_text = (
+            f'✅ 绑定待付车票\n\n{project_label(project)}\n\n'
+            f'当前项目没有待付车票，所以不能走“绑定待付车票”。\n\n'
+            f'如果用户确实已付款，但系统里没有待付车票，请点“补已付订单”。'
+        )
+    else:
+        panel_text = (
+            f'✅ 绑定待付车票\n\n{project_label(project)}\n\n'
+            f'当前待付车票：{len(orders)} 张\n'
+            f'请选择要绑定的车票，然后发送 VP 系统单号。'
+        )
+    await _edit_panel(call, panel_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:add_paid_order_project:') | F.data.startswith('admin:manual_verify:'))
+async def admin_add_paid_order_project(call: CallbackQuery, state: FSMContext):
+    """用户没有待付车票但已经付款时，管理员手动补一张已支付车票。"""
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+
+    project_id = int(call.data.split(':')[-1])
+    await state.clear()
+    async with SessionLocal() as session:
+        project = await session.get(CrowdfundProject, project_id)
+        if not project:
+            await call.answer('项目不存在', show_alert=True)
+            return
+
+    await state.update_data(admin_manual_project_id=project_id, admin_manual_order_id=0)
+    await state.set_state(AdminManualVerify.system_no)
+    rows = [[InlineKeyboardButton(text='⬅️ 返回项目详情', callback_data=f'admin:project:{project_id}')]]
     panel_text = (
-        f'🎫 手动补订单 / 补票\n\n{project_label(project)}\n'
-        f'{pending_hint}\n\n'
+        f'➕ 补已付订单\n\n{project_label(project)}\n\n'
+        f'适用场景：用户确实已付款，但系统里没有待付车票。\n\n'
         f'请直接回复下一条“补订单输入框”，发送：\n'
         f'用户ID VP系统单号\n\n'
-        f'示例：123456789 VP2026060202331011743\n\n'
-        f'机器人会创建一张已支付车票，把这笔订单接到该用户身上。众筹完成或资源审核通过后，该用户会正常收到资源。'
+        f'示例：123456789 VP2026060202331011743'
     )
     await _edit_panel(call, panel_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.message.answer(
