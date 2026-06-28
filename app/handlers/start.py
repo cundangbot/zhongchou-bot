@@ -113,6 +113,10 @@ def _ticket_no(value: int | None) -> str:
     # 仅用于未绑定发卡平台系统单号前的临时车票标识，用户支付绑定后优先展示真实系统单号。
     return f'T.{int(value or 0):03d}'
 
+def _tg_code(value) -> str:
+    value = '-' if value is None or value == '' else str(value)
+    return f'<code>{value}</code>'
+
 
 def _payment_display_no(order: PaymentOrder | None) -> str:
     if not order:
@@ -614,7 +618,40 @@ async def _open_or_reuse_support_ticket_for_business(
 
 
 def _support_user_display(user_id: int, username: str | None = None) -> str:
-    return username or str(user_id)
+    """客服侧用户显示名：有用户名显示 @username（ID），没有用户名只显示 ID。
+
+    避免出现空的 @，也方便管理员复制/核对用户 ID。
+    """
+    uid = str(user_id)
+    name = (username or '').strip()
+    if name.startswith('@'):
+        name = name[1:].strip()
+    if name:
+        return f'@{name}（{uid}）'
+    return uid
+
+def _support_simple_context(project=None, source_label: str = '通用客服入口') -> str:
+    if project is not None:
+        return (
+            f'项目：P.{int(getattr(project, "id", 0) or 0):03d}\n'
+            f'博主：{getattr(project, "blogger", "-") or "-"}\n'
+            f'来源页面：{source_label}'
+        )
+    return (
+        '项目：-\n'
+        '博主：-\n'
+        f'来源页面：{source_label}'
+    )
+
+
+async def _delete_state_message(bot: Bot, state: FSMContext, key: str, chat_id: int) -> None:
+    data = await state.get_data()
+    mid = int(data.get(key) or 0)
+    if mid:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
 
 
 async def _copy_support_user_message_to_admin(
@@ -626,7 +663,7 @@ async def _copy_support_user_message_to_admin(
     context_text: str,
 ) -> int | None:
     """把用户消息同步到客服管理员私聊，并返回管理员侧那条消息 ID。"""
-    user_label = ticket.username or str(ticket.user_id)
+    user_label = _support_user_display(int(ticket.user_id), ticket.username)
     ticket_no = _support_no(ticket.id)
     plain_text = (user_message.text or user_message.caption or '').strip()
     header = msg.support_private_admin_incoming_header(
@@ -738,7 +775,7 @@ async def _send_support_private_bridge_reply(
                 await state.clear()
             return
         user_id = int(ticket.user_id)
-        user_label = ticket.username or str(ticket.user_id)
+        user_label = _support_user_display(int(ticket.user_id), ticket.username)
 
     await _set_support_admin_active_session(
         admin_id=message.from_user.id,
@@ -767,7 +804,9 @@ async def _send_support_private_bridge_reply(
             await state.set_state(AdminContactReply.message)
         elif clear_state:
             await state.clear()
-        await message.reply(msg.support_private_admin_sent(user_label=user_label, ticket_no=_support_no(ticket_id), delivery_method=delivery_method))
+        await _delete_state_message(bot, state, 'support_admin_sent_msg_id', message.chat.id)
+        sent_confirm = await message.reply(msg.support_private_admin_sent(user_label=user_label, ticket_no=_support_no(ticket_id), delivery_method=delivery_method))
+        await state.update_data(support_admin_sent_msg_id=sent_confirm.message_id)
     except Exception as e:
         friendly_error = _friendly_support_delivery_error(e)
         await _mark_support_delivery_failed(int(ticket_id), friendly_error)
@@ -848,7 +887,7 @@ async def _send_support_reply_core(
                 await state.clear()
             return
         user_id = int(ticket.user_id)
-        user_label = ticket.username or str(ticket.user_id)
+        user_label = _support_user_display(int(ticket.user_id), ticket.username)
 
     header_message_id = None
     delivery_method = ''
@@ -1810,7 +1849,7 @@ async def receive_system_no_for_order(message: Message, state: FSMContext, bot: 
                             settings.ADMIN_GROUP_ID,
                             f'🧪 冷启动验票记录\n\n'
                             f'{project_label(project)}\n'
-                            f'用户：{order.user_id}\n'
+                            f'用户：{_tg_code(order.user_id)}\n'
                             f'待绑定车票：{_ticket_no(order.id)}\n'
                             f'金额：{(order.paid_amount or order.expected_amount):g} 元\n'
                             f'方式：管理员/白名单暗号验票\n'
@@ -2383,7 +2422,7 @@ async def _after_admin_force_verify(bot: Bot, session, order: PaymentOrder, admi
         await bot.send_message(
             settings.ADMIN_GROUP_ID,
             f'⚠️ 补票已完成，但无法私信通知用户\n'
-            f'用户：{order.user_id}\n'
+            f'用户：{_tg_code(order.user_id)}\n'
             f'车票：{_ticket_no(order.id)}\n'
             f'原因：{exc}',
         )
@@ -2392,8 +2431,8 @@ async def _after_admin_force_verify(bot: Bot, session, order: PaymentOrder, admi
         settings.ADMIN_GROUP_ID,
         f'🛠 管理员手动补票完成\n'
         f'车票：{_ticket_no(order.id)}\n'
-        f'系统单号：{order.faka_system_no}\n'
-        f'用户：{order.user_id}\n'
+        f'系统单号：{_tg_code(order.faka_system_no)}\n'
+        f'用户：{_tg_code(order.user_id)}\n'
         f'金额：{order.expected_amount:g} 元\n'
         f'操作管理员：{admin_id}',
     )
@@ -2433,13 +2472,13 @@ async def admin_order_detail(call: CallbackQuery, state: FSMContext):
         f'🎫 车票详情｜{_ticket_no(order.id)}\n'
         f'{msg.LINE}\n\n'
         f'{project_label(project) if project else "项目：-"}\n'
-        f'用户：{order.username or order.user_id}\n'
+        f'用户：{order.username or _tg_code(order.user_id)}\n'
         f'状态：{order.status}\n'
         f'类型：{_order_type_name(order.order_type)}\n'
         f'应付：{float(order.expected_amount or 0):g} 元\n'
         f'实付：{float(order.paid_amount or 0):g} 元\n'
-        f'系统单号：{order.faka_system_no or "-"}\n'
-        f'支付单号：{order.faka_pay_no or "-"}\n'
+        f'系统单号：{_tg_code(order.faka_system_no)}\n'
+        f'支付单号：{_tg_code(order.faka_pay_no)}\n'
         f'支付来源：{order.payment_source or "-"}\n'
         f'支付时间：{_fmt_dt(order.paid_at)}\n\n'
         f'{msg.LINE}\n'
@@ -2482,7 +2521,7 @@ async def admin_manual_verify_project(call: CallbackQuery, state: FSMContext):
 
     rows = []
     for order in orders[:30]:
-        user_label = order.username or str(order.user_id)
+        user_label = _support_user_display(int(order.user_id), order.username)
         rows.append([
             InlineKeyboardButton(
                 text=f'用现有车票 {_ticket_no(order.id)}｜{user_label}｜{order.expected_amount:g}元'[:60],
@@ -2540,7 +2579,7 @@ async def admin_manual_verify_select(call: CallbackQuery, state: FSMContext):
         f'🎫 手动补票确认\n\n'
         f'{project_label(project) if project else default_label}\n'
         f'车票：{_ticket_no(order.id)}\n'
-        f'用户：{order.username or order.user_id}\n'
+        f'用户：{order.username or _tg_code(order.user_id)}\n'
         f'金额：{order.expected_amount:g} 元\n\n'
         f'请发送这张车票要绑定的 VP 开头系统单号。'
     )
@@ -2872,8 +2911,8 @@ async def admin_move_bind(message: Message, bot: Bot):
         await _after_admin_force_verify(bot, session, order, message.from_user.id)
     await message.answer(
         f'✅ 转绑成功：{_ticket_no(source_id)} → {_ticket_no(order.id)}\n'
-        f'系统单号：{order.faka_system_no or "-"}\n'
-        f'用户：{order.user_id}\n'
+        f'系统单号：{_tg_code(order.faka_system_no)}\n'
+        f'用户：{_tg_code(order.user_id)}\n'
         f'项目：P.{int(order.project_id or 0):03d}'
     )
 
@@ -2922,7 +2961,7 @@ async def admin_rebind_order_user(message: Message, bot: Bot):
         f'✅ 已重新接回用户\n'
         f'车票：{_ticket_no(order.id)}\n'
         f'项目：P.{int(order.project_id or 0):03d}\n'
-        f'用户：{order.user_id}\n'
+        f'用户：{_tg_code(order.user_id)}\n'
         f'系统单号：{order.faka_system_no or "-"}\n\n'
         f'现在这个用户的「我拼车中/我的车票」会按这张 paid 车票显示；众筹完成后也会按这个用户发资源。'
     )
@@ -2962,7 +3001,7 @@ async def admin_restore_order_paid(message: Message, bot: Bot):
         f'✅ 已恢复车票为已支付\n'
         f'车票：{_ticket_no(order.id)}\n'
         f'项目：P.{int(order.project_id or 0):03d}\n'
-        f'用户：{order.user_id}\n'
+        f'用户：{_tg_code(order.user_id)}\n'
         f'系统单号：{order.faka_system_no or "-"}\n\n'
         f'现在用户的「我拼车中」会按 paid 车票显示；项目完成后也会按这张票发资源。'
     )
@@ -3006,7 +3045,7 @@ async def admin_rebind_vp_user(message: Message, bot: Bot):
         f'✅ 已按系统单号重新接回用户\n'
         f'车票：{_ticket_no(order.id)}\n'
         f'项目：P.{int(order.project_id or 0):03d}\n'
-        f'用户：{order.user_id}\n'
+        f'用户：{_tg_code(order.user_id)}\n'
         f'系统单号：{order.faka_system_no or "-"}'
     )
 
@@ -3461,7 +3500,7 @@ async def admin_dashboard_list(call: CallbackQuery):
                 lines = ['💬 今日客服小纸条', '说明：这里只处理用户人工咨询；退款/报销/提现仍在对应业务列表处理。']
                 rows = []
                 for t in tickets:
-                    user_label = t.username or str(t.user_id)
+                    user_label = _support_user_display(int(t.user_id), t.username)
                     status_label = {'open': '待回复', 'answered': '已回复', 'closed': '已关闭'}.get(t.status, t.status)
                     body = (t.user_message or '非文本消息')[:120]
                     lines.append(f'\n工单：{_support_no(t.id)}｜{status_label}\n用户：{user_label}（{t.user_id}）\n时间：{_fmt_dt(t.created_at)}\n内容：{body}')
@@ -3659,26 +3698,18 @@ async def support_start_callback(call: CallbackQuery, state: FSMContext):
             if order and order.user_id == call.from_user.id:
                 project = await session.get(CrowdfundProject, order.project_id) if order.project_id else None
                 context.update(order_id=order.id, project_id=order.project_id, last_error=order.fail_reason)
-                context['context_text'] = (
-                    f'来源页面：待付/异常车票\n'
-                    f'{project_label(project) if project else default_label}\n'
-                    f'车票：{_ticket_no(order.id)}\n用户：{call.from_user.id}\n'
-                    f'当前状态：{order.status}\n最近错误：{order.fail_reason or "-"}'
-                )
+                context['context_text'] = _support_simple_context(project, '待付/异常车票')
         elif source == 'refund' and ref_id:
             refund = await session.get(RefundRecord, ref_id)
             if refund and refund.user_id == call.from_user.id:
                 project = await session.get(CrowdfundProject, refund.project_id)
                 context.update(refund_id=refund.id, order_id=refund.order_id, project_id=refund.project_id)
-                context['context_text'] = (
-                    f'来源页面：退款详情\n{project_label(project) if project else default_label}\n'
-                    f'退款单：{_refund_no(refund.id)}\n用户：{call.from_user.id}\n当前状态：{_refund_status_label(refund.status)}'
-                )
+                context['context_text'] = _support_simple_context(project, '退款详情')
         elif source == 'project' and ref_id:
             project = await session.get(CrowdfundProject, ref_id)
             if project:
                 context.update(project_id=project.id)
-                context['context_text'] = f'来源页面：项目详情\n{project_label(project)}\n用户：{call.from_user.id}\n当前状态：{_status_label(project.status)}'
+                context['context_text'] = _support_simple_context(project, '项目详情')
 
         # 若用户已有未关闭会话，继续沿用，避免每条消息都变成一张新工单。
         ticket = await _support_active_ticket_for_user(session, call.from_user.id)
@@ -3836,7 +3867,9 @@ async def collect_support_message(message: Message, state: FSMContext, bot: Bot)
                 direction='user_to_admin',
             )
         await state.update_data(contact_ticket_id=ticket.id, contact_context={**context, 'ticket_id': ticket.id})
-        await message.answer(msg.support_user_confirm(_support_no(ticket.id)), reply_markup=support_private_user_keyboard())
+        await _delete_state_message(bot, state, 'support_user_confirm_msg_id', message.chat.id)
+        confirm_msg = await message.answer(msg.support_user_confirm(_support_no(ticket.id)), reply_markup=support_private_user_keyboard())
+        await state.update_data(support_user_confirm_msg_id=confirm_msg.message_id)
     except Exception as e:
         friendly_error = _friendly_support_delivery_error(e)
         await _mark_support_delivery_failed(ticket.id, friendly_error)
@@ -3964,7 +3997,7 @@ async def admin_support_link_from_business(call: CallbackQuery, state: FSMContex
         if not user_id:
             await call.answer('没有找到这个业务单对应的用户', show_alert=True)
             return
-        user_label = username or str(user_id)
+        user_label = _support_user_display(int(user_id), username)
         context_text = f'来源页面：{source_label}\n{detail}'
         ticket = await _open_or_reuse_support_ticket_for_business(
             session,
@@ -4027,7 +4060,7 @@ async def admin_support_hold_private_dialog(call: CallbackQuery, state: FSMConte
         if not ticket or ticket.status == 'closed':
             await call.answer('这个客服对话不存在或已结束', show_alert=True)
             return
-        user_label = ticket.username or str(ticket.user_id)
+        user_label = _support_user_display(int(ticket.user_id), ticket.username)
         user_id = int(ticket.user_id)
     await _set_support_admin_active_session(admin_id=call.from_user.id, ticket_id=ticket_id, user_id=user_id, source='hold', ref_id=ticket_id)
     await state.clear()
@@ -4217,7 +4250,7 @@ async def admin_support_close(call: CallbackQuery, state: FSMContext, bot: Bot):
             await call.answer('客服对话不存在', show_alert=True)
             return
         user_id = int(ticket.user_id)
-        user_label = ticket.username or str(ticket.user_id)
+        user_label = _support_user_display(int(ticket.user_id), ticket.username)
         ticket.status = 'closed'
         ticket.admin_id = call.from_user.id
         ticket.closed_at = datetime.utcnow()
@@ -4346,7 +4379,7 @@ async def collect_refund_info(message: Message, state: FSMContext, bot: Bot):
         r.payout_info = info_text or '见下方收款码/附件'
         await session.commit()
         title = project_label(project) if project else f'项目：P.{int(r.project_id or 0):03d}'
-        user_label = f'@{message.from_user.username}' if message.from_user.username else str(message.from_user.id)
+        user_label = _support_user_display(int(message.from_user.id), message.from_user.username)
         admin_text = msg.refund_admin_new(
             refund_no=_refund_no(r.id),
             user_label=user_label,

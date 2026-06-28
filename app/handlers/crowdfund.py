@@ -12,12 +12,12 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
-from aiogram.types import CallbackQuery, Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument
-from sqlalchemy import select
+from aiogram.types import CallbackQuery, Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select, delete
 
 from app.config import get_settings
 from app.db.base import SessionLocal
-from app.db.models import CrowdfundProject, ResourceAccess, PaymentOrder, RefundRecord, RiskLog, UserBlacklist, ResourceClaimLog, ResourceClaimProgress, SystemEvent
+from app.db.models import CrowdfundProject, ResourceAccess, PaymentOrder, RefundRecord, RiskLog, UserBlacklist, ResourceClaimLog, ResourceClaimProgress, SystemEvent, ProjectStateHistory, ProfitWithdrawal, FinancialLedger, ContactTicket
 from app.keyboards import (
     admin_project_full_keyboard,
     admin_review_keyboard,
@@ -1975,6 +1975,103 @@ async def user_view_resource_page(call: CallbackQuery, bot: Bot):
         )
     else:
         await _safe_send(bot, call.from_user.id, '发送失败，请稍后重试或联系管理。')
+
+
+
+@router.callback_query(F.data.startswith('admin:projects:list:'))
+async def admin_projects_list(call: CallbackQuery):
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+    page = 0
+    try:
+        page = max(0, int((call.data or '').split(':')[-1]))
+    except Exception:
+        page = 0
+    page_size = 10
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(CrowdfundProject)
+            .order_by(CrowdfundProject.id.desc())
+            .offset(page * page_size)
+            .limit(page_size + 1)
+        )
+        projects = list(res.scalars().all())
+    shown = projects[:page_size]
+    has_next = len(projects) > page_size
+    lines = ['📋 项目列表', '━━━━━━━━━━━━━━', f'第 {page + 1} 页｜按最新项目在前排列']
+    rows: list[list[InlineKeyboardButton]] = []
+    if not shown:
+        lines.append('\n暂无项目。')
+    for p in shown:
+        pid = int(p.id or 0)
+        label = f'P.{pid:03d}｜{p.blogger or "-"}｜{_status_label(p.status)}'
+        lines.append(f'\n{label}\n{(p.description or "-")[:36]}')
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f'admin:project:{pid}')])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text='⬅️ 上一页', callback_data=f'admin:projects:list:{page-1}'))
+    if has_next:
+        nav.append(InlineKeyboardButton(text='下一页 ➡️', callback_data=f'admin:projects:list:{page+1}'))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text='⬅️ 返回常用功能', callback_data='admin:tools')])
+    rows.append([InlineKeyboardButton(text='🏠 返回管理面板', callback_data='admin:dashboard')])
+    await _edit_panel(call, '\n'.join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:delete_project:'))
+async def admin_delete_project_prompt(call: CallbackQuery):
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+    project_id = int((call.data or '').split(':')[-1])
+    async with SessionLocal() as session:
+        p = await session.get(CrowdfundProject, project_id)
+    if not p:
+        await call.answer('项目不存在或已删除', show_alert=True)
+        return
+    text = (
+        '🗑 确认彻底删除项目？\n'
+        '━━━━━━━━━━━━━━\n\n'
+        f'项目：P.{project_id:03d}\n'
+        f'博主：{p.blogger or "-"}\n'
+        f'名称/详情：{(p.description or "-")[:120]}\n\n'
+        '删除后会从数据库移除这个项目及相关车票、退款、资源权限、账本关联、客服关联和状态历史。\n'
+        '这个操作不可恢复。'
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✅ 确认彻底删除', callback_data=f'admin:delete_project_confirm:{project_id}')],
+        [InlineKeyboardButton(text='⬅️ 返回项目卡片', callback_data=f'admin:project:{project_id}')],
+        [InlineKeyboardButton(text='🏠 返回管理面板', callback_data='admin:dashboard')],
+    ])
+    await _edit_panel(call, text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:delete_project_confirm:'))
+async def admin_delete_project_confirm(call: CallbackQuery):
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+    project_id = int((call.data or '').split(':')[-1])
+    async with SessionLocal() as session:
+        p = await session.get(CrowdfundProject, project_id)
+        if not p:
+            await call.answer('项目不存在或已删除', show_alert=True)
+            return
+        blogger = p.blogger or '-'
+        for model in (ResourceAccess, ResourceClaimProgress, ResourceClaimLog, ProfitWithdrawal, RefundRecord, FinancialLedger, SystemEvent, ProjectStateHistory, RiskLog, ContactTicket):
+            await session.execute(delete(model).where(model.project_id == project_id))
+        await session.execute(delete(PaymentOrder).where(PaymentOrder.project_id == project_id))
+        await session.delete(p)
+        await session.commit()
+    await _edit_panel(call, f'✅ 已彻底删除项目 P.{project_id:03d}\n博主：{blogger}', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📋 返回项目列表', callback_data='admin:projects:list:0')],
+        [InlineKeyboardButton(text='🏠 返回管理面板', callback_data='admin:dashboard')],
+    ]))
+    await call.answer('已删除项目')
 
 @router.callback_query(F.data.startswith('admin:project:'))
 async def admin_project_detail(call: CallbackQuery):

@@ -615,7 +615,7 @@ def refund_detail(*, refund_no: str, project_no: str, blogger: str, description:
         f'描述：{description}\n\n'
         f'💰 退款金额：{amount:g} 元\n'
         f'📌 当前状态：{status}\n'
-        f'🔎 系统单号：{system_no}\n'
+        f'🔎 系统单号：<code>{system_no}</code>\n'
         f'📮 收款资料：{payout_line}\n'
         f'🕒 创建时间：{created_at}{refunded_line}\n'
         f'{LINE}\n'
@@ -712,13 +712,13 @@ def refund_admin_new(*, refund_no: str, user_label: str, user_id: int, amount: f
         f'{LINE}\n'
         '📌 状态：待确认退款\n'
         f'👤 用户：{user_label}\n'
-        f'🆔 用户ID：{user_id}\n\n'
+        f'🆔 用户ID：<code>{user_id}</code>\n\n'
         f'项目：{project_no}\n'
         f'博主：{blogger}\n'
         f'描述：{description}\n\n'
         f'🎫 原车票：{payment_label}\n'
-        f'🔎 系统单号：{system_no}\n'
-        f'💳 支付单号：{pay_no}\n'
+        f'🔎 系统单号：<code>{system_no}</code>\n'
+        f'💳 支付单号：<code>{pay_no}</code>\n'
         f'💰 应退金额：{amount:g} 元\n\n'
         '📮 用户收款资料\n'
         f'{payout_info}\n\n'
@@ -747,7 +747,7 @@ def refund_done_admin(*, refund_no: str, user_id: int, amount: float, notify_err
         '✅ 退款小票已完成\n'
         f'{LINE}\n'
         f'退款单：{refund_no}\n'
-        f'用户ID：{user_id}\n'
+        f'用户ID：<code>{user_id}</code>\n'
         f'退款金额：{amount:g} 元\n'
         f'{notify_line}\n\n'
         '状态已更新为退款完成，资金账本已记一笔退款支出。'
@@ -768,10 +768,7 @@ def admin_refund_list_header(total: int) -> str:
     return (
         '🧾 退款小票待办\n'
         f'{LINE}\n\n'
-        f'当前待处理：{total} 张\n\n'
-        '这里会显示还没提交资料、等待管理员确认的退款小票。\n'
-        '如果状态是「还没申请退款」，说明用户还没发收款资料；\n'
-        '如果状态是「申请退款审核中」，就可以核对资料后确认退款。\n'
+        f'当前待处理：{total} 张\n'
     )
 
 
@@ -779,9 +776,9 @@ def admin_refund_list_item(*, refund_no: str, user_id: int, amount: float, payme
     order_no = system_no or pay_no or payment_label or refund_no
     return (
         f'\n💸 {refund_no}\n'
-        f'用户：{user_id}\n'
+        f'用户：<code>{user_id}</code>\n'
         f'金额：{amount:g} 元\n'
-        f'订单号：{order_no}'
+        f'订单号：<code>{order_no}</code>'
     )
 
 def creator_project_detail(*, project_no: str, blogger: str, description: str, progress_text: str, original_price: float, seat_price: float, extra_count: int, batches: int) -> str:
@@ -1361,14 +1358,14 @@ def refund_detail(*, refund_no: str, project_no: str, blogger: str, description:
     order_no = system_no or payment_label or refund_no
     return _panel(
         '💸 退款小票',
-        _body(f"用户：{user_id or '-'}", f'金额：{amount:g} 元', f'订单号：{order_no}'),
+        _body(f"用户：{user_id or '-'}", f'金额：{amount:g} 元', f'订单号：<code>{order_no}</code>'),
     )
 
 
 def refund_apply_prompt(*, refund_no: str, project_no: str, blogger: str, description: str, amount: float, payment_label: str, system_no: str) -> str:
     return _panel(
         '💸 退款申请｜小掌柜退款台',
-        _body(f'退款单：{refund_no}', f'项目：{project_no}', f'博主：{blogger}', f'描述：{description}', f'💰 退款金额：{amount:g} 元', f'🎫 原车票：{payment_label}', f'🔎 系统单号：{system_no}', '请像聊天一样发送你的退款收款资料：\n1️⃣ TRX / USDT 地址\n2️⃣ 支付宝账号 / 支付宝收款码\n3️⃣ 其他可收款方式', '支持内容：\n📝 文字账号\n🖼 收款码截图\n📎 文件凭证'),
+        _body(f'退款单：{refund_no}', f'项目：{project_no}', f'博主：{blogger}', f'描述：{description}', f'💰 退款金额：{amount:g} 元', f'🎫 原车票：{payment_label}', f'🔎 系统单号：<code>{system_no}</code>', '请像聊天一样发送你的退款收款资料：\n1️⃣ TRX / USDT 地址\n2️⃣ 支付宝账号 / 支付宝收款码\n3️⃣ 其他可收款方式', '支持内容：\n📝 文字账号\n🖼 收款码截图\n📎 文件凭证'),
         '提交后，小掌柜会把这张退款小票送到审核群，\n管理员确认打款后，你会收到完成通知 🎀',
     )
 
@@ -1396,7 +1393,7 @@ def refund_user_submitted(refund_no: str) -> str:
 def refund_admin_new(*, refund_no: str, user_label: str, user_id: int, amount: float, payment_label: str, system_no: str, pay_no: str, project_no: str, blogger: str, description: str, payout_info: str) -> str:
     return _panel(
         f'💸 新退款小票 {refund_no}',
-        _body('📌 状态：待确认退款', f'👤 用户：{user_label}', f'🆔 用户ID：{user_id}', f'项目：{project_no}', f'博主：{blogger}', f'描述：{description}', f'🎫 原车票：{payment_label}', f'🔎 系统单号：{system_no}', f'💳 支付单号：{pay_no}', f'💰 应退金额：{amount:g} 元', '📮 用户收款资料', payout_info),
+        _body('📌 状态：待确认退款', f'👤 用户：{user_label}', f'🆔 用户ID：<code>{user_id}</code>', f'项目：{project_no}', f'博主：{blogger}', f'描述：{description}', f'🎫 原车票：{payment_label}', f'🔎 系统单号：<code>{system_no}</code>', f'💳 支付单号：<code>{pay_no}</code>', f'💰 应退金额：{amount:g} 元', '📮 用户收款资料', payout_info),
         '小掌柜提示：确认已经线下/原路退款后，再点击「✅ 确认已退款」。\n确认后会写入资金账本，并通知用户退款完成。',
     )
 
@@ -1415,7 +1412,7 @@ def admin_refund_empty() -> str:
 
 
 def admin_refund_list_header(total: int) -> str:
-    return _panel('🧾 退款小票待办', f'当前待处理：{total} 张', '这里会显示还没提交资料、等待管理员确认的退款小票。\n如果状态是「还没申请退款」，说明用户还没发收款资料；\n如果状态是「申请退款审核中」，就可以核对资料后确认退款。')
+    return _panel('🧾 退款小票待办', f'当前待处理：{total} 张')
 
 
 def creator_project_detail(*, project_no: str, blogger: str, description: str, progress_text: str, original_price: float, seat_price: float, extra_count: int, batches: int) -> str:
@@ -1457,7 +1454,7 @@ def support_open() -> str:
 def support_admin_new(*, ticket_no: str, user_label: str, user_id: int, context_text: str, user_message: str) -> str:
     return _panel(
         f'💬 新客服小纸条 {ticket_no}',
-        _body('📌 状态：待回复', f'👤 用户：{user_label}', f'🆔 用户ID：{user_id}', context_text or '来源页面：通用客服入口', '🧸 对话记录', f'用户：{user_message}'),
+        _body('📌 状态：待回复', f'👤 用户：{user_label}', f'🆔 用户ID：<code>{user_id}</code>', context_text or '来源页面：通用客服入口', '🧸 对话记录', f'用户：{user_message}'),
         '小掌柜提示：点「回复用户」后，可发送文字、图片、视频、文件或语音。\n发送成功后，本群会显示“已送达用户”回执。',
     )
 
@@ -1710,13 +1707,13 @@ def refund_admin_new(*, refund_no: str, user_label: str, user_id: int, amount: f
             '📌 类型：退款业务单（审核群处理，不是客服咨询）',
             '📌 状态：待确认退款',
             f'👤 用户：{user_label}',
-            f'🆔 用户ID：{user_id}',
+            f'🆔 用户ID：<code>{user_id}</code>',
             f'项目：{project_no}',
             f'博主：{blogger}',
             f'描述：{description}',
             f'🎫 原车票：{payment_label}',
-            f'🔎 系统单号：{system_no}',
-            f'💳 支付单号：{pay_no}',
+            f'🔎 系统单号：<code>{system_no}</code>',
+            f'💳 支付单号：<code>{pay_no}</code>',
             f'💰 应退金额：{amount:g} 元',
             '📮 用户收款资料',
             payout_info,
@@ -1824,13 +1821,13 @@ def refund_admin_new(*, refund_no: str, user_label: str, user_id: int, amount: f
             '📌 类型：退款业务单（审核群处理，不是客服咨询）',
             '📌 状态：待确认退款',
             f'👤 用户：{user_label}',
-            f'🆔 用户ID：{user_id}',
+            f'🆔 用户ID：<code>{user_id}</code>',
             f'项目：{project_no}',
             f'博主：{blogger}',
             f'描述：{description}',
             f'🎫 原车票：{payment_label}',
-            f'🔎 系统单号：{system_no}',
-            f'💳 支付单号：{pay_no}',
+            f'🔎 系统单号：<code>{system_no}</code>',
+            f'💳 支付单号：<code>{pay_no}</code>',
             f'💰 应退金额：{amount:g} 元',
             '📮 用户收款资料',
             payout_info,
@@ -1871,8 +1868,9 @@ def support_open() -> str:
 
 def support_user_confirm(ticket_no: str) -> str:
     return (
-        f'✅ 已发送给小掌柜（{ticket_no}）\n'
-        '可以继续直接补充消息；小掌柜回复会出现在当前机器人私聊里。'
+        '你还可以继续补充文字、图片，\n'
+        '有什么不明白的，直接丢过来就好，\n'
+        '小掌柜看到后会第一时间在当前私聊里回复你。'
     )
 
 
@@ -1902,42 +1900,30 @@ def support_private_user_forward_failed(*, error: object) -> str:
 
 
 def support_private_admin_incoming_header(*, ticket_no: str, user_label: str, user_id: int, context_text: str, message_kind: str) -> str:
-    return (
-        f'💬 客服对话 {ticket_no}\n'
-        f'👤 用户：{user_label}（{user_id}）\n'
-        f'类型：{message_kind}\n'
-        f'{context_text or "来源页面：通用客服入口"}'
-    )
+    return context_text or '来源页面：通用客服入口'
 
 
 def support_private_admin_text(*, header: str, user_message: str) -> str:
-    return (
-        f'{header}\n\n'
-        f'用户说：\n{user_message or "-"}\n\n'
-        '回复这条消息即可发回给该用户；点「保持这个对话」后可连续直接输入回复。'
-    )
+    body = (user_message or '-').strip()
+    return f'{header}\n\n{body}'
 
 
 def support_private_admin_caption(*, header: str, user_caption: str | None = None) -> str:
-    caption = f'{header}\n\n'
+    caption = f'{header}'
     if user_caption:
-        caption += f'用户说明：\n{user_caption}\n\n'
-    caption += '回复这条消息即可发回给该用户。'
+        caption += f'\n\n{user_caption}'
     return caption
 
 
 def support_private_admin_hold(*, user_label: str, ticket_no: str) -> str:
     return (
         f'📌 已保持对话 {ticket_no}\n'
-        f'当前回复对象：{user_label}\n\n'
-        '现在你直接发送文字、图片、文件、视频或语音，都会发给这个用户。\n'
-        '如果有别的用户进来，直接回复那位用户的消息，就会自动切换过去。'
+        f'当前回复对象：{user_label}'
     )
 
 
 def support_private_admin_sent(*, user_label: str, ticket_no: str, delivery_method: str | None = None) -> str:
-    method_line = f'｜{delivery_method}' if delivery_method else ''
-    return f'✅ 已发送给 {user_label}（{ticket_no}）{method_line}'
+    return f'✅ 已发送给用户 {user_label}'
 
 
 def support_private_admin_failed(*, user_label: str, ticket_no: str, error: object) -> str:

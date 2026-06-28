@@ -215,6 +215,7 @@ def admin_project_detail_keyboard(project_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         # 高风险按钮放到最顶上，避免夹在常用按钮中误触。
         [InlineKeyboardButton(text='❌ 手动取消项目', callback_data=f'admin:cancel_project:{project_id}')],
+        [InlineKeyboardButton(text='🗑 彻底删除项目', callback_data=f'admin:delete_project:{project_id}')],
         [InlineKeyboardButton(text='🔍 打开项目卡片', callback_data=f'admin:project:{project_id}')],
         [InlineKeyboardButton(text='✅ 已支付用户', callback_data=f'admin:paid_users:{project_id}')],
         [InlineKeyboardButton(text='💳 待付车票', callback_data=f'admin:pending_orders:{project_id}')],
@@ -613,7 +614,7 @@ def admin_search_results_keyboard(projects=None, orders=None, refunds=None, tick
 
 def admin_tools_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='🔎 搜索', callback_data='admin:tool:search'), InlineKeyboardButton(text='🧾 查项目闭环', callback_data='admin:tool:audit')],
+        [InlineKeyboardButton(text='📋 项目列表', callback_data='admin:projects:list:0'), InlineKeyboardButton(text='🧾 查项目闭环', callback_data='admin:tool:audit')],
         [InlineKeyboardButton(text='🔧 同步项目', callback_data='admin:tool:sync'), InlineKeyboardButton(text='🔁 迁移旧车用户', callback_data='admin:tool:migrate')],
         [InlineKeyboardButton(text='✅ 绑定待付车票', callback_data='admin:tool:bind'), InlineKeyboardButton(text='➕ 补已付订单', callback_data='admin:tool:add_order')],
         [InlineKeyboardButton(text='👤 车票改用户', callback_data='admin:tool:rebind_user'), InlineKeyboardButton(text='↔️ 转移付款车票', callback_data='admin:tool:move_bind')],
