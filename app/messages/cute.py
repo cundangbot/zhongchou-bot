@@ -594,7 +594,7 @@ def participated_detail(*, ticket_label: str, project_no: str, blogger: str, des
     )
 
 
-def refund_detail(*, refund_no: str, project_no: str, blogger: str, description: str, amount: float, status: str, created_at: str, payment_label: str = '-', system_no: str = '-', payout_info: str | None = None, refunded_at: str | None = None) -> str:
+def refund_detail(*, refund_no: str, project_no: str, blogger: str, description: str, amount: float, status: str, created_at: str, payment_label: str = '-', system_no: str = '-', payout_info: str | None = None, refunded_at: str | None = None, user_id: int | str | None = None) -> str:
     step_map = {
         '还没申请退款': '下一步：请点击「💸 申请退款」，把收款资料发给小掌柜。',
         '待申请': '下一步：请点击「💸 申请退款」，把收款资料发给小掌柜。',
@@ -776,17 +776,12 @@ def admin_refund_list_header(total: int) -> str:
 
 
 def admin_refund_list_item(*, refund_no: str, user_id: int, amount: float, payment_label: str, system_no: str, pay_no: str, project_no: str, blogger: str, description: str, status: str) -> str:
+    order_no = system_no or pay_no or payment_label or refund_no
     return (
         f'\n💸 {refund_no}\n'
         f'用户：{user_id}\n'
         f'金额：{amount:g} 元\n'
-        f'原车票：{payment_label}\n'
-        f'系统单号：{system_no}\n'
-        f'支付单号：{pay_no}\n'
-        f'项目：{project_no}\n'
-        f'博主：{blogger}\n'
-        f'描述：{description}\n'
-        f'状态：{status}'
+        f'订单号：{order_no}'
     )
 
 def creator_project_detail(*, project_no: str, blogger: str, description: str, progress_text: str, original_price: float, seat_price: float, extra_count: int, batches: int) -> str:
@@ -1362,20 +1357,11 @@ def participated_detail(*, ticket_label: str, project_no: str, blogger: str, des
     )
 
 
-def refund_detail(*, refund_no: str, project_no: str, blogger: str, description: str, amount: float, status: str, created_at: str, payment_label: str = '-', system_no: str = '-', payout_info: str | None = None, refunded_at: str | None = None) -> str:
-    step_map = {
-        '还没申请退款': '下一步：请点击「💸 申请退款」，把收款资料发给小掌柜。',
-        '待申请': '下一步：请点击「💸 申请退款」，把收款资料发给小掌柜。',
-        '申请退款审核中': '小掌柜已经收到资料，正在等管理员确认退款。',
-        '退款完成': '这张退款小票已经处理完成啦，可以安心收好记录。',
-        '退款被驳回': '这张退款小票暂时被驳回，可以联系小掌柜核对原因。',
-    }
-    next_step = step_map.get(status, '小掌柜会继续盯着这张退款小票，有进度会及时更新。')
-    refunded_line = f'✅ 完成时间：{refunded_at}' if refunded_at else None
+def refund_detail(*, refund_no: str, project_no: str, blogger: str, description: str, amount: float, status: str, created_at: str, payment_label: str = '-', system_no: str = '-', payout_info: str | None = None, refunded_at: str | None = None, user_id: int | str | None = None) -> str:
+    order_no = system_no or payment_label or refund_no
     return _panel(
-        '💸 退款小票卡片',
-        _body(f'🧾 退款编号：{refund_no}', f'🎫 原车票：{payment_label}', f'项目：{project_no}', f'博主：{blogger}', f'描述：{description}', f'💰 退款金额：{amount:g} 元', f'📌 当前状态：{status}', f'🔎 系统单号：{system_no}', f'📮 收款资料：{payout_info or "暂未提交"}', f'🕒 创建时间：{created_at}', refunded_line),
-        f'小掌柜提醒：{next_step}\n\n退款期间如果资料填错、收款码过期，可以点「联系小掌柜」补充说明，不用重新解释项目背景～',
+        '💸 退款小票',
+        _body(f'用户：{user_id or '-'}', f'金额：{amount:g} 元', f'订单号：{order_no}'),
     )
 
 

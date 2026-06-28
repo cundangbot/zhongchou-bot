@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import asyncio
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart, Command, CommandObject
@@ -804,7 +805,7 @@ async def _update_support_card_after_reply(
         base_text
         + '\n\n✅ 状态：已回复用户'
         + f'\n回复管理员：{admin_name}'
-        + f'\n回复时间：{answered_at:%Y-%m-%d %H:%M:%S}'
+        + f'\n回复时间：{_fmt_dt(answered_at)}'
     )
     await bot.edit_message_text(
         chat_id=int(source_chat_id),
@@ -916,8 +917,26 @@ async def _send_support_reply_core(
             await state.clear()
 
 
+BEIJING_TZ = ZoneInfo('Asia/Shanghai')
+
+
+def _to_beijing(dt):
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        # 数据库里大多数时间是 UTC naive，这里统一按 UTC 转北京时间显示。
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BEIJING_TZ)
+
+
+def _beijing_today_start_utc_naive() -> datetime:
+    start_bj = datetime.now(BEIJING_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_bj.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _fmt_dt(dt) -> str:
-    return dt.strftime('%Y-%m-%d %H:%M') if dt else '-'
+    bj = _to_beijing(dt)
+    return bj.strftime('%Y-%m-%d %H:%M') if bj else '-'
 
 
 def _project_lines(project: CrowdfundProject | None = None, blogger: str | None = None, description: str | None = None, prefix: str = '项目') -> str:
@@ -1509,6 +1528,7 @@ async def refund_order_detail(call: CallbackQuery):
             system_no=o.faka_system_no if o and o.faka_system_no else '-',
             payout_info=r.payout_info,
             refunded_at=_fmt_dt(r.refunded_at) if r.refunded_at else None,
+            user_id=r.user_id,
         )
     await _edit_panel(call, text, reply_markup=refund_detail_keyboard(refund_id, can_apply=can_apply, relaunch_project_id=(p.id if p and p.creator_id == call.from_user.id and _can_relaunch_project(p) else None)))
     await call.answer()
@@ -1676,7 +1696,7 @@ async def completed_orders(call: CallbackQuery):
         lines = ['✅ 你的已完成订单：']
         for o in orders[:30]:
             target = await _target_text(session, o)
-            paid_at = o.paid_at.strftime('%Y-%m-%d %H:%M') if o.paid_at else '-'
+            paid_at = _fmt_dt(o.paid_at)
             lines.append(
                 f'\n{_ticket_no(o.id)}｜{_order_type_name(o.order_type)}\n'
                 f'{target}\n'
@@ -1765,10 +1785,17 @@ async def submit_order_prompt(call: CallbackQuery, state: FSMContext):
 async def receive_system_no_for_order(message: Message, state: FSMContext, bot: Bot):
     from app.services.payments import confirm_order_by_system_no
     data = await state.get_data()
-    order_id = int(data.get('pay_order_id'))
+    try:
+        order_id = int(data.get('pay_order_id') or 0)
+    except (TypeError, ValueError):
+        order_id = 0
+    if order_id <= 0:
+        await state.clear()
+        await message.answer('这个验票输入框已经失效了，请回到“我的众筹”重新点“我已支付，去验票”。', reply_markup=order_center_keyboard())
+        return
     system_no = (message.text or '').strip().upper()
     if not system_no:
-        await message.answer(msg.system_no_empty())
+        await message.answer(msg.system_no_empty() + '\n\n可以继续发送订单号，不需要重新打开查询。')
         return
     await message.answer(msg.verifying(system_no))
     try:
@@ -1813,10 +1840,18 @@ async def receive_system_no_for_order(message: Message, state: FSMContext, bot: 
         if ok:
             await message.answer(msg.verify_success(reason), reply_markup=main_menu())
         else:
-            await message.answer(msg.verify_failed(friendly_verify_failure(reason)), reply_markup=payment_error_keyboard(order_id))
+            # 保持 PaymentSubmit 状态和 pay_order_id，不因输错两三次就掉线。
+            await state.update_data(pay_order_id=order_id)
+            await state.set_state(PaymentSubmit.system_no)
+            await message.answer(
+                msg.verify_failed(friendly_verify_failure(reason)) + '\n\n你可以继续发送正确订单号，我会继续查，不用重新打开查询。',
+                reply_markup=payment_error_keyboard(order_id),
+            )
     except Exception:
+        await state.update_data(pay_order_id=order_id)
+        await state.set_state(PaymentSubmit.system_no)
         await message.answer(
-            msg.verify_service_error(),
+            msg.verify_service_error() + '\n\n查询状态已保留，可以继续发送订单号再试。',
             reply_markup=verify_failure_keyboard(),
         )
 
@@ -2199,7 +2234,7 @@ async def creator_income_detail(call: CallbackQuery):
                     'paid': '已打款',
                     'rejected': '已驳回',
                 }.get(w.status, w.status)
-                lines.append(f'{_payout_no(w.id)}｜{label}｜{w.creator_amount:g} 元｜{w.created_at:%m-%d %H:%M}')
+                lines.append(f'{_payout_no(w.id)}｜{label}｜{w.creator_amount:g} 元｜{_fmt_dt(w.created_at)}')
         await _edit_panel(call, '\n'.join(lines), reply_markup=withdraw_project_keyboard(p.id))
     await call.answer()
 
@@ -3187,8 +3222,7 @@ async def _send_admin_dashboard(message: Message):
     if message.from_user.id not in settings.admin_id_list:
         await message.answer('这个小掌柜面板只有管理员可以打开喔～')
         return
-    from datetime import datetime, timedelta, time
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = _beijing_today_start_utc_naive()
     async with SessionLocal() as session:
         def scalar(q):
             return session.execute(q)
@@ -3288,9 +3322,49 @@ async def admin_dashboard_list(call: CallbackQuery):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
     list_type = call.data.split(':')[-1]
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = _beijing_today_start_utc_naive()
     async with SessionLocal() as session:
-        if list_type == 'pending_review':
+        if list_type == 'todos':
+            pending = list((await session.execute(
+                select(CrowdfundProject).where(
+                    CrowdfundProject.status == 'pending_review',
+                    CrowdfundProject.created_at >= today_start,
+                ).order_by(CrowdfundProject.created_at.desc()).limit(8)
+            )).scalars().all())
+            uploads = list((await session.execute(
+                select(CrowdfundProject).where(
+                    CrowdfundProject.status.in_(['waiting_creator_resource','waiting_buy_info','platform_purchasing','admin_uploading','resource_uploading','resource_rejected','resource_review']),
+                    CrowdfundProject.created_at >= today_start,
+                ).order_by(CrowdfundProject.created_at.desc()).limit(8)
+            )).scalars().all())
+            payouts = list((await session.execute(
+                select(ProfitWithdrawal).where(
+                    ProfitWithdrawal.status == 'pending_admin',
+                    ProfitWithdrawal.created_at >= today_start,
+                ).order_by(ProfitWithdrawal.created_at.desc()).limit(8)
+            )).scalars().all())
+            lines = ['🧺 今日待处理（北京时间）']
+            rows = []
+            lines.append(f'\n待审核车车：{len(pending)} 个')
+            for p in pending[:5]:
+                lines.append(f'P.{int(p.id or 0):03d}｜{p.blogger}｜{_status_label(p.status)}')
+                rows.append([InlineKeyboardButton(text=f'🧺 审核 P.{int(p.id or 0):03d}', callback_data=f'admin:project:{p.id}')])
+            lines.append(f'\n待补资源：{len(uploads)} 个')
+            for p in uploads[:5]:
+                lines.append(f'P.{int(p.id or 0):03d}｜{p.blogger}｜{_status_label(p.status)}')
+                rows.append([InlineKeyboardButton(text=f'📤 资源 P.{int(p.id or 0):03d}', callback_data=f'admin:project:{p.id}')])
+            lines.append(f'\n报销/提现：{len(payouts)} 个')
+            for w in payouts[:5]:
+                p = await session.get(CrowdfundProject, w.project_id)
+                label = '报销' if (getattr(w, 'payout_type', 'profit') or 'profit') == 'reimbursement' else '提现'
+                lines.append(f'{label}｜{_payout_no(w.id)}｜{w.creator_amount:g} 元｜P.{int(w.project_id or 0):03d}｜{p.blogger if p else "-"}')
+                rows.append([InlineKeyboardButton(text=f'✅ 确认{label} {_payout_no(w.id)}', callback_data=f'admin:withdraw_paid:{w.id}')])
+            if len(rows) == 0:
+                lines.append('\n今天暂时没有待处理事项。')
+            rows.append([InlineKeyboardButton(text='⬅️ 返回管理面板', callback_data='admin:dashboard')])
+            text = '\n'.join(lines)
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        elif list_type == 'pending_review':
             res = await session.execute(select(CrowdfundProject).where(CrowdfundProject.status == 'pending_review', CrowdfundProject.created_at >= today_start).order_by(CrowdfundProject.created_at.desc()).limit(10))
             projects = list(res.scalars().all())
             if not projects:
@@ -3390,7 +3464,7 @@ async def admin_dashboard_list(call: CallbackQuery):
                     user_label = t.username or str(t.user_id)
                     status_label = {'open': '待回复', 'answered': '已回复', 'closed': '已关闭'}.get(t.status, t.status)
                     body = (t.user_message or '非文本消息')[:120]
-                    lines.append(f'\n工单：{_support_no(t.id)}｜{status_label}\n用户：{user_label}（{t.user_id}）\n时间：{t.created_at:%Y-%m-%d %H:%M}\n内容：{body}')
+                    lines.append(f'\n工单：{_support_no(t.id)}｜{status_label}\n用户：{user_label}（{t.user_id}）\n时间：{_fmt_dt(t.created_at)}\n内容：{body}')
                     rows.append([InlineKeyboardButton(text=f'💬 回复用户 {_support_no(t.id)}', callback_data=f'admin:support_reply:{t.id}')])
                     rows.append([InlineKeyboardButton(text=f'✅ 关闭 {_support_no(t.id)}', callback_data=f'admin:support_close:{t.id}')])
                 rows.append([InlineKeyboardButton(text='⬅️ 返回待办中心', callback_data='admin:dashboard')])
@@ -3412,10 +3486,13 @@ async def admin_dashboard_list(call: CallbackQuery):
                 sign = '+' if item.direction == 'income' else ('-' if item.direction == 'expense' else '±')
                 ledger_project = await session.get(CrowdfundProject, item.project_id) if item.project_id else None
                 project_display = project_no(ledger_project) if ledger_project else (f'P.{int(item.project_id):03d}' if item.project_id else '-')
+                blogger = ledger_project.blogger if ledger_project else '-'
                 lines.append(
-                    f'\n{sign}{item.amount:g} 元｜{item.category}｜{item.payment_source}'
-                    f'\n项目：{project_display}'
-                    f'｜用户：{item.user_id or "-"}｜{_fmt_dt(item.created_at)}'
+                    f'\n金额：{sign}{item.amount:g} 元'
+                    f'｜项目：{project_display}'
+                    f'｜博主：{blogger}'
+                    f'｜用户：{item.user_id or "-"}'
+                    f'｜时间：{_fmt_dt(item.created_at)}'
                 )
             text = '\n'.join(lines)
             markup = admin_dashboard_keyboard()
@@ -3473,7 +3550,7 @@ async def admin_dashboard_list(call: CallbackQuery):
             else:
                 lines = ['⚠️ 今日风控记录']
                 for r in risks:
-                    lines.append(f'\n用户：{r.user_id}\n提交系统单号：{r.submitted_no or "-"}\n原因：{r.reason}\n时间：{r.created_at:%Y-%m-%d %H:%M}')
+                    lines.append(f'\n用户：{r.user_id}\n提交系统单号：{r.submitted_no or "-"}\n原因：{r.reason}\n时间：{_fmt_dt(r.created_at)}')
                 text = '\n'.join(lines)
             markup = admin_dashboard_keyboard()
         else:
@@ -3488,8 +3565,7 @@ async def admin_dashboard_callback(call: CallbackQuery):
     if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
         await call.answer('只能在审核群由管理员使用', show_alert=True)
         return
-    from datetime import datetime, timedelta
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = _beijing_today_start_utc_naive()
     async with SessionLocal() as session:
         new_projects = (await session.execute(select(func.count()).select_from(CrowdfundProject).where(CrowdfundProject.created_at >= today_start))).scalar() or 0
         paid_orders = (await session.execute(

@@ -5,7 +5,8 @@ import json
 import re
 import random
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -61,6 +62,15 @@ from app.services.project_state import state_value, InvalidProjectTransition
 
 router = Router()
 settings = get_settings()
+
+BEIJING_TZ = ZoneInfo('Asia/Shanghai')
+
+def _fmt_dt(dt) -> str:
+    if not dt:
+        return '-'
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')
 
 
 def _panel_safe_text(text: str, limit: int = 3900) -> str:
@@ -2060,9 +2070,23 @@ async def admin_pending_orders(call: CallbackQuery):
         orders = list(res.scalars().all())
     lines = [f'🕒 待支付订单｜{project_title(p) if p else project_id}']
     for o in orders[:80]:
-        lines.append(f'{_ticket_no(o.id)}｜{o.username or o.user_id}｜{o.expected_amount:g} 元｜{o.created_at:%m-%d %H:%M}')
+        lines.append(f'{_ticket_no(o.id)}｜{o.username or o.user_id}｜{o.expected_amount:g} 元｜{_fmt_dt(o.created_at)}')
     await _edit_panel(call, '\n'.join(lines) if orders else '暂无待支付订单。', reply_markup=admin_project_detail_keyboard(project_id))
     await call.answer()
+
+
+def _admin_resource_manage_keyboard(project_id: int, has_items: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text='➕ 上传/补充资源', callback_data=f'admin:upload_resource:{project_id}')],
+        [InlineKeyboardButton(text='🔁 清空并重新上传', callback_data=f'admin:reset_resource:{project_id}')],
+    ]
+    if has_items:
+        rows.append([InlineKeyboardButton(text='🗑 删除最新一条资源', callback_data=f'admin:delete_resource_last:{project_id}')])
+        rows.append([InlineKeyboardButton(text='🧹 清空全部资源', callback_data=f'admin:clear_resources:{project_id}')])
+        rows.append([InlineKeyboardButton(text='✅ 审核通过并发布资源', callback_data=f'admin:publish_resource:{project_id}')])
+    rows.append([InlineKeyboardButton(text='⬅️ 返回项目卡片', callback_data=f'admin:project:{project_id}')])
+    rows.append([InlineKeyboardButton(text='🏠 返回管理面板', callback_data='admin:dashboard')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data.startswith('admin:view_resources:'))
@@ -2077,10 +2101,55 @@ async def admin_view_resources(call: CallbackQuery, bot: Bot):
             await call.answer('项目不存在', show_alert=True)
             return
         items = _load_resource_items(p)
-    if not items:
-        await _edit_panel(call, '该项目还没有上传资源。', reply_markup=admin_project_detail_keyboard(project_id))
-    else:
-        await _send_resource_preview_to_admin(bot, p, items)
+    lines = [
+        '📦 查看/修改上传资源',
+        project_label(p),
+        f'当前资源：{_resource_type_counts(items)}',
+        '',
+        '为避免误触，点击“查看上传资源”不会直接把资源刷到群里。',
+        '需要调整时，可在这里追加、清空重传、删除最新一条，或审核通过并发布。',
+    ]
+    await _edit_panel(call, '\n'.join(lines), reply_markup=_admin_resource_manage_keyboard(project_id, bool(items)))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:delete_resource_last:'))
+async def admin_delete_resource_last(call: CallbackQuery, bot: Bot):
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+    project_id = int(call.data.split(':')[-1])
+    async with SessionLocal() as session:
+        p = await session.get(CrowdfundProject, project_id)
+        if not p:
+            await call.answer('项目不存在', show_alert=True)
+            return
+        items = _load_resource_items(p)
+        if not items:
+            await call.answer('已经没有资源可删', show_alert=True)
+            return
+        removed = items.pop()
+        _save_resource_items(p, items)
+        await session.commit()
+        count_text = _resource_type_counts(items)
+    await _edit_panel(call, f'✅ 已删除最新一条资源。\n当前资源：{count_text}', reply_markup=_admin_resource_manage_keyboard(project_id, bool(items)))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:clear_resources:'))
+async def admin_clear_resources(call: CallbackQuery, bot: Bot):
+    if call.from_user.id not in settings.admin_id_list:
+        await call.answer('无权限', show_alert=True)
+        return
+    project_id = int(call.data.split(':')[-1])
+    async with SessionLocal() as session:
+        p = await session.get(CrowdfundProject, project_id)
+        if not p:
+            await call.answer('项目不存在', show_alert=True)
+            return
+        p.resource_text = '[]'
+        await session.commit()
+    await _edit_panel(call, '✅ 已清空该项目全部资源，可点击“上传/补充资源”重新添加。', reply_markup=_admin_resource_manage_keyboard(project_id, False))
     await call.answer()
 
 

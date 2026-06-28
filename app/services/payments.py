@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import re
 from decimal import Decimal, InvalidOperation
 from sqlalchemy import select, func, case, or_, delete
@@ -14,6 +15,10 @@ from app.services.idempotency import begin_operation, finish_operation
 from app.services.system_events import set_metric
 
 settings = get_settings()
+BEIJING_TZ = ZoneInfo('Asia/Shanghai')
+
+def now_beijing_str() -> str:
+    return datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def _no(value: int | None) -> str:
@@ -253,7 +258,7 @@ async def confirm_order_by_system_no(session: AsyncSession, user_id: int, system
         result = FakaOrderResult(
             pay_channel='SEED', system_no=f'SEED-P{int(local.project_id or 0):03d}-T{local.id:03d}',
             pay_no=f'SEEDPAY-{local.id:03d}', pay_method='管理员冷启动暗号验票', status='已支付',
-            amount=float(local.expected_amount), order_time=datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            amount=float(local.expected_amount), order_time=now_beijing_str(),
             product_name='冷启动填充订单', buyer_name=local.username or str(user_id), buyer_user_id=int(user_id),
             order_bot=settings.EXPECTED_FAKA_ORDER_BOT, raw='冷启动暗号验票通过',
         )
@@ -265,7 +270,7 @@ async def confirm_order_by_system_no(session: AsyncSession, user_id: int, system
         result = FakaOrderResult(
             pay_channel='TEST', system_no=f'{system_no}-{local.id}', pay_no=f'TESTPAY-{local.id}',
             pay_method='内部验收支付', status='已支付', amount=fake_amount,
-            order_time=datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), product_name='内部验收订单',
+            order_time=now_beijing_str(), product_name='内部验收订单',
             buyer_name=local.username or str(user_id), buyer_user_id=int(user_id),
             order_bot=settings.EXPECTED_FAKA_ORDER_BOT, raw='内部验收支付确认',
         )

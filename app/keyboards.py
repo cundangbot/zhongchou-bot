@@ -204,26 +204,28 @@ def creator_buyinfo_keyboard(project_id: int) -> InlineKeyboardMarkup:
 
 def admin_project_full_keyboard(project_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='📤 上传资源', callback_data=f'admin:upload_resource:{project_id}')],
+        [InlineKeyboardButton(text='❌ 手动取消项目', callback_data=f'admin:cancel_project:{project_id}')],
+        [InlineKeyboardButton(text='📤 上传/补充资源', callback_data=f'admin:upload_resource:{project_id}')],
         [InlineKeyboardButton(text='🔎 项目详情', callback_data=f'admin:project:{project_id}')],
-        [InlineKeyboardButton(text='❌ 取消并生成退款清单', callback_data=f'admin:cancel_project:{project_id}')],
+        [InlineKeyboardButton(text='⬅️ 返回管理面板', callback_data='admin:dashboard')],
     ])
 
 
 def admin_project_detail_keyboard(project_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        # 高风险按钮放到最顶上，避免夹在常用按钮中误触。
+        [InlineKeyboardButton(text='❌ 手动取消项目', callback_data=f'admin:cancel_project:{project_id}')],
         [InlineKeyboardButton(text='🔍 打开项目卡片', callback_data=f'admin:project:{project_id}')],
         [InlineKeyboardButton(text='✅ 已支付用户', callback_data=f'admin:paid_users:{project_id}')],
         [InlineKeyboardButton(text='💳 待付车票', callback_data=f'admin:pending_orders:{project_id}')],
         [InlineKeyboardButton(text='🎫 手动补票', callback_data=f'admin:manual_verify:{project_id}')],
         [InlineKeyboardButton(text='🧾 支付闭环检查', callback_data=f'admin:audit_project:{project_id}')],
         [InlineKeyboardButton(text='🔧 同步进度/权限', callback_data=f'admin:sync_project:{project_id}')],
-        [InlineKeyboardButton(text='📦 查看上传资源', callback_data=f'admin:view_resources:{project_id}')],
+        [InlineKeyboardButton(text='📦 查看/修改上传资源', callback_data=f'admin:view_resources:{project_id}')],
         [InlineKeyboardButton(text='🧭 状态历史', callback_data=f'admin:state_history:{project_id}')],
-        [InlineKeyboardButton(text='🔁 重新上传/修正资源', callback_data=f'admin:reset_resource:{project_id}')],
         [InlineKeyboardButton(text='✅ 手动标记满员', callback_data=f'admin:mark_full:{project_id}')],
         [InlineKeyboardButton(text='⏰ 延长上传时间3小时', callback_data=f'admin:extend_resource:{project_id}:3')],
-        [InlineKeyboardButton(text='❌ 手动取消项目', callback_data=f'admin:cancel_project:{project_id}')],
+        [InlineKeyboardButton(text='⬅️ 返回管理面板', callback_data='admin:dashboard')],
     ])
 
 
@@ -323,9 +325,7 @@ def refund_item_keyboard(refund_id: int) -> InlineKeyboardMarkup:
 
 def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='🧺 待审核车车', callback_data='admin:list:pending_review')],
-        [InlineKeyboardButton(text='📤 待补资源', callback_data='admin:list:wait_upload')],
-        [InlineKeyboardButton(text='💰 报销/提现小篮子', callback_data='admin:list:payouts')],
+        [InlineKeyboardButton(text='🧺 今日待处理', callback_data='admin:list:todos')],
         [InlineKeyboardButton(text='🧾 退款小票', callback_data='admin:list:refunds')],
         [InlineKeyboardButton(text='💬 私聊客服记录', callback_data='admin:list:support')],
         [InlineKeyboardButton(text='⚠️ 风控提醒', callback_data='admin:list:risks')],
@@ -616,8 +616,7 @@ def admin_tools_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text='🔎 搜索', callback_data='admin:tool:search'), InlineKeyboardButton(text='🧾 查项目闭环', callback_data='admin:tool:audit')],
         [InlineKeyboardButton(text='🔧 同步项目', callback_data='admin:tool:sync'), InlineKeyboardButton(text='🔁 迁移旧车用户', callback_data='admin:tool:migrate')],
         [InlineKeyboardButton(text='✅ 绑定待付车票', callback_data='admin:tool:bind'), InlineKeyboardButton(text='➕ 补已付订单', callback_data='admin:tool:add_order')],
-        [InlineKeyboardButton(text='♻️ 恢复取消车票', callback_data='admin:tool:restore'), InlineKeyboardButton(text='👤 车票改用户', callback_data='admin:tool:rebind_user')],
-        [InlineKeyboardButton(text='🔐 VP改用户', callback_data='admin:tool:rebind_vp'), InlineKeyboardButton(text='↔️ 转移付款车票', callback_data='admin:tool:move_bind')],
+        [InlineKeyboardButton(text='👤 车票改用户', callback_data='admin:tool:rebind_user'), InlineKeyboardButton(text='↔️ 转移付款车票', callback_data='admin:tool:move_bind')],
         [InlineKeyboardButton(text='💬 回复客服', callback_data='admin:tool:reply'), InlineKeyboardButton(text='🎫 迁移单张车票', callback_data='admin:tool:migrate_order')],
         [InlineKeyboardButton(text='⬅️ 返回管理面板', callback_data='admin:dashboard')],
     ])

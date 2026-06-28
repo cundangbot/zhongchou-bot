@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -25,6 +26,14 @@ from app.services.project_state import ProjectState, transition_project, state_v
 from app.services.system_events import record_event
 
 settings = get_settings()
+BEIJING_TZ = ZoneInfo('Asia/Shanghai')
+
+def fmt_beijing(dt) -> str:
+    if not dt:
+        return '-'
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def load_resource_items(project: CrowdfundProject) -> list[dict]:
@@ -311,7 +320,7 @@ async def notify_project_full(
             f"🎉 拼车已满员：{title}\n"
             "模式：发起人垫付/已有资源\n"
             f"已私信发起人在 {settings.RESOURCE_UPLOAD_TIMEOUT_HOURS} 小时内购买并上传资源。\n"
-            f"截止时间 UTC：{project.resource_due_at:%Y-%m-%d %H:%M:%S}",
+            f"截止时间（北京时间）：{fmt_beijing(project.resource_due_at)}",
             reply_markup=admin_project_full_keyboard(project.id),
         )
     else:
