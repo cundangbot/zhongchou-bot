@@ -434,7 +434,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler.add_job(backup_postgres_job, 'cron', hour=3, minute=0, id='backup_postgres')
     scheduler.add_job(cleanup_old_data_job, 'cron', hour=4, minute=20, id='cleanup_old_data')
     if bool(settings.DAILY_CROWDFUND_SUMMARY_ENABLED):
-        scheduler.add_job(send_daily_crowdfund_summary, 'cron', hour=int(settings.DAILY_CROWDFUND_SUMMARY_HOUR), minute=int(settings.DAILY_CROWDFUND_SUMMARY_MINUTE), id='daily_crowdfund_summary', timezone='Asia/Shanghai')
+        scheduler.add_job(send_daily_crowdfund_summary, 'cron', args=[bot], hour=int(settings.DAILY_CROWDFUND_SUMMARY_HOUR), minute=int(settings.DAILY_CROWDFUND_SUMMARY_MINUTE), id='daily_crowdfund_summary', timezone='Asia/Shanghai')
     try:
         import logging
         logging.info('Registered scheduler jobs: %s', ', '.join(job.id for job in scheduler.get_jobs()))
