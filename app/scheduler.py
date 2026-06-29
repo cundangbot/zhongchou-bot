@@ -6,6 +6,7 @@ import asyncio
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
+from html import escape
 from aiogram import Bot
 from sqlalchemy import select, delete, func
 from app.db.base import SessionLocal
@@ -13,7 +14,7 @@ from app.db.models import ResourceAccess, PaymentOrder, RefundRecord, CrowdfundP
 from app.services.crowdfund import expire_old_projects, expire_resource_timeout_projects, expire_creator_prepay_timeout_projects, project_title, project_public_text, project_label
 from app.services.payments import expire_stale_pending_orders
 from app.config import get_settings
-from app.keyboards import join_project_keyboard, refund_apply_keyboard, pending_order_actions_keyboard
+from app.keyboards import join_project_keyboard, refund_apply_keyboard, pending_order_actions_keyboard, _join_deeplink
 from app.services.payment_checker import faka_query_client
 from app.services.project_state import ProjectState, transition_project, state_value
 from app.services.system_events import record_event, record_or_update_event, resolve_events, set_metric
@@ -33,6 +34,116 @@ async def _safe_send(bot: Bot, chat_id: int, text: str, **kwargs):
         return await bot.send_message(chat_id, text, **kwargs)
     except Exception:
         return None
+
+
+
+def _channel_message_url(project: CrowdfundProject) -> str:
+    if not getattr(project, 'channel_message_id', None):
+        return ''
+    channel = str(settings.PUBLIC_CHANNEL_ID)
+    if channel.startswith('-100'):
+        channel = channel[4:]
+    elif channel.startswith('-'):
+        channel = channel[1:]
+    return f'https://t.me/c/{channel}/{int(project.channel_message_id)}'
+
+
+SUMMARY_MESSAGE_LIMIT = 3600
+
+
+def _summary_line(idx: int, project: CrowdfundProject) -> str:
+    detail_url = _channel_message_url(project)
+    try:
+        join_url = _join_deeplink(int(project.id))
+    except Exception:
+        join_url = detail_url
+    detail_link = f'<a href="{escape(detail_url, quote=True)}">点击查看</a>' if detail_url else '-'
+    join_link = f'<a href="{escape(join_url, quote=True)}">点击上车</a>' if join_url else '-'
+    name = escape(str(project.blogger or '-'))
+    return (
+        f'{idx}. 项目：P.{int(project.id or 0):03d}\n'
+        f'   名称：{name}\n'
+        f'   详情：{detail_link}\n'
+        f'   上车地址：{join_link}'
+    )
+
+
+def _split_summary_messages(active: list[CrowdfundProject], full: list[CrowdfundProject]) -> list[str]:
+    header = (
+        '📋 今日众筹拾遗\n'
+        '━━━━━━━━━━━━━━\n\n'
+        '有些资源是孤岛，\n'
+        '拼一辆车，就变成桥。\n\n'
+        '今天这几辆，\n'
+        '总有一辆开往你想去的地方 🎀'
+    )
+    footer = (
+        '收藏这件事，\n'
+        '本来就是慢慢遇见对的那一份。\n'
+        '━━━━━━━━━━━━━━\n'
+        '➠ @bele888bot\n'
+        '众筹小掌柜 · 提交即发起 · 成团即释出'
+    )
+
+    blocks: list[str] = [header, '正在众筹']
+    blocks.extend(_summary_line(i, p) for i, p in enumerate(active, 1)) if active else blocks.append('暂无')
+    blocks.append('满配项目')
+    blocks.extend(_summary_line(i, p) for i, p in enumerate(full, 1)) if full else blocks.append('暂无')
+
+    messages: list[str] = []
+    current = ''
+    for block in blocks:
+        candidate = block if not current else f'{current}\n\n{block}'
+        if len(candidate) <= SUMMARY_MESSAGE_LIMIT:
+            current = candidate
+            continue
+        if current:
+            messages.append(current)
+        if len(block) <= SUMMARY_MESSAGE_LIMIT:
+            current = block
+        else:
+            for start in range(0, len(block), SUMMARY_MESSAGE_LIMIT):
+                piece = block[start:start + SUMMARY_MESSAGE_LIMIT]
+                if len(piece) == SUMMARY_MESSAGE_LIMIT:
+                    messages.append(piece)
+                else:
+                    current = piece
+    final_candidate = footer if not current else f'{current}\n\n{footer}'
+    if len(final_candidate) <= SUMMARY_MESSAGE_LIMIT:
+        messages.append(final_candidate)
+    else:
+        if current:
+            messages.append(current)
+        messages.append(footer)
+    if len(messages) > 1:
+        total = len(messages)
+        messages = [f'{msg}\n\n（{idx}/{total}）' for idx, msg in enumerate(messages, 1)]
+    return messages
+
+
+async def send_daily_crowdfund_summary(bot: Bot) -> None:
+    async with SessionLocal() as session:
+        active = list((await session.execute(
+            select(CrowdfundProject)
+            .where(CrowdfundProject.status.in_(['active', 'approved_wait_creator']))
+            .order_by(CrowdfundProject.created_at.desc())
+            .limit(80)
+        )).scalars().all())
+        full = list((await session.execute(
+            select(CrowdfundProject)
+            .where(CrowdfundProject.status.in_([
+                'full', 'waiting_creator_resource', 'waiting_buy_info', 'platform_purchasing',
+                'admin_uploading', 'resource_uploading', 'resource_submitted', 'resource_review',
+                'resource_rejected', 'resource_published', 'delivered'
+            ]))
+            .order_by(CrowdfundProject.full_at.desc().nullslast(), CrowdfundProject.created_at.desc())
+            .limit(80)
+        )).scalars().all())
+    if not active and not full:
+        return
+    for msg in _split_summary_messages(active, full):
+        await _safe_send(bot, settings.PUBLIC_CHANNEL_ID, msg, disable_web_page_preview=True, parse_mode='HTML')
+        await asyncio.sleep(max(0.05, float(settings.MESSAGE_PUSH_DELAY_SECONDS)))
 
 
 async def _notify_refund_users(bot: Bot, session, project, reason: str) -> int:
@@ -322,4 +433,11 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler.add_job(check_telethon_health_job, 'interval', seconds=max(30, int(settings.TELETHON_HEALTHCHECK_SECONDS)), id='check_telethon_health')
     scheduler.add_job(backup_postgres_job, 'cron', hour=3, minute=0, id='backup_postgres')
     scheduler.add_job(cleanup_old_data_job, 'cron', hour=4, minute=20, id='cleanup_old_data')
+    if bool(settings.DAILY_CROWDFUND_SUMMARY_ENABLED):
+        scheduler.add_job(send_daily_crowdfund_summary, 'cron', hour=int(settings.DAILY_CROWDFUND_SUMMARY_HOUR), minute=int(settings.DAILY_CROWDFUND_SUMMARY_MINUTE), id='daily_crowdfund_summary', timezone='Asia/Shanghai')
+    try:
+        import logging
+        logging.info('Registered scheduler jobs: %s', ', '.join(job.id for job in scheduler.get_jobs()))
+    except Exception:
+        pass
     return scheduler
