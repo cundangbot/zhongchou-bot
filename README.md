@@ -432,3 +432,32 @@ SUPPORT_ADMIN_ID=123456789
 SUPPORT_PRIVATE_BRIDGE_ENABLED=true
 SUPPORT_EXTERNAL_ONLY=false
 ```
+
+
+
+## Alembic 重叠版本修复（v1.6.3.8）
+
+如果升级时报：
+
+```text
+Requested revision 0003_support_admin_sessions overlaps with other requested revisions 0001_postgresql
+```
+
+请先停止服务，再运行：
+
+```bash
+source venv/bin/activate
+python scripts/repair_alembic_overlap.py
+python scripts/repair_alembic_overlap.py --apply
+alembic upgrade head
+alembic current
+```
+
+该脚本只清理 `alembic_version` 中重复的低版本记录，不修改拼车、订单、用户或支付数据。
+
+## 频道与评论区行为（v1.6.3.9）
+
+- 新发布拼车：频道只保留发起媒体和简洁摘要；完整详情、进度与操作按钮位于原生评论区。
+- 项目进度、满员、取消及补票状态只更新评论区详情卡。
+- 满员后不再向频道额外发送完成提醒。
+- 升级前已经发布、且没有评论区映射的旧拼车帖子保持原状，不提供批量迁移命令，也不会自动改写。

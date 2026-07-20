@@ -243,6 +243,7 @@ def project_channel_text(project: CrowdfundProject) -> str:
     return fixed + description
 
 
+
 def project_public_text(project: CrowdfundProject) -> str:
     from app.services.project_state import ProjectState, normalize_project_status
     mode_map = {'prepaid': '🙋 我来垫付', 'platform': '🤖 小掌柜代买', 'owned': '📦 我已持有资源'}

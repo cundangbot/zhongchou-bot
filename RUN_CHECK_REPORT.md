@@ -1,34 +1,40 @@
-# v1.6.2.0 修复检查报告
+# v1.6.3.9 Run Check Report
 
-本次以用户上传的 `new_code.zip` 原始包为底稿重新整理，不继续叠加之前临时补丁。
+## Scope
 
-## 本地可执行检查
+Based on v1.6.3.8, removed only the historical channel-panel migration feature.
 
-- `python3 -m compileall -q -f app`：通过。
-- 单文件语法检查：`start.py`、`crowdfund.py`、`payments.py`、`project_state.py`、`project_runtime.py`、`scheduler.py`、`keyboards.py`、`cute.py` 均通过。
-- 静态扫描：未发现 `ProjectState.PENDING` 这种不存在枚举的业务引用；仅保留历史兼容映射 `ProjectState.PENDING -> pending_review`。
-- 静态扫描：项目状态比较统一使用 `state_value()`，避免 `ProjectState.X` 字符串误判。
-- 静态扫描：常见 `callback_data` 前缀均有对应 handler；仅剩通用分页动态前缀由统一分页函数处理。
+Removed:
 
-## 当前环境限制
+- administrator historical-panel migration command and alias;
+- standalone discussion-group panel creation for old posts;
+- historical-post jump-link button generation;
+- migration-only channel/discussion copy and helper functions;
+- historical migration documentation.
 
-当前容器未安装 `aiogram`、`sqlalchemy`、`apscheduler`，也没有真实 Telegram Bot Token、数据库和 Docker 运行环境，因此不能在这里真实启动机器人或完成 Telegram 回调实测。部署到服务器后仍需用真实账号跑一遍业务验收。
+Retained:
 
-## 本次重点验收项
+- new project media + concise channel summary;
+- full details, progress and action buttons in the native comment thread;
+- progress/full/cancel/extra-ticket updates on the comment detail card;
+- no additional channel message when a project becomes full;
+- daily summary replacement and previous-summary deletion;
+- discussion mapping database fields and revision `0004_channel_discussion`;
+- Alembic overlap repair script from v1.6.3.8;
+- startup resource cleanup on failure.
 
-1. 用户提交 VP 系统单号，如果重复，会显示占用车票、对应项目、绑定用户和当前状态。
-2. 管理员可使用 `/search 关键词` 搜索项目、车票、系统单号、支付单号、用户 ID、博主名、资源描述。
-3. 管理员可使用 `/bind T.012 VP...` 直接给指定待付车票手动绑定。
-4. 管理员搜索结果里，待付车票会出现「直接绑定这张车票」按钮。
-5. 客服桥不会再抢 `/search`、`/bind`、发起众筹、退款资料、资源上传资料。
-6. `/start` 会清理用户旧状态，避免卡在客服或上传状态。
-7. 审核通过/拒绝按钮遇到状态不符时会弹窗提示，不再静默无反应。
+Existing channel-only projects without discussion mapping are left untouched.
 
-## v1.6.3.6 频道媒体/评论区分离复检
+## Checks
 
-- Python compileall：通过。
-- 媒体组发布模拟：通过；频道首个媒体 caption 仅含“新车发车/项目/博主/描述”。
-- 按钮位置模拟：通过；频道无按钮，评论区详情卡包含上车按钮。
-- 状态同步模拟：通过；频道摘要无进度，评论区详情卡更新进度和按钮。
-- 评论区缺失回滚模拟：通过；频道帖子自动撤回并阻止审核发布完成。
-- 离线启动检查：通过；app.main、数据库初始化、3 个路由及 8 个调度任务均成功加载。
+- Python bytecode compilation: passed.
+- Top-level circular-import scan: passed.
+- `app.main` startup import: passed.
+- SQLAlchemy metadata registration: passed, 20 tables.
+- Router registration: passed, 3 top-level routers.
+- Scheduler construction: passed, 8 jobs.
+- Fresh Alembic migration `0001 -> 0002 -> 0003 -> 0004`: passed.
+- Final Alembic revision: `0004_channel_discussion (head)`.
+- Native-comment runtime simulation: channel caption has no button; detail panel receives the join/status keyboard.
+- Existing channel-only runtime simulation: original channel panel and join entry remain available.
+- Static search confirmed no historical migration handler or helper remains in application code.

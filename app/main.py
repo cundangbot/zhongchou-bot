@@ -17,12 +17,11 @@ from app.db.models import CrowdfundProject
 from app.handlers import crowdfund, start, fallback
 from app.scheduler import setup_scheduler
 from app.services.payment_checker import faka_query_client
-from app.keyboards import join_project_keyboard, admin_dashboard_keyboard
+from app.keyboards import admin_dashboard_keyboard
 from app.services.singleton import SingletonLease
 from app.db.models import SystemMetric
 from app import runtime
 from app.messages import cute as msg
-from app.services.project_state import state_value
 
 
 def build_bot_proxy_url(settings) -> str | None:
@@ -66,28 +65,27 @@ async def detect_bot_username(bot: Bot, settings) -> str:
 
 
 async def refresh_public_join_buttons(bot: Bot, settings) -> tuple[int, int]:
-    """Replace legacy callback buttons on existing channel posts with private-chat deep links."""
-    active_statuses = [
-        'active', 'full', 'waiting_creator_resource', 'waiting_buy_info',
-        'platform_purchasing', 'admin_uploading', 'resource_uploading',
-        'resource_submitted', 'resource_rejected', 'resource_published', 'delivered',
-    ]
+    """Ensure native-comment channel posts stay clean after restart.
+
+    Only projects that already have a discussion detail message are touched. Existing
+    channel-only projects published before this feature are left unchanged.
+    """
     updated = failed = 0
     async with SessionLocal() as session:
         result = await session.execute(
             select(CrowdfundProject).where(
                 CrowdfundProject.channel_message_id.is_not(None),
-                CrowdfundProject.status.in_(active_statuses),
+                CrowdfundProject.discussion_detail_message_id.is_not(None),
             )
         )
         projects = list(result.scalars().all())
+
     for project in projects:
-        full = state_value(project.status) != 'active' or int(project.paid_seats or 0) >= int(project.required_seats or 0)
         try:
             await bot.edit_message_reply_markup(
                 chat_id=settings.PUBLIC_CHANNEL_ID,
                 message_id=project.channel_message_id,
-                reply_markup=join_project_keyboard(project.id, full=full, seat_price=project.seat_price),
+                reply_markup=None,
             )
             updated += 1
         except Exception as exc:
@@ -96,7 +94,7 @@ async def refresh_public_join_buttons(bot: Bot, settings) -> tuple[int, int]:
                 updated += 1
             else:
                 failed += 1
-                logging.warning('Failed to refresh channel button for project %s: %s', project.id, exc)
+                logging.warning('Failed to clear channel button for project %s: %s', project.id, exc)
     return updated, failed
 
 
@@ -166,62 +164,86 @@ async def main() -> None:
     settings = get_settings()
 
     lease = SingletonLease()
+    bot: Bot | None = None
+    scheduler = None
+    payment_listener_started = False
+
     if not await lease.acquire():
         logging.error('已有一个机器人实例正在运行，本实例退出。')
         return
     runtime.single_instance = True
 
-    await init_db()
-
-    proxy_url = build_bot_proxy_url(settings)
-    if proxy_url:
-        logging.info("Aiogram Bot API proxy enabled: %s", proxy_url)
-
-    session = AiohttpSession(proxy=proxy_url)
-
-    bot = Bot(
-        token=settings.BOT_TOKEN,
-        session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    # 自动读取真实机器人用户名，避免 BOT_USERNAME/.env 路径问题导致频道按钮退回 callback。
-    bot_username = await detect_bot_username(bot, settings)
-    refreshed_buttons = await refresh_public_join_buttons(bot, settings)
-    await notify_startup_config(bot, settings, bot_username, refreshed_buttons)
-
-    # PAYMENT_TEST_MODE=true 时跳过真实查单；正式环境由 Telethon 自动重连并向管理群告警。
-    if settings.PAYMENT_MODE == "telethon" and not settings.PAYMENT_TEST_MODE:
-        faka_query_client.set_alert_bot(bot)
-        try:
-            await faka_query_client.start()
-        except Exception:
-            # 支付监听故障不应拖垮整个机器人；后台健康检查会继续自动重连并告警。
-            logging.exception("Telethon payment listener failed to start; bot will continue and retry in scheduler")
-
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(start.router)
-    dp.include_router(crowdfund.router)
-    # fallback 必须最后注册，专门处理旧消息/漏接按钮，避免用户点击没反应。
-    dp.include_router(fallback.router)
-
-    await setup_bot_commands(bot, settings)
-    await ensure_admin_control_panel(bot, settings)
-
-    scheduler = setup_scheduler(bot)
-    scheduler.start()
-    from datetime import datetime
-    runtime.scheduler = scheduler
-    runtime.started_at = datetime.utcnow()
-
     try:
-        await dp.start_polling(bot)
-    finally:
-        scheduler.shutdown(wait=False)
-        await bot.session.close()
+        await init_db()
+
+        proxy_url = build_bot_proxy_url(settings)
+        if proxy_url:
+            logging.info("Aiogram Bot API proxy enabled: %s", proxy_url)
+
+        session = AiohttpSession(proxy=proxy_url)
+        bot = Bot(
+            token=settings.BOT_TOKEN,
+            session=session,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+
+        # 自动读取真实机器人用户名，避免 BOT_USERNAME/.env 路径问题导致频道按钮退回 callback。
+        bot_username = await detect_bot_username(bot, settings)
+        refreshed_buttons = await refresh_public_join_buttons(bot, settings)
+        await notify_startup_config(bot, settings, bot_username, refreshed_buttons)
+
+        # PAYMENT_TEST_MODE=true 时跳过真实查单；正式环境由 Telethon 自动重连并向管理群告警。
         if settings.PAYMENT_MODE == "telethon" and not settings.PAYMENT_TEST_MODE:
-            await faka_query_client.stop()
-        await lease.release()
+            faka_query_client.set_alert_bot(bot)
+            try:
+                await faka_query_client.start()
+                payment_listener_started = True
+            except Exception:
+                # 支付监听故障不应拖垮整个机器人；后台健康检查会继续自动重连并告警。
+                logging.exception("Telethon payment listener failed to start; bot will continue and retry in scheduler")
+
+        dp = Dispatcher(storage=MemoryStorage())
+        dp.include_router(start.router)
+        dp.include_router(crowdfund.router)
+        # fallback 必须最后注册，专门处理旧消息/漏接按钮，避免用户点击没反应。
+        dp.include_router(fallback.router)
+
+        await setup_bot_commands(bot, settings)
+        await ensure_admin_control_panel(bot, settings)
+
+        scheduler = setup_scheduler(bot)
+        scheduler.start()
+        from datetime import datetime
+        runtime.scheduler = scheduler
+        runtime.started_at = datetime.utcnow()
+
+        await dp.start_polling(bot)
+    except Exception:
+        logging.exception(
+            'Bot startup/runtime failed. If the error mentions a missing database column, '
+            'stop the service, run scripts/repair_alembic_overlap.py --apply, then run alembic upgrade head.'
+        )
+        raise
+    finally:
+        if scheduler is not None:
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                logging.exception('Failed to shut down scheduler cleanly')
+        if payment_listener_started:
+            try:
+                await faka_query_client.stop()
+            except Exception:
+                logging.exception('Failed to stop payment listener cleanly')
+        if bot is not None:
+            try:
+                await bot.session.close()
+            except Exception:
+                logging.exception('Failed to close bot session cleanly')
+        try:
+            await lease.release()
+        except Exception:
+            logging.exception('Failed to release singleton lease cleanly')
         runtime.single_instance = False
 
 
