@@ -13,6 +13,9 @@ depends_on = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    if 'support_bridge_messages' in inspector.get_table_names():
+        return
     op.create_table(
         'support_bridge_messages',
         sa.Column('id', sa.Integer(), primary_key=True, autoincrement=True),
@@ -34,6 +37,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    if 'support_bridge_messages' not in inspector.get_table_names():
+        return
     op.drop_index('ix_support_bridge_ticket_created', table_name='support_bridge_messages')
     op.drop_index('ix_support_bridge_messages_admin_message_id', table_name='support_bridge_messages')
     op.drop_index('ix_support_bridge_messages_admin_id', table_name='support_bridge_messages')

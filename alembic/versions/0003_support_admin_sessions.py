@@ -13,6 +13,9 @@ depends_on = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    if 'support_admin_sessions' in inspector.get_table_names():
+        return
     op.create_table(
         'support_admin_sessions',
         sa.Column('id', sa.Integer(), primary_key=True, autoincrement=True),
@@ -31,6 +34,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    if 'support_admin_sessions' not in inspector.get_table_names():
+        return
     op.drop_index('ix_support_admin_sessions_updated_at', table_name='support_admin_sessions')
     op.drop_index('ix_support_admin_sessions_user_id', table_name='support_admin_sessions')
     op.drop_index('ix_support_admin_sessions_ticket_id', table_name='support_admin_sessions')

@@ -47,6 +47,7 @@ from app.services.crowdfund import (
     cancel_project,
     create_project,
     project_public_text,
+    project_channel_text,
     project_title,
     project_label,
     reject_project,
@@ -57,13 +58,27 @@ from app.states import BuyInfoCollect, CrowdfundCreate, ResourceUploadCollect
 from app.services.idempotency import begin_operation, finish_operation, fail_operation
 from app.services.system_events import record_event
 from app.messages import cute as msg
-from app.services.project_runtime import notify_project_full as runtime_notify_project_full
+from app.services.project_runtime import (
+    notify_project_full as runtime_notify_project_full,
+    update_public_project as runtime_update_public_project,
+)
+from app.services.channel_discussion import register_automatic_forward, wait_for_discussion_target
 from app.services.project_state import state_value, InvalidProjectTransition
 
 router = Router()
 settings = get_settings()
 
 BEIJING_TZ = ZoneInfo('Asia/Shanghai')
+
+
+@router.message(F.is_automatic_forward == True)
+async def capture_channel_discussion_forward(message: Message) -> None:
+    """Capture Telegram's automatic channel-post forward in the linked discussion group."""
+    register_automatic_forward(
+        message,
+        public_channel_id=settings.PUBLIC_CHANNEL_ID,
+        discussion_group_id=settings.PUBLIC_DISCUSSION_GROUP_ID,
+    )
 
 def _fmt_dt(dt) -> str:
     if not dt:
@@ -582,132 +597,225 @@ async def _sync_admin_upload_session_to_project(session, project: CrowdfundProje
     return existing
 
 
-async def _send_public_project(bot: Bot, project: CrowdfundProject):
-    """
-    发布频道拼车消息。
-
-    分情况处理：
-    1）只有一张图片/一个视频/一个文件：媒体 caption 直接放完整拼车面板，并挂参与按钮；后续更新 edit_message_caption。
-    2）多张照片/视频：先发媒体组，第一条 caption 只放简短描述；再发单独文本主面板+按钮；后续更新 edit_message_text。
-    3）纯文字：直接发文本主面板+按钮。
-    """
-    full_text = project_public_text(project)
-    markup = join_project_keyboard(project.id, full=_is_after_full_stage(project), cancelled=state_value(project.status) in ('cancelled', 'expired'), seat_price=project.seat_price)
-    items = _load_description_items(project)
-    media_items = [x for x in items if x.get('type') in ('photo', 'video')]
-    text_items = [x for x in items if x.get('type') == 'text' and x.get('text')]
-    doc_items = [x for x in items if x.get('type') in ('document', 'animation', 'copy')]
-
-    media_caption = _project_public_brief_text(project)
-    single_media = _single_channel_media_item(items)
-
-    # 只有一张图片/视频/文件：拼车文案、描述、按钮全部在同一条消息里，最直观。
-    if single_media:
-        t = single_media.get('type')
-        try:
-            if t == 'photo':
-                return await bot.send_photo(settings.PUBLIC_CHANNEL_ID, single_media['file_id'], caption=full_text, reply_markup=markup)
-            if t == 'video':
-                return await bot.send_video(settings.PUBLIC_CHANNEL_ID, single_media['file_id'], caption=full_text, reply_markup=markup)
-            if t == 'document':
-                return await bot.send_document(settings.PUBLIC_CHANNEL_ID, single_media['file_id'], caption=full_text, reply_markup=markup)
-            if t == 'animation':
-                return await bot.send_animation(settings.PUBLIC_CHANNEL_ID, single_media['file_id'], caption=full_text, reply_markup=markup)
-        except Exception:
-            # caption 过长或媒体发送失败时降级为文本主面板，保证项目能发布。
-            pass
-
-    if media_items:
-        # 多图/多视频：发媒体组。第一张/第一个视频只带简短描述，避免和下方完整拼车面板重复。
-        for i in range(0, len(media_items), 10):
-            chunk = media_items[i:i + 10]
-            group = []
-            for j, item in enumerate(chunk):
-                caption = media_caption if i == 0 and j == 0 else None
-                if item.get('type') == 'photo':
-                    group.append(InputMediaPhoto(media=item['file_id'], caption=caption))
-                elif item.get('type') == 'video':
-                    group.append(InputMediaVideo(media=item['file_id'], caption=caption))
-            if group:
-                await bot.send_media_group(settings.PUBLIC_CHANNEL_ID, group)
-
-        # 主消息只用文本，后续更新只编辑这条，避免 edit caption/text 冲突。
-        button_msg = await bot.send_message(
-            settings.PUBLIC_CHANNEL_ID,
-            f'⬆️ 上方为拼车详情与描述内容\n\n{full_text}',
-            reply_markup=markup,
+async def _send_comment_item(bot: Bot, chat_id: int, root_message_id: int, item: dict) -> None:
+    item_type = item.get('type')
+    caption = item.get('caption') or None
+    kwargs = {'reply_to_message_id': root_message_id}
+    if item_type == 'text':
+        text = str(item.get('text') or '').strip()
+        if not text:
+            return
+        for start in range(0, len(text), 3900):
+            await bot.send_message(chat_id, text[start:start + 3900], **kwargs)
+        return
+    if item_type == 'photo':
+        await bot.send_photo(chat_id, item['file_id'], caption=caption, **kwargs)
+        return
+    if item_type == 'video':
+        await bot.send_video(chat_id, item['file_id'], caption=caption, **kwargs)
+        return
+    if item_type == 'document':
+        await bot.send_document(chat_id, item['file_id'], caption=caption, **kwargs)
+        return
+    if item_type == 'animation':
+        await bot.send_animation(chat_id, item['file_id'], caption=caption, **kwargs)
+        return
+    if item_type == 'copy':
+        await bot.copy_message(
+            chat_id,
+            int(item['chat_id']),
+            int(item['message_id']),
+            reply_to_message_id=root_message_id,
         )
 
-        if text_items:
-            await bot.send_message(settings.PUBLIC_CHANNEL_ID, '📝 补充文字描述：\n\n' + '\n\n'.join(x.get('text', '') for x in text_items))
 
-        for item in doc_items:
-            try:
-                if item.get('type') == 'document':
-                    await bot.send_document(settings.PUBLIC_CHANNEL_ID, item['file_id'], caption=item.get('caption') or None)
-                elif item.get('type') == 'animation':
-                    await bot.send_animation(settings.PUBLIC_CHANNEL_ID, item['file_id'], caption=item.get('caption') or None)
-                elif item.get('type') == 'copy':
-                    await bot.copy_message(settings.PUBLIC_CHANNEL_ID, int(item['chat_id']), int(item['message_id']))
-            except Exception:
-                pass
-        return button_msg
+async def _wait_for_any_discussion_target(channel_message_ids: list[int]):
+    """等待同一项目任意一条频道媒体在关联讨论组中的自动转发。"""
+    ids = [int(message_id) for message_id in channel_message_ids if int(message_id or 0) > 0]
+    if not ids:
+        return None
 
-    if project.description_message_id and not getattr(project, 'description_items', None):
-        try:
-            copied = await bot.copy_message(
-                settings.PUBLIC_CHANNEL_ID,
-                project.description_chat_id,
-                project.description_message_id,
-                caption=full_text,
-                reply_markup=markup,
+    tasks = [
+        asyncio.create_task(
+            wait_for_discussion_target(
+                message_id,
+                timeout=float(settings.DISCUSSION_FORWARD_WAIT_SECONDS),
             )
-            return copied
+        )
+        for message_id in ids
+    ]
+    try:
+        for completed in asyncio.as_completed(tasks):
+            try:
+                result = await completed
+            except Exception:
+                continue
+            if result is not None:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                return result
+        return None
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _publish_project_details_to_comments(
+    bot: Bot,
+    project: CrowdfundProject,
+    channel_message_ids: list[int],
+) -> bool:
+    target = await _wait_for_any_discussion_target(channel_message_ids)
+    if target is None:
+        return False
+
+    markup = join_project_keyboard(
+        project.id,
+        full=_is_after_full_stage(project),
+        cancelled=state_value(project.status) in ('cancelled', 'expired'),
+        seat_price=project.seat_price,
+    )
+    detail = await bot.send_message(
+        target.chat_id,
+        project_public_text(project),
+        reply_to_message_id=target.message_id,
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
+    project.discussion_chat_id = target.chat_id
+    project.discussion_root_message_id = target.message_id
+    project.discussion_detail_message_id = detail.message_id
+    return True
+
+
+async def _send_channel_project_media(bot: Bot, project: CrowdfundProject) -> list[Message]:
+    """频道只发投稿媒体和四行摘要，不挂拼车按钮。"""
+    brief = project_channel_text(project)
+    items = _load_description_items(project)
+    photo_video_items = [item for item in items if item.get('type') in ('photo', 'video')]
+    document_items = [item for item in items if item.get('type') == 'document']
+    animation_items = [item for item in items if item.get('type') == 'animation']
+
+    sent_messages: list[Message] = []
+    caption_used = False
+
+    # 图片与视频可组成同一个媒体组，尽量减少频道占屏。
+    for offset in range(0, len(photo_video_items), 10):
+        chunk = photo_video_items[offset:offset + 10]
+        if len(chunk) == 1:
+            item = chunk[0]
+            caption = brief if not caption_used else None
+            if item.get('type') == 'photo':
+                sent = await bot.send_photo(settings.PUBLIC_CHANNEL_ID, item['file_id'], caption=caption)
+            else:
+                sent = await bot.send_video(settings.PUBLIC_CHANNEL_ID, item['file_id'], caption=caption)
+            sent_messages.append(sent)
+            caption_used = caption_used or bool(caption)
+            continue
+
+        media = []
+        for index, item in enumerate(chunk):
+            caption = brief if not caption_used and index == 0 else None
+            if item.get('type') == 'photo':
+                media.append(InputMediaPhoto(media=item['file_id'], caption=caption))
+            else:
+                media.append(InputMediaVideo(media=item['file_id'], caption=caption))
+        group_messages = await bot.send_media_group(settings.PUBLIC_CHANNEL_ID, media)
+        sent_messages.extend(group_messages)
+        caption_used = True
+
+    # 文件单独组成文件媒体组，避免与图片/视频混发导致 Telegram 拒绝。
+    for offset in range(0, len(document_items), 10):
+        chunk = document_items[offset:offset + 10]
+        if len(chunk) == 1:
+            caption = brief if not caption_used else None
+            sent = await bot.send_document(
+                settings.PUBLIC_CHANNEL_ID,
+                chunk[0]['file_id'],
+                caption=caption,
+            )
+            sent_messages.append(sent)
+            caption_used = caption_used or bool(caption)
+            continue
+
+        media = [
+            InputMediaDocument(
+                media=item['file_id'],
+                caption=brief if not caption_used and index == 0 else None,
+            )
+            for index, item in enumerate(chunk)
+        ]
+        group_messages = await bot.send_media_group(settings.PUBLIC_CHANNEL_ID, media)
+        sent_messages.extend(group_messages)
+        caption_used = True
+
+    # 动图不能加入媒体组，逐条发送；仅第一条承载频道摘要。
+    for item in animation_items:
+        caption = brief if not caption_used else None
+        sent = await bot.send_animation(settings.PUBLIC_CHANNEL_ID, item['file_id'], caption=caption)
+        sent_messages.append(sent)
+        caption_used = caption_used or bool(caption)
+
+    # 没有可直接复用的媒体时，仍保留一条简洁摘要，避免项目无法建立评论线程。
+    if not sent_messages:
+        sent_messages.append(
+            await bot.send_message(
+                settings.PUBLIC_CHANNEL_ID,
+                brief,
+                disable_web_page_preview=True,
+            )
+        )
+    return sent_messages
+
+
+async def _delete_channel_project_messages(bot: Bot, messages: list[Message]) -> None:
+    for message in reversed(messages):
+        try:
+            await bot.delete_message(settings.PUBLIC_CHANNEL_ID, message.message_id)
         except Exception:
             pass
-    return await bot.send_message(settings.PUBLIC_CHANNEL_ID, full_text, reply_markup=markup)
+
+
+async def _send_public_project(bot: Bot, project: CrowdfundProject):
+    """发布频道媒体摘要，并把完整详情与按钮放入关联评论区。"""
+    sent_messages = await _send_channel_project_media(bot, project)
+    primary = sent_messages[0]
+    channel_message_ids = [message.message_id for message in sent_messages]
+
+    try:
+        comments_ok = await _publish_project_details_to_comments(
+            bot,
+            project,
+            channel_message_ids,
+        )
+    except Exception as exc:
+        logging.exception('Failed to publish project %s details to discussion comments', project.id)
+        await _delete_channel_project_messages(bot, sent_messages)
+        await _safe_send(
+            bot,
+            settings.ADMIN_GROUP_ID,
+            f'⚠️ 项目 {project_title(project)} 的评论区详情发布失败，频道媒体已撤回：{exc}',
+        )
+        raise RuntimeError('评论区详情发布失败，频道媒体已撤回') from exc
+
+    if not comments_ok:
+        await _delete_channel_project_messages(bot, sent_messages)
+        await _safe_send(
+            bot,
+            settings.ADMIN_GROUP_ID,
+            '⚠️ 未收到频道帖子在关联讨论组中的自动转发，本次频道媒体已撤回，项目仍保持待审核。\n'
+            '请确认：频道已绑定讨论组；机器人已加入讨论组并具备读取消息、发送消息权限；'
+            'PUBLIC_DISCUSSION_GROUP_ID 配置正确或保持为 0 自动识别。',
+        )
+        raise RuntimeError('未识别到关联评论区，频道媒体已撤回')
+    return primary
 
 async def _update_public_project(bot: Bot, project: CrowdfundProject) -> None:
-    if not project.channel_message_id:
-        return
-    text = project_public_text(project)
-    markup = join_project_keyboard(project.id, full=_is_after_full_stage(project), cancelled=state_value(project.status) in ('cancelled', 'expired'), seat_price=project.seat_price)
-    items = _load_description_items(project)
-    single_media = _single_channel_media_item(items)
-    has_media_panel = bool(items and any(x.get('type') in ('photo', 'video', 'document', 'animation', 'copy') for x in items))
-    try:
-        # 单张媒体发布时，频道主消息是媒体消息；后续更新 caption。
-        if single_media:
-            await bot.edit_message_caption(
-                chat_id=settings.PUBLIC_CHANNEL_ID,
-                message_id=project.channel_message_id,
-                caption=text,
-                reply_markup=markup,
-            )
-            return
-
-        # 多图/多视频发布时，channel_message_id 保存的是单独文本主面板；后续更新 text。
-        prefix = '⬆️ 上方为拼车详情与描述内容\n\n' if has_media_panel else ''
-        await bot.edit_message_text(
-            prefix + text,
-            chat_id=settings.PUBLIC_CHANNEL_ID,
-            message_id=project.channel_message_id,
-            reply_markup=markup,
-        )
-    except TelegramBadRequest as e:
-        # Telegram 在内容和按钮完全相同时会返回 message is not modified。
-        # 这不是业务失败，不能刷管理群告警。
-        if 'message is not modified' in str(e).lower():
-            return
-        async with SessionLocal() as event_session:
-            await record_event(event_session, 'channel_update_failed', str(e), project_id=project.id)
-            await event_session.commit()
-        await _safe_send(bot, settings.ADMIN_GROUP_ID, f'⚠️ 更新频道拼车消息失败：{project_title(project)}\n错误：{e}')
-    except Exception as e:
-        async with SessionLocal() as event_session:
-            await record_event(event_session, 'channel_update_failed', str(e), project_id=project.id)
-            await event_session.commit()
-        await _safe_send(bot, settings.ADMIN_GROUP_ID, f'⚠️ 更新频道拼车消息失败：{project_title(project)}\n错误：{e}')
+    await runtime_update_public_project(bot, project)
 
 
 async def _cancel_and_announce(bot: Bot, session, project: CrowdfundProject, reason: str):
@@ -1231,6 +1339,7 @@ async def admin_approve(call: CallbackQuery, bot: Bot):
             sent = await _send_public_project(bot, project)
             await approve_project(session, project.id, sent.message_id, actor_id=call.from_user.id)
             await session.refresh(project)
+            await _update_public_project(bot, project)
         except InvalidProjectTransition as exc:
             await fail_operation(session, operation_key, str(exc))
             await session.commit()

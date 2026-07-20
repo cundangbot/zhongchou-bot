@@ -13,15 +13,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db.base import SessionLocal
 from app.db.models import CrowdfundProject, ResourceAccess
-from app.messages import cute as msg
 from app.keyboards import (
     admin_project_full_keyboard,
     creator_buyinfo_keyboard,
     creator_resource_keyboard,
     join_project_keyboard,
 )
-from app.services.crowdfund import project_label, project_no, project_public_text, project_title
-from app.services.idempotency import begin_operation, finish_operation, fail_operation
+from app.services.crowdfund import project_channel_text, project_label, project_public_text, project_title
+from app.services.idempotency import begin_operation, finish_operation
 from app.services.project_state import ProjectState, transition_project, state_value
 from app.services.system_events import record_event
 
@@ -130,140 +129,115 @@ async def paid_user_ids(session: AsyncSession, project_id: int) -> list[int]:
     return sorted(set(result.scalars().all()))
 
 
-async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
-    """Update the one editable channel panel for a project.
+async def _record_channel_update_failure(project: CrowdfundProject, exc: Exception, *, area: str) -> None:
+    async with SessionLocal() as event_session:
+        await record_event(
+            event_session,
+            'channel_update_failed',
+            f'{area}: {exc}',
+            project_id=project.id,
+        )
+        await event_session.commit()
 
-    This helper lives in services so both handlers can use it without importing each other.
-    """
+
+async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
+    """频道保持媒体摘要；进度、满员、取消与按钮只同步到评论区详情卡。"""
     if not project.channel_message_id:
         return
 
-    text = project_public_text(project)
     markup = join_project_keyboard(
         project.id,
         full=is_after_full_stage(project),
-        cancelled=state_value(project.status) in ("cancelled", "expired"),
+        cancelled=state_value(project.status) in ('cancelled', 'expired'),
         seat_price=project.seat_price,
     )
-    items = _load_description_items(project)
-    single_media = _single_channel_media_item(items)
-    has_media_panel = bool(
-        items and any(
-            item.get("type") in ("photo", "video", "document", "animation", "copy")
-            for item in items
-        )
-    )
 
-    try:
-        if single_media:
+    discussion_chat_id = getattr(project, 'discussion_chat_id', None)
+    detail_message_id = getattr(project, 'discussion_detail_message_id', None)
+
+    if discussion_chat_id and detail_message_id:
+        # 新版频道主帖永远只保留媒体和固定摘要，不展示进度或按钮。
+        channel_text = project_channel_text(project)
+        try:
             await bot.edit_message_caption(
                 chat_id=settings.PUBLIC_CHANNEL_ID,
                 message_id=project.channel_message_id,
-                caption=text,
-                reply_markup=markup,
+                caption=channel_text,
+                reply_markup=None,
             )
-            return
+        except TelegramBadRequest as exc:
+            if 'there is no caption' in str(exc).lower() or 'message can\'t be edited' in str(exc).lower():
+                try:
+                    await bot.edit_message_text(
+                        channel_text,
+                        chat_id=settings.PUBLIC_CHANNEL_ID,
+                        message_id=project.channel_message_id,
+                        reply_markup=None,
+                        disable_web_page_preview=True,
+                    )
+                except TelegramBadRequest as text_exc:
+                    if 'message is not modified' not in str(text_exc).lower():
+                        await _record_channel_update_failure(project, text_exc, area='频道摘要更新失败')
+                except Exception as text_exc:
+                    await _record_channel_update_failure(project, text_exc, area='频道摘要更新失败')
+            elif 'message is not modified' not in str(exc).lower():
+                await _record_channel_update_failure(project, exc, area='频道摘要更新失败')
+        except Exception as exc:
+            await _record_channel_update_failure(project, exc, area='频道摘要更新失败')
 
-        prefix = "⬆️ 上方为拼车详情与描述内容\n\n" if has_media_panel else ""
+        try:
+            await bot.edit_message_text(
+                project_public_text(project),
+                chat_id=discussion_chat_id,
+                message_id=detail_message_id,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest as exc:
+            if 'message is not modified' not in str(exc).lower():
+                await _record_channel_update_failure(project, exc, area='评论区详情更新失败')
+        except Exception as exc:
+            await _record_channel_update_failure(project, exc, area='评论区详情更新失败')
+        return
+
+    # 兼容升级前没有评论区映射的旧项目，避免旧项目突然丢失上车入口。
+    channel_updated = False
+    try:
         await bot.edit_message_text(
-            prefix + text,
+            project_public_text(project),
             chat_id=settings.PUBLIC_CHANNEL_ID,
             message_id=project.channel_message_id,
             reply_markup=markup,
+            disable_web_page_preview=True,
         )
+        channel_updated = True
     except TelegramBadRequest as exc:
-        if "message is not modified" in str(exc).lower():
-            return
-        async with SessionLocal() as event_session:
-            await record_event(
-                event_session,
-                "channel_update_failed",
-                str(exc),
-                project_id=project.id,
-            )
-            await event_session.commit()
-        await safe_send(
-            bot,
-            settings.ADMIN_GROUP_ID,
-            f"⚠️ 更新频道拼车消息失败：{project_title(project)}\n错误：{exc}",
-        )
+        if 'message is not modified' in str(exc).lower():
+            channel_updated = True
+        else:
+            try:
+                await bot.edit_message_caption(
+                    chat_id=settings.PUBLIC_CHANNEL_ID,
+                    message_id=project.channel_message_id,
+                    caption=project_public_text(project),
+                    reply_markup=markup,
+                )
+                channel_updated = True
+            except TelegramBadRequest as caption_exc:
+                if 'message is not modified' in str(caption_exc).lower():
+                    channel_updated = True
+                else:
+                    await _record_channel_update_failure(project, caption_exc, area='旧频道卡片更新失败')
+            except Exception as caption_exc:
+                await _record_channel_update_failure(project, caption_exc, area='旧频道卡片更新失败')
     except Exception as exc:
-        async with SessionLocal() as event_session:
-            await record_event(
-                event_session,
-                "channel_update_failed",
-                str(exc),
-                project_id=project.id,
-            )
-            await event_session.commit()
+        await _record_channel_update_failure(project, exc, area='旧频道卡片更新失败')
+
+    if not channel_updated:
         await safe_send(
             bot,
             settings.ADMIN_GROUP_ID,
-            f"⚠️ 更新频道拼车消息失败：{project_title(project)}\n错误：{exc}",
-        )
-
-
-def full_success_channel_text(project: CrowdfundProject) -> str:
-    """Standalone channel notice sent once when a project becomes full."""
-    pending_extra = max(0, int(project.extra_fund_count or 0) - int(project.extra_withdrawn_count or 0))
-    mode_map = {
-        "prepaid": "🙋 我来垫付",
-        "platform": "🤖 小掌柜代买",
-        "owned": "📦 我已持有资源",
-    }
-    status_map = {
-        ProjectState.FULL.value: "已满员",
-        ProjectState.WAITING_CREATOR_RESOURCE.value: "等待车主上传资源",
-        ProjectState.WAITING_BUY_INFO.value: "等待购买资料",
-        ProjectState.PLATFORM_PURCHASING.value: "小掌柜代买中",
-        ProjectState.ADMIN_UPLOADING.value: "等待小掌柜上传资源",
-        ProjectState.RESOURCE_UPLOADING.value: "资源上传中",
-        ProjectState.RESOURCE_SUBMITTED.value: "资源待审核",
-        ProjectState.RESOURCE_REVIEW.value: "资源审核中",
-        ProjectState.RESOURCE_REJECTED.value: "资源需重传",
-        ProjectState.RESOURCE_PUBLISHED.value: "资源可领取",
-        ProjectState.DELIVERED.value: "已交付",
-    }
-    return msg.project_full_success_card(
-        project_no_text=project_no(project),
-        blogger=project.blogger,
-        description=project.description,
-        seat_price=float(project.seat_price or settings.SEAT_PRICE),
-        required_seats=int(project.required_seats or 0),
-        paid_seats=int(project.paid_seats or 0),
-        purchase_mode_name=mode_map.get(project.purchase_mode, project.purchase_mode),
-        status_name=status_map.get(state_value(project.status), state_value(project.status)),
-        pending_extra=pending_extra,
-    )
-
-
-async def send_full_success_channel_panel(bot: Bot, session: AsyncSession, project: CrowdfundProject) -> None:
-    """Send the standalone full-success channel notice exactly once per project."""
-    operation_key = f"full-success-channel-panel:{project.id}"
-    if not await begin_operation(session, operation_key, "full_success_channel_panel", stale_after_minutes=30):
-        return
-    try:
-        sent = await bot.send_message(
-            settings.PUBLIC_CHANNEL_ID,
-            full_success_channel_text(project),
-            reply_markup=join_project_keyboard(project.id, full=True, seat_price=project.seat_price),
-        )
-        await finish_operation(session, operation_key, {"project_id": project.id, "message_id": sent.message_id})
-        await session.flush()
-    except Exception as exc:
-        await record_event(
-            session,
-            "full_success_channel_panel_failed",
-            f"项目 {project.id} 满员成功频道提醒发送失败：{exc}",
-            project_id=project.id,
-            severity="warning",
-        )
-        await fail_operation(session, operation_key, str(exc))
-        await session.flush()
-        await safe_send(
-            bot,
-            settings.ADMIN_GROUP_ID,
-            f"⚠️ 满员成功频道提醒发送失败：{project_title(project)}\n错误：{exc}",
+            f'⚠️ 更新频道拼车消息失败：{project_title(project)}',
         )
 
 
@@ -348,7 +322,7 @@ async def notify_project_full(
             reply_markup=admin_project_full_keyboard(project.id),
         )
 
-    await send_full_success_channel_panel(bot, session, project)
+    # 满员状态只更新原频道卡片和评论详情，不再额外发布“拼车完成/满员”频道提醒。
     await update_public_project(bot, project)
 
     for user_id in await paid_user_ids(session, project.id):

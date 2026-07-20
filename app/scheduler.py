@@ -3,6 +3,7 @@ from __future__ import annotations
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.events import EVENT_JOB_ERROR
 import asyncio
+import json
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -11,13 +12,14 @@ from aiogram import Bot
 from sqlalchemy import select, delete, func
 from app.db.base import SessionLocal
 from app.db.models import ResourceAccess, PaymentOrder, RefundRecord, CrowdfundProject
-from app.services.crowdfund import expire_old_projects, expire_resource_timeout_projects, expire_creator_prepay_timeout_projects, project_title, project_public_text, project_label
+from app.services.crowdfund import expire_old_projects, expire_resource_timeout_projects, expire_creator_prepay_timeout_projects, project_label
 from app.services.payments import expire_stale_pending_orders
 from app.config import get_settings
-from app.keyboards import join_project_keyboard, refund_apply_keyboard, pending_order_actions_keyboard, _join_deeplink
+from app.keyboards import refund_apply_keyboard, pending_order_actions_keyboard, _join_deeplink
 from app.services.payment_checker import faka_query_client
 from app.services.project_state import ProjectState, transition_project, state_value
-from app.services.system_events import record_event, record_or_update_event, resolve_events, set_metric
+from app.services.system_events import record_event, record_or_update_event, resolve_events, set_metric, get_metric
+from app.services.project_runtime import update_public_project
 
 settings = get_settings()
 
@@ -121,6 +123,9 @@ def _split_summary_messages(active: list[CrowdfundProject], full: list[Crowdfund
     return messages
 
 
+DAILY_SUMMARY_MESSAGE_IDS_KEY = 'daily_crowdfund_summary_message_ids'
+
+
 async def send_daily_crowdfund_summary(bot: Bot) -> None:
     async with SessionLocal() as session:
         active = list((await session.execute(
@@ -139,11 +144,59 @@ async def send_daily_crowdfund_summary(bot: Bot) -> None:
             .order_by(CrowdfundProject.full_at.desc().nullslast(), CrowdfundProject.created_at.desc())
             .limit(80)
         )).scalars().all())
+        old_metric = await get_metric(session, DAILY_SUMMARY_MESSAGE_IDS_KEY)
+        try:
+            old_message_ids = [int(x) for x in json.loads(old_metric.value or '[]')] if old_metric else []
+        except Exception:
+            old_message_ids = []
+
     if not active and not full:
         return
-    for msg in _split_summary_messages(active, full):
-        await _safe_send(bot, settings.PUBLIC_CHANNEL_ID, msg, disable_web_page_preview=True, parse_mode='HTML')
+
+    messages = _split_summary_messages(active, full)
+    new_message_ids: list[int] = []
+    for text in messages:
+        sent = await _safe_send(
+            bot,
+            settings.PUBLIC_CHANNEL_ID,
+            text,
+            disable_web_page_preview=True,
+            parse_mode='HTML',
+        )
+        if not sent:
+            break
+        new_message_ids.append(int(sent.message_id))
         await asyncio.sleep(max(0.05, float(settings.MESSAGE_PUSH_DELAY_SECONDS)))
+
+    # 新汇总必须完整发布成功，才替换上一条；避免发送中断后频道里只剩半份汇总。
+    if len(new_message_ids) != len(messages):
+        for message_id in new_message_ids:
+            try:
+                await bot.delete_message(settings.PUBLIC_CHANNEL_ID, message_id)
+            except Exception:
+                pass
+        async with SessionLocal() as session:
+            await record_event(
+                session,
+                'daily_summary_publish_failed',
+                f'每日汇总发布不完整：计划 {len(messages)} 条，成功 {len(new_message_ids)} 条',
+                severity='warning',
+            )
+            await session.commit()
+        return
+
+    # 新汇总发出后删除昨天的全部汇总分片，再保存今天的消息 ID，支持重启后继续替换。
+    for message_id in old_message_ids:
+        if message_id in new_message_ids:
+            continue
+        try:
+            await bot.delete_message(settings.PUBLIC_CHANNEL_ID, message_id)
+        except Exception:
+            pass
+
+    async with SessionLocal() as session:
+        await set_metric(session, DAILY_SUMMARY_MESSAGE_IDS_KEY, json.dumps(new_message_ids))
+        await session.commit()
 
 
 async def _notify_refund_users(bot: Bot, session, project, reason: str) -> int:
@@ -203,29 +256,7 @@ async def _create_refund_records(bot: Bot, session, project, reason: str) -> int
 
 
 async def _edit_cancelled_channel(bot: Bot, project):
-    if not project.channel_message_id:
-        return
-    text = project_public_text(project)
-    markup = join_project_keyboard(project.id, cancelled=True)
-    try:
-        await bot.edit_message_text(
-            text,
-            chat_id=settings.PUBLIC_CHANNEL_ID,
-            message_id=project.channel_message_id,
-            reply_markup=markup,
-        )
-        return
-    except Exception:
-        pass
-    try:
-        await bot.edit_message_caption(
-            chat_id=settings.PUBLIC_CHANNEL_ID,
-            message_id=project.channel_message_id,
-            caption=text,
-            reply_markup=markup,
-        )
-    except Exception:
-        pass
+    await update_public_project(bot, project)
 
 
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
@@ -275,15 +306,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
             expired = await expire_old_projects(session)
             for p in expired:
                 reason = p.cancel_reason or '7天未满员自动取消'
-                if p.channel_message_id:
-                    try:
-                        await bot.edit_message_text(
-                            f'⏰ 该拼车已过期并取消：{project_title(p)}\n\n原因：{reason}\n已支付用户请联系管理退款。',
-                            chat_id=settings.PUBLIC_CHANNEL_ID,
-                            message_id=p.channel_message_id,
-                        )
-                    except Exception as exc:
-                        await record_event(session, 'channel_update_failed', str(exc), project_id=p.id)
+                await update_public_project(bot, p)
                 await _create_refund_records(bot, session, p, reason)
                 ok = await _notify_refund_users(bot, session, p, reason)
                 await _safe_send(bot, settings.ADMIN_GROUP_ID, f'拼车 P.{int(p.id or 0):03d} 已过期取消，请处理退款。已通知 {ok} 人。')
@@ -317,17 +340,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
             cancelled = await expire_resource_timeout_projects(session)
             for p in cancelled:
                 reason = p.cancel_reason or f'发起人未在{settings.RESOURCE_UPLOAD_TIMEOUT_HOURS}小时内上传资源'
-                if p.channel_message_id:
-                    try:
-                        await bot.edit_message_text(
-                            f'⛔ 众筹已取消\n\n{project_label(p)}\n\n'
-                            f'原因：{reason}\n'
-                            f'已支付用户请联系管理处理退款。',
-                            chat_id=settings.PUBLIC_CHANNEL_ID,
-                            message_id=p.channel_message_id,
-                        )
-                    except Exception as exc:
-                        await record_event(session, 'channel_update_failed', str(exc), project_id=p.id)
+                await update_public_project(bot, p)
                 await _create_refund_records(bot, session, p, reason)
                 ok = await _notify_refund_users(bot, session, p, reason)
                 await _safe_send(

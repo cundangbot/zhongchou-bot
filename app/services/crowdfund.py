@@ -230,6 +230,19 @@ def project_progress_text(project: CrowdfundProject, *, compact: bool = False) -
     return f'🔥 拼车进度：{paid}/{required}\n{bar}\n还差 {remain} 人满员'
 
 
+def project_channel_text(project: CrowdfundProject) -> str:
+    """频道仅展示媒体配套摘要；完整拼车信息与操作按钮放在关联评论区。"""
+    description = ' '.join(str(project.description or '').split()) or '暂无描述'
+    blogger = ' '.join(str(project.blogger or '').split()) or '-'
+
+    # Telegram 媒体 caption 上限为 1024 字符，预留项目号、博主等固定字段空间。
+    fixed = f'🚗 新车发车！\n项目：{project_no(project)}\n博主：{blogger}\n描述：'
+    max_description_length = max(1, 1024 - len(fixed))
+    if len(description) > max_description_length:
+        description = description[:max(1, max_description_length - 1)].rstrip() + '…'
+    return fixed + description
+
+
 def project_public_text(project: CrowdfundProject) -> str:
     from app.services.project_state import ProjectState, normalize_project_status
     mode_map = {'prepaid': '🙋 我来垫付', 'platform': '🤖 小掌柜代买', 'owned': '📦 我已持有资源'}

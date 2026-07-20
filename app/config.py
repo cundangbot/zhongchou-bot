@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     BOT_USERNAME: str = ''
     ADMIN_GROUP_ID: int
     PUBLIC_CHANNEL_ID: int
+    # 频道关联讨论组。填 0 时会根据 Telegram 的自动转发消息自动识别。
+    PUBLIC_DISCUSSION_GROUP_ID: int = 0
+    DISCUSSION_FORWARD_WAIT_SECONDS: float = 8.0
     MEMBER_GROUP_ID: int
     ADMIN_IDS: str = ''
 
@@ -91,7 +94,7 @@ class Settings(BaseSettings):
     PENDING_ORDER_REMINDER_MINUTES: int = 5
     DATA_RETENTION_DAYS: int = 30
     MESSAGE_PUSH_DELAY_SECONDS: float = 0.05
-    DAILY_CROWDFUND_SUMMARY_ENABLED: bool = False
+    DAILY_CROWDFUND_SUMMARY_ENABLED: bool = True
     DAILY_CROWDFUND_SUMMARY_HOUR: int = 7
     DAILY_CROWDFUND_SUMMARY_MINUTE: int = 0
     TELETHON_RECONNECT_ATTEMPTS: int = 3
