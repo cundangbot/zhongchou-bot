@@ -8,7 +8,7 @@ from telethon import TelegramClient
 from app.config import get_settings
 from app.telethon_proxy import build_telethon_proxy
 from app.db.base import SessionLocal
-from app.services.system_events import record_event, set_metric
+from app.services.system_events import record_event, resolve_events, set_metric
 from app.services.payment_products import detect_payment_product
 
 settings = get_settings()
@@ -140,9 +140,12 @@ class FakaQueryClient:
         self._last_alert_key = key
         try:
             async with SessionLocal() as session:
-                event_type = 'telethon_disconnected' if 'recover' not in key else 'telethon_recovered'
-                await record_event(session, event_type, text, severity='error' if 'recover' not in key else 'info')
-                await set_metric(session, 'telethon_status', 'connected' if 'recover' in key else 'disconnected')
+                if 'recover' in key:
+                    await resolve_events(session, 'telethon_disconnected')
+                    await set_metric(session, 'telethon_status', 'connected')
+                else:
+                    await record_event(session, 'telethon_disconnected', text, severity='error')
+                    await set_metric(session, 'telethon_status', 'disconnected')
                 await session.commit()
         except Exception:
             pass

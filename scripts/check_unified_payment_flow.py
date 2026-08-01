@@ -43,6 +43,7 @@ def _install_import_stubs() -> None:
         return None
 
     system_events.record_event = _noop
+    system_events.resolve_events = _noop
     system_events.set_metric = _noop
     sys.modules['app.services.system_events'] = system_events
 

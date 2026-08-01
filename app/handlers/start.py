@@ -1459,7 +1459,7 @@ async def start(message: Message, command: CommandObject | None = None, state: F
 
 
 @router.message(Command('member'))
-@router.message(F.text == '💎 会员群购买')
+@router.message(F.text == '💎 会员购买')
 async def member_group_purchase_page(message: Message, state: FSMContext):
     # 主菜单入口必须结束旧输入状态，避免会员按钮被当成博主名、退款资料或客服消息。
     await state.clear()
@@ -3366,7 +3366,7 @@ async def _send_admin_dashboard(message: Message):
         risks = (await session.execute(select(func.count()).select_from(RiskLog).where(RiskLog.created_at >= today_start))).scalar() or 0
         support_open = (await session.execute(select(func.count()).select_from(ContactTicket).where(ContactTicket.status.in_(['open','answered']), ContactTicket.created_at >= today_start))).scalar() or 0
         pending_refunds = (await session.execute(select(func.count()).select_from(RefundRecord).where(RefundRecord.status == 'pending_admin'))).scalar() or 0
-        unresolved_events = (await session.execute(select(func.count()).select_from(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start))).scalar() or 0
+        unresolved_events = (await session.execute(select(func.count(func.distinct(SystemEvent.event_type))).select_from(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start, SystemEvent.severity.in_(['warning', 'error', 'critical']), SystemEvent.event_type != 'duplicate_operation'))).scalar() or 0
     await message.answer(
         msg.admin_dashboard_text(
             new_projects=new_projects,
@@ -3689,7 +3689,7 @@ async def admin_dashboard_list(call: CallbackQuery):
                 ).limit(10)
             )).scalars().all())
             events = list((await session.execute(
-                select(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start).order_by(SystemEvent.created_at.desc()).limit(30)
+                select(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start, SystemEvent.severity.in_(['warning', 'error', 'critical']), SystemEvent.event_type != 'duplicate_operation').order_by(SystemEvent.created_at.desc()).limit(30)
             )).scalars().all())
             lines = ['🚨 今日运营异常面板']
             lines.append(f'\n核验失败次数过多用户：{len(high_risk_rows)}')
@@ -3698,9 +3698,11 @@ async def admin_dashboard_list(call: CallbackQuery):
             lines.append(f'\n超过上传时限项目：{len(overdue_projects)}')
             for p in overdue_projects:
                 lines.append(f'• {project_no(p)}｜{p.blogger}｜截止 {_fmt_dt(p.resource_due_at)}')
-            grouped = {}
+            latest_by_type = {}
+            totals_by_type = {}
             for e in events:
-                grouped[e.event_type] = grouped.get(e.event_type, 0) + 1
+                totals_by_type[e.event_type] = totals_by_type.get(e.event_type, 0) + 1
+                latest_by_type.setdefault(e.event_type, e)
             labels = {
                 'channel_update_failed': '频道消息更新失败',
                 'resource_delivery_failed': '资源私发失败',
@@ -3708,11 +3710,15 @@ async def admin_dashboard_list(call: CallbackQuery):
                 'scheduler_job_failed': '数据库/调度任务失败',
                 'duplicate_operation': '重复按钮处理',
                 'database_backup_failed': '数据库备份失败',
+                'payment_listener_start_failed': '自动核验监听启动失败',
             }
-            lines.append('\n未解决系统事件：')
-            if grouped:
-                for key, count in grouped.items():
-                    lines.append(f'• {labels.get(key, key)}：{count}')
+            lines.append('\n当前未解决异常类型：')
+            if latest_by_type:
+                for key, event in latest_by_type.items():
+                    latest_message = str(event.message or '').replace('\n', ' ').strip()[:120]
+                    collapsed = totals_by_type.get(key, 1)
+                    suffix = f'（历史重复 {collapsed} 条已折叠）' if collapsed > 1 else ''
+                    lines.append(f'• {labels.get(key, key)}{suffix}\n  最新：{latest_message or "-"}')
             else:
                 lines.append('• 暂无')
             text = '\n'.join(lines)
@@ -3765,7 +3771,7 @@ async def admin_dashboard_callback(call: CallbackQuery):
         risks = (await session.execute(select(func.count()).select_from(RiskLog).where(RiskLog.created_at >= today_start))).scalar() or 0
         support_open = (await session.execute(select(func.count()).select_from(ContactTicket).where(ContactTicket.status.in_(['open','answered']), ContactTicket.created_at >= today_start))).scalar() or 0
         pending_refunds = (await session.execute(select(func.count()).select_from(RefundRecord).where(RefundRecord.status == 'pending_admin'))).scalar() or 0
-        unresolved_events = (await session.execute(select(func.count()).select_from(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start))).scalar() or 0
+        unresolved_events = (await session.execute(select(func.count(func.distinct(SystemEvent.event_type))).select_from(SystemEvent).where(SystemEvent.resolved.is_(False), SystemEvent.created_at >= today_start, SystemEvent.severity.in_(['warning', 'error', 'critical']), SystemEvent.event_type != 'duplicate_operation'))).scalar() or 0
     text = msg.admin_dashboard_text(
         new_projects=new_projects,
         paid_orders=paid_orders,

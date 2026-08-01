@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -18,12 +19,11 @@ from app.services.payment_checker import faka_query_client
 from app.services.payment_auto_listener import payment_auto_listener
 from app.keyboards import admin_dashboard_keyboard
 from app.services.singleton import SingletonLease
-from app.db.models import SystemMetric, PaymentOrder, CrowdfundProject
-from sqlalchemy import select
+from app.db.models import SystemMetric
 from app import runtime
 from app.messages import cute as msg
-from app.services.payments import virtual_verify_creator_prepay_order
-from app.services.payment_binding import run_paid_followups
+
+APP_VERSION = (Path(__file__).resolve().parents[1] / 'VERSION').read_text(encoding='utf-8').strip()
 
 
 def build_bot_proxy_url(settings) -> str | None:
@@ -88,50 +88,6 @@ async def notify_startup_config(bot: Bot, settings, username: str) -> None:
             logging.exception('Failed to send startup configuration warning')
 
 
-async def recover_creator_virtual_prepays(bot: Bot, settings) -> None:
-    """Apply the .env creator-prepay whitelist to already pending eligible projects.
-
-    The scan is narrow and idempotent: creator double-seat orders only, configured
-    user IDs only, and projects still waiting for creator prepayment. It does not
-    query faka and does not touch normal passenger orders.
-    """
-    if not settings.CREATOR_PREPAY_AUTO_VERIFY_ENABLED:
-        return
-    user_ids = settings.creator_prepay_auto_verify_id_list
-    if not user_ids:
-        return
-
-    async with SessionLocal() as session:
-        order_ids = list((await session.execute(
-            select(PaymentOrder.id)
-            .join(CrowdfundProject, CrowdfundProject.id == PaymentOrder.project_id)
-            .where(
-                PaymentOrder.status == 'pending',
-                PaymentOrder.order_type == 'crowdfunding_creator_prepay',
-                PaymentOrder.user_id.in_(user_ids),
-                CrowdfundProject.status == 'approved_wait_creator',
-            )
-            .order_by(PaymentOrder.id.asc())
-        )).scalars().all())
-
-        for order_id in order_ids:
-            try:
-                ok, reason, order = await virtual_verify_creator_prepay_order(
-                    session,
-                    int(order_id),
-                    operator_id=None,
-                )
-                if ok and order:
-                    await run_paid_followups(bot, session, order, notify_user=True)
-                else:
-                    logging.warning(
-                        'Creator virtual prepay recovery skipped order %s: %s',
-                        order_id,
-                        reason,
-                    )
-            except Exception:
-                logging.exception('Creator virtual prepay recovery failed for order %s', order_id)
-
 
 async def setup_bot_commands(bot: Bot, settings) -> None:
     # 清理旧版本可能给管理员私聊/审核群设置过的专属命令菜单。
@@ -140,12 +96,12 @@ async def setup_bot_commands(bot: Bot, settings) -> None:
             await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=int(chat_id)))
         except Exception:
             logging.debug('No scoped commands to delete for chat %s', chat_id)
-    # 左侧命令菜单保留三个用户入口；管理员能力全部放到审核群固定按钮面板。
+    # 左侧命令菜单只保留稳定业务入口；底部四按钮菜单由 /start 正常下发。
     await bot.set_my_commands(
         [
             BotCommand(command='start', description='打开首页菜单 🚗'),
             BotCommand(command='orders', description='打开我的众筹 📋'),
-            BotCommand(command='member', description='购买会员群 💎'),
+            BotCommand(command='member', description='打开会员购买 💎'),
         ],
         scope=BotCommandScopeDefault(),
     )
@@ -204,6 +160,7 @@ async def main() -> None:
         bot_username = await detect_bot_username(bot, settings)
         # 重启/部署时不编辑历史频道模板。模板只在项目状态真实变化时更新；
         # 历史模板丢失或机器人用户名变更时，由管理员在项目详情手动“生成拼车模板”。
+        logging.info('Starting Zhongchou Bot v%s from %s', APP_VERSION, Path(__file__).resolve())
         await notify_startup_config(bot, settings, bot_username)
 
         # PAYMENT_TEST_MODE=true 时跳过真实查单；正式环境由 Telethon 自动重连并向管理群告警。
@@ -235,7 +192,6 @@ async def main() -> None:
 
         await setup_bot_commands(bot, settings)
         await ensure_admin_control_panel(bot, settings)
-        await recover_creator_virtual_prepays(bot, settings)
 
         scheduler = setup_scheduler(bot)
         scheduler.start()

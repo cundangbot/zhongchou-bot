@@ -76,8 +76,8 @@ def main_menu() -> ReplyKeyboardMarkup:
     # /start、/admin_dashboard 等放到 Telegram 左侧“/”命令菜单里。
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text='🚗 发起众筹'), KeyboardButton(text='💎 会员群购买')],
-            [KeyboardButton(text='🔥 热门众筹'), KeyboardButton(text='📋 我的众筹')],
+            [KeyboardButton(text='🚗 发起众筹'), KeyboardButton(text='🔥 热门众筹')],
+            [KeyboardButton(text='💎 会员购买'), KeyboardButton(text='📋 我的众筹')],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -89,7 +89,7 @@ def member_group_purchase_keyboard(payment_link: str | None = None) -> InlineKey
     rows = []
     url = str(payment_link or '').strip()
     if url.startswith(('https://', 'http://', 'tg://')):
-        rows.append([InlineKeyboardButton(text='💳 立即购买会员群', url=url)])
+        rows.append([InlineKeyboardButton(text='💳 立即购买会员', url=url)])
     rows.append([support_contact_button('💬 联系小掌柜', 'membership', 0)])
     rows.append([InlineKeyboardButton(text='🏠 返回首页', callback_data='home:main')])
     return InlineKeyboardMarkup(inline_keyboard=rows)

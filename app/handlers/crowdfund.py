@@ -1056,10 +1056,16 @@ async def admin_approve(call: CallbackQuery, bot: Bot):
             await call.answer('该投稿正在发布或已发布', show_alert=True)
             return
         try:
-            sent = await _send_public_project(bot, project)
+            # 频道首次发布时就按“等待发起人双车位”状态渲染，
+            # 避免审核通过后立刻再编辑一次刚发出的模板。
+            original_status = project.status
+            project.status = 'approved_wait_creator'
+            try:
+                sent = await _send_public_project(bot, project)
+            finally:
+                project.status = original_status
             await approve_project(session, project.id, sent.message_id, actor_id=call.from_user.id)
             await session.refresh(project)
-            await _update_public_project(bot, project)
         except InvalidProjectTransition as exc:
             await fail_operation(session, operation_key, str(exc))
             await session.commit()

@@ -7,7 +7,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import SystemEvent, SystemMetric
 
 
+# 这些属于“当前系统状态”，同一类型/项目/用户重复发生时只更新最新记录，
+# 不应每次调度或重连都往管理员待办里累计一条。
+_DEDUP_EVENT_TYPES = {
+    'channel_update_failed',
+    'resource_delivery_failed',
+    'telethon_disconnected',
+    'scheduler_job_failed',
+    'database_backup_failed',
+    'payment_listener_start_failed',
+    'daily_summary_publish_failed',
+}
+
+
 async def record_event(session: AsyncSession, event_type: str, message: str, *, severity: str = 'warning', project_id: int | None = None, user_id: int | None = None, metadata: dict | None = None) -> SystemEvent:
+    if event_type in _DEDUP_EVENT_TYPES:
+        conditions = [SystemEvent.event_type == event_type, SystemEvent.resolved.is_(False)]
+        conditions.append(SystemEvent.project_id == project_id if project_id is not None else SystemEvent.project_id.is_(None))
+        conditions.append(SystemEvent.user_id == user_id if user_id is not None else SystemEvent.user_id.is_(None))
+        row = (await session.execute(
+            select(SystemEvent).where(*conditions).order_by(SystemEvent.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if row is not None:
+            row.message = message
+            row.severity = severity
+            row.metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+            row.created_at = datetime.utcnow()
+            await session.flush()
+            return row
+
     row = SystemEvent(
         event_type=event_type,
         severity=severity,
@@ -49,9 +77,12 @@ async def resolve_events(session: AsyncSession, event_type: str) -> int:
 
 
 async def record_or_update_event(session: AsyncSession, event_type: str, message: str, *, severity: str = 'warning', project_id: int | None = None, user_id: int | None = None, metadata: dict | None = None) -> SystemEvent:
+    conditions = [SystemEvent.event_type == event_type, SystemEvent.resolved.is_(False)]
+    conditions.append(SystemEvent.project_id == project_id if project_id is not None else SystemEvent.project_id.is_(None))
+    conditions.append(SystemEvent.user_id == user_id if user_id is not None else SystemEvent.user_id.is_(None))
     row = (await session.execute(
         select(SystemEvent)
-        .where(SystemEvent.event_type == event_type, SystemEvent.resolved.is_(False))
+        .where(*conditions)
         .order_by(SystemEvent.created_at.desc())
         .limit(1)
     )).scalar_one_or_none()
