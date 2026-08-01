@@ -13,6 +13,7 @@ from app.services.payment_checker import FakaOrderResult, faka_query_client
 from app.services.ledger import post_ledger
 from app.services.idempotency import begin_operation, finish_operation
 from app.services.system_events import set_metric
+from app.services.payment_products import payment_product_by_kind
 
 settings = get_settings()
 BEIJING_TZ = ZoneInfo('Asia/Shanghai')
@@ -374,6 +375,120 @@ async def apply_paid_effects(session: AsyncSession, order: PaymentOrder) -> None
                 await transition_project(session, project, ProjectState.FULL, reason='已支付车位达到满员', idempotency_key=f'project:{project.id}:full')
     order.effects_applied_at = datetime.utcnow()
     await session.flush()
+
+
+async def virtual_verify_creator_prepay_order(
+    session: AsyncSession,
+    order_id: int,
+    *,
+    operator_id: int | None = None,
+) -> tuple[bool, str, PaymentOrder | None]:
+    """Locally verify a creator double-seat order for an explicit .env whitelist.
+
+    This bypass is deliberately narrower than PAYMENT_TEST_MODE and SEED_MODE:
+    it accepts only ``crowdfunding_creator_prepay`` orders owned by a configured
+    Telegram ID. The project receives its two reserved seats, while the finance
+    ledger records a zero-value virtual entry so real cash totals are unchanged.
+    """
+    order = (await session.execute(
+        select(PaymentOrder)
+        .where(PaymentOrder.id == int(order_id))
+        .with_for_update()
+    )).scalar_one_or_none()
+    if not order:
+        return False, '发起人双车位待付订单不存在', None
+    if order.status == 'paid':
+        return True, '发起人双车位已经核验完成', order
+    if order.status != 'pending':
+        return False, f'发起人双车位订单状态为 {order.status}，不能自动核验', order
+    if order.order_type != 'crowdfunding_creator_prepay':
+        return False, '该订单不是发起人双车位订单', order
+    if not settings.should_auto_verify_creator_prepay(order.user_id):
+        return False, '发起人不在双车位虚拟自动核验白名单', order
+    if not order.project_id:
+        return False, '发起人双车位订单没有关联项目', order
+
+    project = (await session.execute(
+        select(CrowdfundProject)
+        .where(CrowdfundProject.id == int(order.project_id))
+        .with_for_update()
+    )).scalar_one_or_none()
+    if not project:
+        return False, '发起人双车位订单关联项目不存在', order
+    if int(project.creator_id) != int(order.user_id):
+        return False, '订单用户与项目发起人不一致', order
+
+    from app.services.project_state import ProjectState, state_value
+    project_status = state_value(project.status)
+    if project_status != ProjectState.APPROVED_WAIT_CREATOR.value:
+        return False, f'项目当前状态为 {project_status}，不是等待发起人预付', order
+
+    amount = _money(order.expected_amount)
+    if amount == Decimal('120.00'):
+        spec = payment_product_by_kind('creator_120')
+    elif amount == Decimal('60.00'):
+        spec = payment_product_by_kind('creator_60')
+    else:
+        return False, f'不支持的发起人双车位金额：{amount} 元', order
+
+    operation_key = f'virtual-creator-prepay:{order.id}'
+    if not await begin_operation(session, operation_key, 'virtual_creator_prepay'):
+        await session.refresh(order)
+        return order.status == 'paid', '该发起人双车位订单正在处理或已完成', order
+
+    virtual_system_no = f'VIRTUAL-CP-P{int(project.id):03d}-T{int(order.id):03d}'
+    virtual_pay_no = f'VIRTUALPAY-CP-{int(order.id):03d}'
+    order.payment_source = 'virtual'
+    order.faka_system_no = virtual_system_no
+    order.faka_pay_no = virtual_pay_no
+    order.raw_response = (
+        '由 CREATOR_PREPAY_AUTO_VERIFY_IDS 白名单触发发起人双车位虚拟自动核验；'
+        '未向 faka 查询，未产生真实收款。'
+    )
+    order.paid_channel = 'VIRTUAL'
+    order.paid_method = '发起人双车位白名单虚拟核验'
+    order.product_name = spec.canonical_name if spec else '发起人双车位虚拟核验'
+    order.faka_buyer_user_id = int(order.user_id)
+    order.faka_order_bot = 'LOCAL_ENV_WHITELIST'
+    order.paid_amount = amount
+    order.status = 'paid'
+    order.paid_at = datetime.utcnow()
+    order.fail_reason = None
+
+    await apply_paid_effects(session, order)
+    await post_ledger(
+        session,
+        idempotency_key=f'payment:{order.id}',
+        direction='income',
+        category=order.order_type,
+        amount=Decimal('0.00'),
+        payment_source='virtual',
+        project_id=order.project_id,
+        order_id=order.id,
+        user_id=order.user_id,
+        operator_id=operator_id,
+        description='发起人双车位白名单虚拟核验（不计真实收入）',
+        metadata={
+            'virtual_expected_amount': str(amount),
+            'config_source': 'CREATOR_PREPAY_AUTO_VERIFY_IDS',
+        },
+    )
+    await finish_operation(
+        session,
+        operation_key,
+        {'order_id': int(order.id), 'project_id': int(project.id), 'system_no': virtual_system_no},
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        order_id_value = int(order.id)
+        await session.rollback()
+        current = await session.get(PaymentOrder, order_id_value)
+        if current and current.status == 'paid':
+            return True, '发起人双车位已经核验完成', current
+        return False, '虚拟核验写入冲突，请管理员检查该项目订单', current or order
+    await session.refresh(order)
+    return True, '发起人双车位已按白名单自动核验', order
 
 
 async def force_verify_order(session: AsyncSession, order_id: int, system_no: str, admin_id: int) -> tuple[bool, str, PaymentOrder | None]:

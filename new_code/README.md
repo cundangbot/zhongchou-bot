@@ -1,4 +1,20 @@
-# v1.6.4.5 全项目交互闭环优化版
+# v1.6.4.8 发起人双车位白名单虚拟自动核验版
+
+
+本版新增发起人双车位白名单虚拟自动核验：
+
+```env
+CREATOR_PREPAY_AUTO_VERIFY_ENABLED=true
+CREATOR_PREPAY_AUTO_VERIFY_IDS=111111111,222222222
+```
+
+- 仅识别 Telegram 数字用户 ID；不要填写用户名、项目编号或频道 ID。
+- 白名单发起人的项目审核通过后，系统自动完成发起人双车位核验，不需要点击支付链接或发送暗号。
+- 30 元项目自动核验 60 元双车位；60 元项目自动核验 120 元双车位。
+- 只处理 `crowdfunding_creator_prepay`，不会放行普通车位或满员后补票。
+- 不查询 faka；订单来源保存为 `virtual`，资金账本记录 0 元，不计入真实收入。
+- 部署前已经处于“等待发起人预付”的白名单项目，会在启动时幂等恢复。
+- 原 `SEED_MODE_ENABLED / ADMIN_VERIFY_SECRET / SEEDER_IDS` 冷启动暗号继续保留，作为人工应急兜底。
 
 本版本在 v1.6.4.4 纯自动支付基础上完成全项目交互闭环整理：
 
@@ -46,6 +62,9 @@ PAYMENT_AUTO_CONFIRM_ENABLED=true
 PAYMENT_CONFIRM_BOT_USERNAME=@jingpinhybot
 EXPECTED_FAKA_ORDER_BOT=@jingpinhybot
 PAYMENT_EXPECTED_PRODUCT_KEYWORDS=车位支付链接
+
+# 会员群整库购买支付页；仅用于主菜单跳转，不进入车位 VP 自动核验。
+MEMBER_GROUP_PAYMENT_LINK=https://你的会员群支付链接
 ```
 
 `PAYMENT_CONFIRM_BOT_USERNAME` 必须填写实际向 Telethon 商家账号发送“购买成功”通知的机器人用户名。
@@ -542,9 +561,14 @@ alembic current
 取消待付票增加二次确认，并明确提示已付款用户不要取消，避免付款后失去自动匹配对象。
 
 
-## v1.6.4.6 管理员资源修订与按日资金账本
+## v1.6.4.7 管理员资源修订与按日资金账本
 
 - 发起人提交资源审核后，普通用户上传/补充/清空入口继续锁定。
 - 管理员在资源待审核阶段仍可追加、删除最新一条、清空全部或重新上传；资源发布/交付后才完全只读。
 - 管理面板「资金账本」改为北京时间按日期分页，支持前一天、后一天、回到今天和返回管理面板。
 - 单日流水超过 20 条时，在当天内部继续分页，保证明细不因 Telegram 消息长度被截断。
+
+
+## v1.6.4.9 会员群购买入口
+
+底部常驻菜单新增「💎 会员群购买」。用户点击后会看到当前已发布及未来完成的众筹项目资源权益说明，并可通过 `MEMBER_GROUP_PAYMENT_LINK` 跳转独立支付页。该支付入口与四种车位商品隔离，不会触发 VP 自动绑票。

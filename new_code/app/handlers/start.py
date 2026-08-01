@@ -27,6 +27,7 @@ from app.db.base import SessionLocal
 from app.db.models import PaymentOrder, CrowdfundProject, ProfitWithdrawal, ResourceAccess, RiskLog, UserBlacklist, RefundRecord, ContactTicket, SupportBridgeMessage, SupportAdminSession, ResourceClaimProgress, FinancialLedger, SystemEvent, ProjectStateHistory, VerifiedPayment
 from app.keyboards import (
     main_menu,
+    member_group_purchase_keyboard,
     order_center_keyboard,
     pending_order_actions_keyboard,
     order_center_back_keyboard,
@@ -1457,6 +1458,31 @@ async def start(message: Message, command: CommandObject | None = None, state: F
     await message.answer(START_HELP, reply_markup=main_menu())
 
 
+@router.message(Command('member'))
+@router.message(F.text == '💎 会员群购买')
+async def member_group_purchase_page(message: Message, state: FSMContext):
+    # 主菜单入口必须结束旧输入状态，避免会员按钮被当成博主名、退款资料或客服消息。
+    await state.clear()
+    payment_link = str(settings.MEMBER_GROUP_PAYMENT_LINK or '').strip()
+    payment_ready = payment_link.startswith(('https://', 'http://', 'tg://'))
+    await message.answer(
+        msg.member_group_purchase(payment_ready=payment_ready),
+        reply_markup=member_group_purchase_keyboard(payment_link),
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data == 'home:main')
+async def home_main_callback(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.message.answer(START_HELP, reply_markup=main_menu())
+    await call.answer()
+
+
 @router.message(Command('orders'))
 @router.message(F.text == '📋 众筹订单')
 @router.message(F.text == '📋 我的众筹')
@@ -1951,10 +1977,12 @@ async def seed_status(message: Message):
         f'.env 已找到：{"是" if ENV_FILE.exists() else "否"}\n'
         f'冷启动模式：{"开启" if settings.SEED_MODE_ENABLED else "关闭"}\n'
         f'暗号已配置：{"是" if (settings.ADMIN_VERIFY_SECRET or "").strip() else "否"}\n'
-        f'允许使用的用户ID：{", ".join(map(str, allowed)) if allowed else "无"}\n'
+        f'允许使用冷启动暗号的用户ID：{", ".join(map(str, allowed)) if allowed else "无"}\n'
+        f'发起人双车位虚拟自动核验：{"开启" if settings.CREATOR_PREPAY_AUTO_VERIFY_ENABLED else "关闭"}\n'
+        f'自动核验发起人ID：{", ".join(map(str, settings.creator_prepay_auto_verify_id_list)) if settings.creator_prepay_auto_verify_id_list else "无"}\n'
         f'机器人深链用户名：@{(settings.BOT_USERNAME or "未就绪").lstrip("@")}\n\n'
-        '使用方法：先生成一张待付车票；自动核验开启时由系统自动核对，冷启动暗号仅供管理员/白名单调试。\n'
-        '只有 ADMIN_IDS 或 SEEDER_IDS 中的数字用户 ID 可以通过。'
+        '冷启动暗号：先生成待付车票，再由管理员/SEEDER_IDS 白名单账号发送暗号。\n'
+        '发起人自动核验：项目审核通过后，仅对 CREATOR_PREPAY_AUTO_VERIFY_IDS 中的发起人双车位订单自动生效。'
     )
 
 

@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     ADMIN_VERIFY_SECRET: str = ''
     SEEDER_IDS: str = ''
 
+    # 发起人双车位虚拟自动核验：只对配置的 Telegram 数字 ID 生效。
+    # 不查询 faka、不影响普通车位，且资金账本按 0 元虚拟流水记录。
+    CREATOR_PREPAY_AUTO_VERIFY_ENABLED: bool = False
+    CREATOR_PREPAY_AUTO_VERIFY_IDS: str = ''
+
     # Telethon proxy config. Leave empty if your network can connect to Telegram directly.
     TG_PROXY_TYPE: str = ''  # socks5 or http
     TG_PROXY_HOST: str = ''  # e.g. 127.0.0.1
@@ -109,6 +114,9 @@ class Settings(BaseSettings):
     WISH_ACCEPT_HOURS: int = 3
     FUND_LOW_THRESHOLD: float = 300
     MEMBER_JOIN_URL: str = ''  # legacy, v1.2.6 no longer enforces membership
+    # 会员群整库购买入口：展示当前已发布及未来完成的众筹项目资源权益。
+    # 这里只配置支付页 URL；入群/发货由支付页或管理员按现有业务方式处理。
+    MEMBER_GROUP_PAYMENT_LINK: str = ''
     RESOURCE_UPLOAD_TIMEOUT_HOURS: int = 5
     COCREATE_PLATFORM_RATIO: float = 0.50
     COCREATE_PLATFORM_CAP: float = 999999
@@ -179,6 +187,19 @@ class Settings(BaseSettings):
     @property
     def seeder_id_list(self) -> List[int]:
         return [int(x.strip()) for x in self.SEEDER_IDS.split(',') if x.strip()]
+
+    @property
+    def creator_prepay_auto_verify_id_list(self) -> List[int]:
+        return [int(x.strip()) for x in self.CREATOR_PREPAY_AUTO_VERIFY_IDS.split(',') if x.strip()]
+
+    def should_auto_verify_creator_prepay(self, user_id: int | str | None) -> bool:
+        if not self.CREATOR_PREPAY_AUTO_VERIFY_ENABLED or user_id is None:
+            return False
+        try:
+            target = int(user_id)
+        except (TypeError, ValueError):
+            return False
+        return target in set(self.creator_prepay_auto_verify_id_list)
 
     @property
     def payment_expected_product_keywords(self) -> List[str]:

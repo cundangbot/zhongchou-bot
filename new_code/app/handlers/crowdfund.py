@@ -49,7 +49,8 @@ from app.services.crowdfund import (
     reject_project,
     project_progress_text,
 )
-from app.services.payments import create_payment_order, project_payment_snapshot
+from app.services.payments import create_payment_order, project_payment_snapshot, virtual_verify_creator_prepay_order
+from app.services.payment_binding import run_paid_followups
 from app.states import BuyInfoCollect, CrowdfundCreate, ResourceUploadCollect
 from app.services.idempotency import begin_operation, finish_operation, fail_operation
 from app.services.system_events import record_event
@@ -1090,19 +1091,65 @@ async def admin_approve(call: CallbackQuery, bot: Bot):
                 project_id=project.id,
             )
 
-        await _safe_send(
-            bot,
-            project.creator_id,
-            msg.crowdfunding_creator_approved(
-                project_title=project_title(project),
-                prepay_seats=settings.CREATOR_PREPAY_SEATS,
-                amount=float(creator_order.expected_amount or settings.creator_prepay_amount_for_price(project.seat_price)),
-                    ),
-            reply_markup=payment_order_keyboard(creator_order.id, settings.payment_link_for_order_amount(creator_order.expected_amount, creator_prepay=True)),
+        auto_verified = False
+        auto_verify_reason = ''
+        if settings.should_auto_verify_creator_prepay(project.creator_id):
+            auto_verified, auto_verify_reason, creator_order = await virtual_verify_creator_prepay_order(
+                session,
+                int(creator_order.id),
+                operator_id=call.from_user.id,
+            )
+            if auto_verified and creator_order:
+                try:
+                    await run_paid_followups(bot, session, creator_order, notify_user=True)
+                except Exception as exc:
+                    logging.exception('Creator virtual prepay follow-up failed for project %s', project.id)
+                    await _safe_send(
+                        bot,
+                        settings.ADMIN_GROUP_ID,
+                        '⚠️ 发起人双车位已完成虚拟核验，但后续通知失败\n\n'
+                        f'项目：P.{int(project.id):03d}｜{project.blogger}\n'
+                        f'发起人：<code>{int(project.creator_id)}</code>\n'
+                        f'错误：{exc}',
+                    )
+            else:
+                await _safe_send(
+                    bot,
+                    settings.ADMIN_GROUP_ID,
+                    '⚠️ 发起人双车位白名单自动核验失败，已退回正常支付流程\n\n'
+                    f'项目：P.{int(project.id):03d}｜{project.blogger}\n'
+                    f'发起人：<code>{int(project.creator_id)}</code>\n'
+                    f'原因：{auto_verify_reason or "未知错误"}',
+                )
+
+        if not auto_verified:
+            await _safe_send(
+                bot,
+                project.creator_id,
+                msg.crowdfunding_creator_approved(
+                    project_title=project_title(project),
+                    prepay_seats=settings.CREATOR_PREPAY_SEATS,
+                    amount=float(creator_order.expected_amount or settings.creator_prepay_amount_for_price(project.seat_price)),
+                ),
+                reply_markup=payment_order_keyboard(
+                    creator_order.id,
+                    settings.payment_link_for_order_amount(creator_order.expected_amount, creator_prepay=True),
+                ),
+            )
+
+        await finish_operation(
+            session,
+            operation_key,
+            {
+                'channel_message_id': sent.message_id,
+                'creator_prepay_auto_verified': auto_verified,
+            },
         )
-        await finish_operation(session, operation_key, {'channel_message_id': sent.message_id})
         await session.commit()
-    await call.message.edit_text('✅ 已通过并发布众筹，已通知发起人支付双车位费用')
+    if auto_verified:
+        await call.message.edit_text('✅ 已通过并发布众筹，发起人双车位已按 .env 白名单自动核验')
+    else:
+        await call.message.edit_text('✅ 已通过并发布众筹，已通知发起人支付双车位费用')
     await call.answer()
 
 

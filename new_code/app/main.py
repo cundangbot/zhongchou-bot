@@ -9,21 +9,21 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from aiogram.fsm.storage.memory import MemoryStorage
-from sqlalchemy import select
 
 from app.config import get_settings
 from app.db.base import init_db, SessionLocal
-from app.db.models import CrowdfundProject
 from app.handlers import crowdfund, start, fallback
 from app.scheduler import setup_scheduler
 from app.services.payment_checker import faka_query_client
 from app.services.payment_auto_listener import payment_auto_listener
-from app.services.project_runtime import update_public_project
 from app.keyboards import admin_dashboard_keyboard
 from app.services.singleton import SingletonLease
-from app.db.models import SystemMetric
+from app.db.models import SystemMetric, PaymentOrder, CrowdfundProject
+from sqlalchemy import select
 from app import runtime
 from app.messages import cute as msg
+from app.services.payments import virtual_verify_creator_prepay_order
+from app.services.payment_binding import run_paid_followups
 
 
 def build_bot_proxy_url(settings) -> str | None:
@@ -66,38 +66,19 @@ async def detect_bot_username(bot: Bot, settings) -> str:
     return username
 
 
-async def refresh_public_join_buttons(bot: Bot, settings) -> tuple[int, int]:
-    """Refresh every stored public-channel carpool panel after restart."""
-    updated = failed = 0
-    async with SessionLocal() as session:
-        result = await session.execute(
-            select(CrowdfundProject).where(CrowdfundProject.channel_message_id.is_not(None))
-        )
-        projects = list(result.scalars().all())
-
-    for project in projects:
-        try:
-            await update_public_project(bot, project)
-            updated += 1
-        except Exception as exc:
-            failed += 1
-            logging.warning('Failed to refresh public panel for project %s: %s', project.id, exc)
-    return updated, failed
-
-
-async def notify_startup_config(bot: Bot, settings, username: str, refreshed: tuple[int, int]) -> None:
+async def notify_startup_config(bot: Bot, settings, username: str) -> None:
     """Send one actionable startup diagnostic only when seed mode/config needs attention."""
     warnings = []
     if settings.SEED_MODE_ENABLED and not (settings.ADMIN_VERIFY_SECRET or '').strip():
         warnings.append('SEED_MODE_ENABLED=true，但 ADMIN_VERIFY_SECRET 为空')
     if settings.SEED_MODE_ENABLED and not (settings.admin_id_list or settings.seeder_id_list):
         warnings.append('冷启动模式已开启，但 ADMIN_IDS/SEEDER_IDS 没有可用数字 ID')
-    updated, failed = refreshed
-    if warnings or failed:
+    if settings.CREATOR_PREPAY_AUTO_VERIFY_ENABLED and not settings.creator_prepay_auto_verify_id_list:
+        warnings.append('发起人双车位虚拟自动核验已开启，但 CREATOR_PREPAY_AUTO_VERIFY_IDS 为空')
+    if warnings:
         body = [
             '⚙️ 启动配置检查',
             f'机器人深链：@{username}',
-            f'频道拼车面板刷新：成功 {updated}，失败 {failed}',
             f'冷启动模式：{"开启" if settings.SEED_MODE_ENABLED else "关闭"}',
         ]
         body.extend(f'⚠️ {x}' for x in warnings)
@@ -107,6 +88,51 @@ async def notify_startup_config(bot: Bot, settings, username: str, refreshed: tu
             logging.exception('Failed to send startup configuration warning')
 
 
+async def recover_creator_virtual_prepays(bot: Bot, settings) -> None:
+    """Apply the .env creator-prepay whitelist to already pending eligible projects.
+
+    The scan is narrow and idempotent: creator double-seat orders only, configured
+    user IDs only, and projects still waiting for creator prepayment. It does not
+    query faka and does not touch normal passenger orders.
+    """
+    if not settings.CREATOR_PREPAY_AUTO_VERIFY_ENABLED:
+        return
+    user_ids = settings.creator_prepay_auto_verify_id_list
+    if not user_ids:
+        return
+
+    async with SessionLocal() as session:
+        order_ids = list((await session.execute(
+            select(PaymentOrder.id)
+            .join(CrowdfundProject, CrowdfundProject.id == PaymentOrder.project_id)
+            .where(
+                PaymentOrder.status == 'pending',
+                PaymentOrder.order_type == 'crowdfunding_creator_prepay',
+                PaymentOrder.user_id.in_(user_ids),
+                CrowdfundProject.status == 'approved_wait_creator',
+            )
+            .order_by(PaymentOrder.id.asc())
+        )).scalars().all())
+
+        for order_id in order_ids:
+            try:
+                ok, reason, order = await virtual_verify_creator_prepay_order(
+                    session,
+                    int(order_id),
+                    operator_id=None,
+                )
+                if ok and order:
+                    await run_paid_followups(bot, session, order, notify_user=True)
+                else:
+                    logging.warning(
+                        'Creator virtual prepay recovery skipped order %s: %s',
+                        order_id,
+                        reason,
+                    )
+            except Exception:
+                logging.exception('Creator virtual prepay recovery failed for order %s', order_id)
+
+
 async def setup_bot_commands(bot: Bot, settings) -> None:
     # 清理旧版本可能给管理员私聊/审核群设置过的专属命令菜单。
     for chat_id in [*settings.admin_id_list, settings.ADMIN_GROUP_ID]:
@@ -114,11 +140,12 @@ async def setup_bot_commands(bot: Bot, settings) -> None:
             await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=int(chat_id)))
         except Exception:
             logging.debug('No scoped commands to delete for chat %s', chat_id)
-    # 左侧命令菜单只保留两个用户入口；管理员能力全部放到审核群固定按钮面板。
+    # 左侧命令菜单保留三个用户入口；管理员能力全部放到审核群固定按钮面板。
     await bot.set_my_commands(
         [
             BotCommand(command='start', description='打开首页菜单 🚗'),
             BotCommand(command='orders', description='打开我的众筹 📋'),
+            BotCommand(command='member', description='购买会员群 💎'),
         ],
         scope=BotCommandScopeDefault(),
     )
@@ -175,8 +202,9 @@ async def main() -> None:
 
         # 自动读取真实机器人用户名，避免 BOT_USERNAME/.env 路径问题导致频道按钮退回 callback。
         bot_username = await detect_bot_username(bot, settings)
-        refreshed_buttons = await refresh_public_join_buttons(bot, settings)
-        await notify_startup_config(bot, settings, bot_username, refreshed_buttons)
+        # 重启/部署时不编辑历史频道模板。模板只在项目状态真实变化时更新；
+        # 历史模板丢失或机器人用户名变更时，由管理员在项目详情手动“生成拼车模板”。
+        await notify_startup_config(bot, settings, bot_username)
 
         # PAYMENT_TEST_MODE=true 时跳过真实查单；正式环境由 Telethon 自动重连并向管理群告警。
         if settings.PAYMENT_MODE == "telethon" and not settings.PAYMENT_TEST_MODE:
@@ -207,6 +235,7 @@ async def main() -> None:
 
         await setup_bot_commands(bot, settings)
         await ensure_admin_control_panel(bot, settings)
+        await recover_creator_virtual_prepays(bot, settings)
 
         scheduler = setup_scheduler(bot)
         scheduler.start()

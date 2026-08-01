@@ -72,17 +72,27 @@ def external_support_keyboard(source: str = 'generic', ref_id: int | str | None 
 
 # 底部常驻菜单：可爱版，显示在 Telegram 输入框下方。
 def main_menu() -> ReplyKeyboardMarkup:
-    # 底部常驻菜单只保留用户最常用的 3 个入口。
+    # 底部常驻菜单保留四个用户主入口。
     # /start、/admin_dashboard 等放到 Telegram 左侧“/”命令菜单里。
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text='🚗 发起众筹')],
+            [KeyboardButton(text='🚗 发起众筹'), KeyboardButton(text='💎 会员群购买')],
             [KeyboardButton(text='🔥 热门众筹'), KeyboardButton(text='📋 我的众筹')],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
         input_field_placeholder='选个小功能，滴滴出发～🚗✨',
     )
+
+
+def member_group_purchase_keyboard(payment_link: str | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    url = str(payment_link or '').strip()
+    if url.startswith(('https://', 'http://', 'tg://')):
+        rows.append([InlineKeyboardButton(text='💳 立即购买会员群', url=url)])
+    rows.append([support_contact_button('💬 联系小掌柜', 'membership', 0)])
+    rows.append([InlineKeyboardButton(text='🏠 返回首页', callback_data='home:main')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def non_member_keyboard() -> ReplyKeyboardMarkup:

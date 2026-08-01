@@ -129,10 +129,11 @@ async def send_public_project_panel(bot: Bot, project: CrowdfundProject):
 
 
 async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
-    """Update the standalone carpool panel in the public channel."""
+    """Update one public panel only after a real project-state/progress change."""
     if not project.channel_message_id:
         return
 
+    last_error: Exception | None = None
     markup = join_project_keyboard(
         project.id,
         full=is_after_full_stage(project),
@@ -165,16 +166,26 @@ async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
         except TelegramBadRequest as caption_exc:
             if 'message is not modified' in str(caption_exc).lower():
                 return
+            last_error = caption_exc
             await _record_channel_update_failure(project, caption_exc, area='频道拼车面板更新失败')
         except Exception as caption_exc:
+            last_error = caption_exc
             await _record_channel_update_failure(project, caption_exc, area='频道拼车面板更新失败')
     except Exception as exc:
+        last_error = exc
         await _record_channel_update_failure(project, exc, area='频道拼车面板更新失败')
 
+    reason = str(last_error or '未知错误').strip()[:500]
     await safe_send(
         bot,
         settings.ADMIN_GROUP_ID,
-        f'⚠️ 更新频道拼车面板失败：{project_title(project)}',
+        '⚠️ 频道拼车模板更新失败\n\n'
+        f'项目：{project_title(project)}\n'
+        f'频道：{settings.PUBLIC_CHANNEL_ID}\n'
+        f'消息ID：{project.channel_message_id}\n'
+        f'原因：{reason}\n\n'
+        '这只会在人数、满员、补票或取消等真实状态变化时触发。'
+        '若原模板已删除或消息ID已失效，请到项目详情点击「🧩 生成拼车模板」。',
     )
 
 

@@ -75,7 +75,7 @@ class PaymentOrder(Base):
     expected_amount: Mapped[Decimal] = mapped_column(MONEY)
     order_type: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(String(32), default='pending', index=True)
-    payment_source: Mapped[str] = mapped_column(String(24), default='real')  # real/seed/test/manual
+    payment_source: Mapped[str] = mapped_column(String(24), default='real')  # real/seed/test/manual/virtual
     faka_system_no: Mapped[str | None] = mapped_column(String(96), nullable=True, index=True)
     paid_amount: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
     paid_channel: Mapped[str | None] = mapped_column(String(64), nullable=True)
