@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from telethon import TelegramClient
 from app.config import get_settings
@@ -117,6 +118,21 @@ class FakaQueryClient:
         self._alert_bot = None
         self._last_alert_key: str | None = None
         self._healthy = False
+        self._last_query_success_at = None
+        self._last_query_error: str | None = None
+
+
+    @property
+    def healthy(self) -> bool:
+        return bool(self._healthy and self.client.is_connected())
+
+    @property
+    def last_query_success_at(self):
+        return self._last_query_success_at
+
+    @property
+    def last_query_error(self) -> str | None:
+        return self._last_query_error
 
     @property
     def client(self) -> TelegramClient:
@@ -226,6 +242,15 @@ class FakaQueryClient:
                             if returned_no == requested_no and parsed.status:
                                 self._healthy = True
                                 self._last_alert_key = None
+                                self._last_query_success_at = datetime.utcnow()
+                                self._last_query_error = None
+                                try:
+                                    async with SessionLocal() as session:
+                                        await set_metric(session, 'last_faka_query_success', self._last_query_success_at.isoformat())
+                                        await set_metric(session, 'last_faka_query_system_no', requested_no)
+                                        await session.commit()
+                                except Exception:
+                                    pass
                                 return parsed
                 except Exception as exc:
                     last_error = exc
@@ -236,6 +261,13 @@ class FakaQueryClient:
                         pass
                     if attempt < attempts:
                         await asyncio.sleep(min(attempt * 2, 6))
+            self._last_query_error = str(last_error)[:1000]
+            try:
+                async with SessionLocal() as session:
+                    await set_metric(session, 'last_faka_query_error', self._last_query_error)
+                    await session.commit()
+            except Exception:
+                pass
             await self._alert_admin(
                 'telethon_query_failed',
                 f'⚠️ 支付监听查询失败并已尝试自动重连。\n系统单号：{system_no}\n错误：{last_error}',

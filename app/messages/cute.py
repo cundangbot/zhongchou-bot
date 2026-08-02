@@ -366,27 +366,55 @@ def participated_detail(*, ticket_label: str, project_no: str, blogger: str, des
     )
 
 
-def refund_detail(*, refund_no: str, project_no: str, blogger: str, description: str, amount: float, status: str, created_at: str, payment_label: str = '-', system_no: str = '-', payout_info: str | None = None, refunded_at: str | None = None, user_id: int | str | None = None) -> str:
+def refund_detail(
+    *,
+    refund_no: str,
+    project_no: str,
+    blogger: str,
+    description: str,
+    amount: float,
+    status: str,
+    created_at: str,
+    payment_label: str = '-',
+    system_no: str = '-',
+    payout_info: str | None = None,
+    refunded_at: str | None = None,
+    user_id: int | str | None = None,
+    refund_reason: str = '-',
+    original_amount: float | None = None,
+    pay_no: str = '-',
+    pay_method: str = '-',
+    paid_at: str = '-',
+    refund_allowed: bool = True,
+) -> str:
     safe_payout = html.escape(str(payout_info or '尚未提交'))
+    original = amount if original_amount is None else original_amount
     body = _body(
         f'退款单：{html.escape(str(refund_no or "-"))}',
         f'项目：{html.escape(str(project_no or "-"))}',
         f'博主：{html.escape(str(blogger or "-"))}',
         f'描述：{html.escape(str(description or "-"))}',
+        f'退款原因：{html.escape(str(refund_reason or "-"))}',
         f'退款状态：{html.escape(str(status or "-"))}',
-        f'💰 退款金额：{amount:g} 元',
+        f'💳 原支付金额：{float(original or 0):g} 元',
+        f'💰 应退金额：{amount:g} 元',
         f'🎫 原车票：{html.escape(str(payment_label or "-"))}',
         f'🔎 系统单号：<code>{html.escape(str(system_no or "-"))}</code>',
-        f'🕒 创建时间：{html.escape(str(created_at or "-"))}',
+        f'🧾 支付单号：<code>{html.escape(str(pay_no or "-"))}</code>',
+        f'💳 支付方式：{html.escape(str(pay_method or "-"))}',
+        f'🕒 支付时间：{html.escape(str(paid_at or "-"))}',
+        f'🕒 退款单创建：{html.escape(str(created_at or "-"))}',
         f'📮 收款资料：{safe_payout}',
         f'✅ 退款完成时间：{html.escape(str(refunded_at))}' if refunded_at else None,
     )
     if refunded_at:
         tip = '这笔退款已经处理完成，记录会继续保留在退款车票中。'
+    elif not refund_allowed:
+        tip = '退款只在项目取消、项目过期或资源上传超时时开放；个人临时不想参加不能申请退款。'
     elif payout_info:
         tip = '收款资料已提交，正在等待管理员确认退款；有补充说明可联系小掌柜。'
     else:
-        tip = '还没有提交收款资料，请点击「💸 申请退款」补齐后进入管理员处理流程。'
+        tip = '退款只在项目取消、项目过期或资源上传超时时开放。请点击「💸 申请退款」提交收款资料。'
     return _panel('💸 退款小票', body, tip)
 
 

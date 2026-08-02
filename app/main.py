@@ -19,6 +19,7 @@ from app.services.payment_checker import faka_query_client
 from app.services.payment_auto_listener import payment_auto_listener
 from app.keyboards import admin_dashboard_keyboard
 from app.services.singleton import SingletonLease
+from app.services.schema_preflight import check_database_schema
 from app.db.models import SystemMetric
 from app import runtime
 from app.messages import cute as msg
@@ -87,6 +88,38 @@ async def notify_startup_config(bot: Bot, settings, username: str) -> None:
         except Exception:
             logging.exception('Failed to send startup configuration warning')
 
+
+
+async def notify_schema_warning_once(bot: Bot, settings, schema_status) -> None:
+    """Send one warning per distinct schema mismatch, even if systemd restarts repeatedly."""
+    signature = schema_status.short_message[:1800]
+    should_send = True
+    try:
+        async with SessionLocal() as session:
+            metric = await session.get(SystemMetric, 'startup_schema_warning_signature')
+            if metric and metric.value == signature:
+                should_send = False
+            elif metric is None:
+                session.add(SystemMetric(key='startup_schema_warning_signature', value=signature))
+            else:
+                metric.value = signature
+            await session.commit()
+    except Exception:
+        # system_metrics itself may be missing; still send once for this process.
+        pass
+    if should_send:
+        await bot.send_message(settings.ADMIN_GROUP_ID, schema_status.admin_warning)
+
+
+async def clear_schema_warning_signature() -> None:
+    try:
+        async with SessionLocal() as session:
+            metric = await session.get(SystemMetric, 'startup_schema_warning_signature')
+            if metric:
+                await session.delete(metric)
+                await session.commit()
+    except Exception:
+        pass
 
 
 async def setup_bot_commands(bot: Bot, settings) -> None:
@@ -163,8 +196,22 @@ async def main() -> None:
         logging.info('Starting Zhongchou Bot v%s from %s', APP_VERSION, Path(__file__).resolve())
         await notify_startup_config(bot, settings, bot_username)
 
+        # 启动业务任务前先核对 Alembic 版本与支付关键表。结构未就绪时，
+        # 机器人仍保留基础交互和系统健康页，但暂停支付监听/调度器，避免半启动后持续报错。
+        schema_status = await check_database_schema()
+        runtime.database_schema_ready = bool(schema_status.ready)
+        runtime.database_schema_message = schema_status.short_message
+        if not schema_status.ready:
+            logging.error('Database schema preflight failed: %s', schema_status.short_message)
+            try:
+                await notify_schema_warning_once(bot, settings, schema_status)
+            except Exception:
+                logging.exception('Failed to send database schema startup warning')
+        else:
+            await clear_schema_warning_signature()
+
         # PAYMENT_TEST_MODE=true 时跳过真实查单；正式环境由 Telethon 自动重连并向管理群告警。
-        if settings.PAYMENT_MODE == "telethon" and not settings.PAYMENT_TEST_MODE:
+        if schema_status.ready and settings.PAYMENT_MODE == "telethon" and not settings.PAYMENT_TEST_MODE:
             faka_query_client.set_alert_bot(bot)
             try:
                 await faka_query_client.start()
@@ -191,12 +238,20 @@ async def main() -> None:
         dp.include_router(fallback.router)
 
         await setup_bot_commands(bot, settings)
-        await ensure_admin_control_panel(bot, settings)
+        try:
+            await ensure_admin_control_panel(bot, settings)
+        except Exception:
+            if schema_status.ready:
+                raise
+            logging.exception('Admin control panel skipped because database schema is not ready')
 
-        scheduler = setup_scheduler(bot)
-        scheduler.start()
+        if schema_status.ready:
+            scheduler = setup_scheduler(bot)
+            scheduler.start()
+            runtime.scheduler = scheduler
+        else:
+            runtime.scheduler = None
         from datetime import datetime
-        runtime.scheduler = scheduler
         runtime.started_at = datetime.utcnow()
 
         await dp.start_polling(bot)

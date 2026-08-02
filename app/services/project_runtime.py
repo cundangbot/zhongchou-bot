@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -117,7 +118,7 @@ async def send_public_project_panel(bot: Bot, project: CrowdfundProject):
     markup = join_project_keyboard(
         project.id,
         full=is_after_full_stage(project),
-        cancelled=state_value(project.status) in ('cancelled', 'expired'),
+        cancelled=state_value(project.status) in ('cancelled', 'expired', 'refund_pending', 'refund_completed'),
         seat_price=project.seat_price,
     )
     return await bot.send_message(
@@ -128,8 +129,8 @@ async def send_public_project_panel(bot: Bot, project: CrowdfundProject):
     )
 
 
-async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
-    """Update one public panel only after a real project-state/progress change."""
+async def _update_public_project_now(bot: Bot, project: CrowdfundProject) -> None:
+    """Immediately update one public panel from a fresh project snapshot."""
     if not project.channel_message_id:
         return
 
@@ -137,7 +138,7 @@ async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
     markup = join_project_keyboard(
         project.id,
         full=is_after_full_stage(project),
-        cancelled=state_value(project.status) in ('cancelled', 'expired'),
+        cancelled=state_value(project.status) in ('cancelled', 'expired', 'refund_pending', 'refund_completed'),
         seat_price=project.seat_price,
     )
     text = project_public_text(project)
@@ -187,6 +188,55 @@ async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
         '这只会在人数、满员、补票或取消等真实状态变化时触发。'
         '若原模板已删除或消息ID已失效，请到项目详情点击「🧩 生成拼车模板」。',
     )
+
+
+_panel_update_tasks: dict[int, asyncio.Task] = {}
+_panel_update_guard = asyncio.Lock()
+
+
+async def _run_debounced_panel_update(bot: Bot, project_id: int, delay: float) -> None:
+    try:
+        await asyncio.sleep(max(0.0, delay))
+        async with SessionLocal() as session:
+            fresh = await session.get(CrowdfundProject, int(project_id))
+            if not fresh:
+                return
+            await _update_public_project_now(bot, fresh)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logging.exception('Debounced public project update failed for project %s', project_id)
+    finally:
+        async with _panel_update_guard:
+            current = _panel_update_tasks.get(int(project_id))
+            if current is asyncio.current_task():
+                _panel_update_tasks.pop(int(project_id), None)
+
+
+async def update_public_project(bot: Bot, project: CrowdfundProject) -> None:
+    """Debounce one project's panel updates and render only the latest committed state.
+
+    Repeated calls within a few seconds cancel the previous pending render and create
+    one new task. Startup never calls this function for historical projects.
+    """
+    project_id = int(getattr(project, 'id', 0) or 0)
+    if not project_id or not getattr(project, 'channel_message_id', None):
+        return
+    delay = max(0.0, float(getattr(settings, 'PROJECT_PANEL_DEBOUNCE_SECONDS', 3.0) or 0.0))
+    if delay <= 0:
+        async with SessionLocal() as session:
+            fresh = await session.get(CrowdfundProject, project_id)
+            if fresh:
+                await _update_public_project_now(bot, fresh)
+        return
+    async with _panel_update_guard:
+        previous = _panel_update_tasks.get(project_id)
+        if previous and not previous.done():
+            previous.cancel()
+        _panel_update_tasks[project_id] = asyncio.create_task(
+            _run_debounced_panel_update(bot, project_id, delay),
+            name=f'project-panel-update-{project_id}',
+        )
 
 
 async def notify_creator_rider_progress(

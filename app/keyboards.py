@@ -149,11 +149,35 @@ def auto_payment_project_keyboard(choices: list[tuple[int, str]], verified_id: i
 
 
 def admin_payment_contact_keyboard(system_no: str) -> InlineKeyboardMarkup:
-    """Admin alert action: use the saved verified buyer, falling back to faka only before verification was saved."""
+    """Payment exception recovery actions. Kept under the old function name for compatibility."""
     safe_no = ''.join(ch for ch in str(system_no or '').upper() if ch.isalnum())[:40]
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='💬 查询用户并联系', callback_data=f'admin:payment_contact:{safe_no}')],
+        [InlineKeyboardButton(text='🔍 查看 faka 核验结果', callback_data=f'admin:payment_result:{safe_no}')],
+        [InlineKeyboardButton(text='🎫 查看匹配待付车票', callback_data=f'admin:payment_matches:{safe_no}')],
+        [InlineKeyboardButton(text='🚗 选择项目绑定', callback_data=f'admin:payment_projects:{safe_no}')],
+        [InlineKeyboardButton(text='🔄 重新执行本地绑定', callback_data=f'admin:payment_retry:{safe_no}')],
+        [InlineKeyboardButton(text='💬 联系付款用户', callback_data=f'admin:payment_contact:{safe_no}')],
     ])
+
+
+def admin_payment_order_choices_keyboard(verified_id: int, choices: list[tuple[int, str]], system_no: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label[:60], callback_data=f'admin:payment_bind_order:{int(verified_id)}:{int(order_id)}')]
+        for order_id, label in choices[:20]
+    ]
+    rows.append([InlineKeyboardButton(text='🔄 重新执行本地绑定', callback_data=f'admin:payment_retry:{system_no}')])
+    rows.append([InlineKeyboardButton(text='💬 联系付款用户', callback_data=f'admin:payment_contact:{system_no}')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_payment_project_choices_keyboard(verified_id: int, choices: list[tuple[int, str]], system_no: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label[:60], callback_data=f'admin:payment_bind_project:{int(verified_id)}:{int(project_id)}')]
+        for project_id, label in choices[:20]
+    ]
+    rows.append([InlineKeyboardButton(text='🔄 重新执行本地绑定', callback_data=f'admin:payment_retry:{system_no}')])
+    rows.append([InlineKeyboardButton(text='💬 联系付款用户', callback_data=f'admin:payment_contact:{system_no}')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cancel_pending_confirm_keyboard(order_id: int) -> InlineKeyboardMarkup:

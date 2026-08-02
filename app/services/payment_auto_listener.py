@@ -294,6 +294,37 @@ async def _dispatch_verified_payment(record_id: int, bot: Bot) -> None:
         raise
 
 
+async def retry_verified_payment(record_id: int, bot: Bot) -> tuple[bool, str]:
+    """Retry only the local dispatch/binding step using the saved faka result."""
+    async with SessionLocal() as session:
+        record = (await session.execute(
+            select(VerifiedPayment)
+            .where(VerifiedPayment.id == int(record_id))
+            .with_for_update()
+        )).scalar_one_or_none()
+        if not record:
+            return False, '已核实付款记录不存在'
+        if record.status == 'bound':
+            return True, '这笔付款已经绑定完成，无需重试'
+        record.status = 'verified_unbound'
+        record.failure_reason = None
+        record.user_notice_error = None
+        await session.commit()
+    try:
+        await _dispatch_verified_payment(int(record_id), bot)
+    except Exception as exc:
+        return False, f'本地绑定重试失败：{exc}'
+    async with SessionLocal() as session:
+        record = await session.get(VerifiedPayment, int(record_id))
+        if not record:
+            return False, '重试后付款记录不存在'
+        if record.status == 'bound':
+            return True, '本地绑定已完成'
+        if record.status == 'awaiting_selection':
+            return True, '已重新发送选择页面，等待用户选择'
+        return False, record.failure_reason or f'当前状态：{record.status}'
+
+
 async def resume_unbound_verified_payments(bot: Bot, *, limit: int = 50) -> int:
     """Resume records interrupted before or during local dispatch."""
     stale_processing_before = datetime.utcnow() - timedelta(minutes=5)

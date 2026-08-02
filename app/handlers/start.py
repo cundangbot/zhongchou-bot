@@ -64,6 +64,8 @@ from app.keyboards import (
     support_bot_display_name,
     auto_payment_success_keyboard,
     admin_payment_contact_keyboard,
+    admin_payment_order_choices_keyboard,
+    admin_payment_project_choices_keyboard,
     admin_tools_keyboard,
     empty_orders_keyboard, empty_resources_keyboard, payment_error_keyboard, resource_progress_keyboard,
 )
@@ -75,7 +77,13 @@ from app.services.ledger import post_ledger
 from app.services.idempotency import begin_operation, finish_operation
 from app.services.system_events import get_metric
 from app.services.payment_checker import faka_query_client
-from app.services.payment_binding import bind_verified_to_order, bind_verified_to_project, payment_binding_failure_text, payment_success_text, run_paid_followups
+from app.services.payment_products import payment_product_by_kind
+from app.services.payment_auto_listener import payment_auto_listener, retry_verified_payment
+from app.services.payment_binding import (
+    bind_verified_to_order, bind_verified_to_project, payment_binding_failure_text,
+    payment_success_text, run_paid_followups, matching_pending_orders, eligible_projects,
+    pending_choice_rows, project_choice_rows,
+)
 from app.services.project_runtime import (
     load_resource_items,
     notify_creator_rider_progress,
@@ -216,6 +224,7 @@ def _support_context_source_label(source: str | None) -> str:
         'project': '项目详情入口',
         'payment': '支付异常通知',
         'direct': '管理员主动联系',
+        'membership': '会员购买入口',
     }.get(source or 'generic', source or '通用客服入口')
 
 
@@ -734,6 +743,138 @@ def _support_simple_context(project=None, source_label: str = '通用客服入�
     )
 
 
+async def _support_has_previous_user_message(ticket_id: int) -> bool:
+    async with SessionLocal() as session:
+        count = (await session.execute(
+            select(func.count()).select_from(SupportBridgeMessage).where(
+                SupportBridgeMessage.ticket_id == int(ticket_id),
+                SupportBridgeMessage.direction == 'user_to_admin',
+            )
+        )).scalar() or 0
+        return int(count) > 0
+
+
+async def _support_recent_user_actions(session, user_id: int) -> list[str]:
+    events: list[tuple[datetime, str]] = []
+    orders = list((await session.execute(
+        select(PaymentOrder)
+        .where(PaymentOrder.user_id == int(user_id))
+        .order_by(PaymentOrder.created_at.desc())
+        .limit(6)
+    )).scalars().all())
+    for order in orders:
+        if order.status == 'paid' and order.paid_at:
+            label = f'完成付款 T.{int(order.id):03d}｜{order.faka_system_no or "无VP"}'
+            when = order.paid_at
+        elif order.status == 'pending':
+            label = f'创建待付车票 T.{int(order.id):03d}'
+            when = order.created_at
+        else:
+            label = f'车票 T.{int(order.id):03d} 状态变为 {order.status}'
+            when = order.created_at
+        events.append((when or datetime.min, label))
+
+    refunds = list((await session.execute(
+        select(RefundRecord)
+        .where(RefundRecord.user_id == int(user_id))
+        .order_by(RefundRecord.created_at.desc())
+        .limit(4)
+    )).scalars().all())
+    for refund in refunds:
+        events.append((refund.created_at or datetime.min, f'退款单 R.{int(refund.id):03d}｜{_refund_status_label(refund.status)}'))
+
+    projects = list((await session.execute(
+        select(CrowdfundProject)
+        .where(CrowdfundProject.creator_id == int(user_id))
+        .order_by(CrowdfundProject.created_at.desc())
+        .limit(4)
+    )).scalars().all())
+    for project in projects:
+        events.append((project.created_at or datetime.min, f'发起项目 P.{int(project.id):03d}｜{project.blogger}'))
+
+    events.sort(key=lambda item: item[0] or datetime.min, reverse=True)
+    return [f'{_fmt_dt(when)}｜{label}' for when, label in events[:3]]
+
+
+async def _build_support_business_context(session, user_id: int, context: dict) -> str:
+    source = context.get('source_page') or 'generic'
+    source_label = _support_context_source_label(source)
+    project = await session.get(CrowdfundProject, int(context.get('project_id') or 0)) if context.get('project_id') else None
+    order = await session.get(PaymentOrder, int(context.get('order_id') or 0)) if context.get('order_id') else None
+    refund = await session.get(RefundRecord, int(context.get('refund_id') or 0)) if context.get('refund_id') else None
+
+    if refund and order is None:
+        order = await session.get(PaymentOrder, int(refund.order_id or 0))
+    if order and project is None and order.project_id:
+        project = await session.get(CrowdfundProject, int(order.project_id))
+
+    # 通用/支付入口没有明确业务编号时，附带用户最近的一笔相关车票。
+    # 会员购买等独立入口不附带无关项目。
+    if order is None and source in {'generic', 'pending', 'error', 'payment'}:
+        order = (await session.execute(
+            select(PaymentOrder)
+            .where(PaymentOrder.user_id == int(user_id))
+            .order_by(PaymentOrder.created_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if order and project is None and order.project_id:
+            project = await session.get(CrowdfundProject, int(order.project_id))
+
+    verified = None
+    if order and order.faka_system_no:
+        verified = (await session.execute(
+            select(VerifiedPayment).where(VerifiedPayment.system_no == order.faka_system_no)
+        )).scalar_one_or_none()
+    if verified is None:
+        verified = (await session.execute(
+            select(VerifiedPayment)
+            .where(VerifiedPayment.user_id == int(user_id))
+            .order_by(VerifiedPayment.updated_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+
+    last_error = context.get('last_error')
+    if not last_error and order:
+        last_error = order.fail_reason
+    if not last_error and verified:
+        last_error = verified.failure_reason or verified.user_notice_error
+    if not last_error:
+        event = (await session.execute(
+            select(SystemEvent)
+            .where(SystemEvent.user_id == int(user_id), SystemEvent.severity.in_(['warning', 'error', 'critical']))
+            .order_by(SystemEvent.created_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        last_error = event.message if event else None
+
+    if project:
+        project_line = f'P.{int(project.id):03d}｜{project.blogger}｜{_status_label(project.status)}'
+    else:
+        project_line = '-'
+    if order:
+        order_line = f'T.{int(order.id):03d}｜{_order_type_name(order.order_type)}｜{_order_status_label(order, project)}'
+    else:
+        order_line = '-'
+    if verified:
+        vp_line = f'{verified.system_no}｜{verified.status}'
+    elif order and order.faka_system_no:
+        vp_line = f'{order.faka_system_no}｜未找到 verified_payments 记录'
+    else:
+        vp_line = '-'
+
+    actions = await _support_recent_user_actions(session, int(user_id))
+    action_text = '\n'.join(f'{idx}. {value}' for idx, value in enumerate(actions, start=1)) or '暂无记录'
+    last_error_text = str(last_error or '-').replace('\n', ' ').strip()[:500] or '-'
+    return (
+        f'来源页面：{source_label}\n'
+        f'相关项目当前状态：{project_line}\n'
+        f'相关车票状态：{order_line}\n'
+        f'相关 VP 状态：{vp_line}\n'
+        f'最后一次错误：{last_error_text}\n'
+        f'用户最近三个操作：\n{action_text}'
+    )
+
+
 async def _delete_state_message(bot: Bot, state: FSMContext, key: str, chat_id: int) -> None:
     data = await state.get_data()
     mid = int(data.get(key) or 0)
@@ -758,9 +899,11 @@ async def _copy_support_user_message_to_admin(
     ticket_no = _support_no(ticket.id)
     plain_text = (user_message.text or user_message.caption or '').strip()
     is_held_dialog = await _support_admin_has_fresh_session(admin_id, int(ticket.id), touch=True)
+    has_previous_user_message = await _support_has_previous_user_message(int(ticket.id))
 
-    if is_held_dialog:
-        # 管理员已经点过“保持这个对话”：后续只推送用户发来的原始内容，不再重复来源页面/按钮。
+    if is_held_dialog or has_previous_user_message:
+        # 同一客服会话只有第一条用户消息携带完整业务上下文。
+        # 后续消息无论管理员是否点过“保持这个对话”，都只推送原始内容。
         if not _message_has_media_payload(user_message):
             sent = await bot.send_message(
                 admin_id,
@@ -794,7 +937,7 @@ async def _copy_support_user_message_to_admin(
     if not _message_has_media_payload(user_message):
         sent = await bot.send_message(
             admin_id,
-            msg.support_private_admin_text(header=header, user_message=plain_text),
+            _panel_safe_text(msg.support_private_admin_text(header=header, user_message=plain_text), 3900),
             reply_markup=keyboard,
             parse_mode=None,
             disable_web_page_preview=True,
@@ -1279,6 +1422,36 @@ def _refund_status_label(status: str | None) -> str:
     }.get(status or '', status or '-')
 
 
+def _refund_is_open_for_project(project: CrowdfundProject | None) -> bool:
+    """Only system-created cancellation/expiry/resource-timeout refunds are user-applicable."""
+    if project is None:
+        return False
+    status = state_value(project.status)
+    reason = (project.cancel_reason or '').strip()
+    if status in {
+        ProjectState.CANCELLED.value,
+        ProjectState.EXPIRED.value,
+        ProjectState.REFUND_PENDING.value,
+        ProjectState.REFUND_COMPLETED.value,
+    }:
+        return bool(project.expired_at or reason)
+    return False
+
+
+def _refund_open_reason(project: CrowdfundProject | None) -> str:
+    if project is None:
+        return '项目状态不支持退款'
+    reason = (project.cancel_reason or '').strip()
+    if reason:
+        return reason
+    status = state_value(project.status)
+    if status == ProjectState.EXPIRED.value:
+        return '项目已过期'
+    if status in {ProjectState.CANCELLED.value, ProjectState.REFUND_PENDING.value, ProjectState.REFUND_COMPLETED.value}:
+        return '项目已取消'
+    return '项目状态不支持退款'
+
+
 def _order_status_label(o: PaymentOrder, project: CrowdfundProject | None = None) -> str:
     if o.status == 'pending':
         return '待支付'
@@ -1666,7 +1839,8 @@ async def refund_order_detail(call: CallbackQuery):
             return
         o = await session.get(PaymentOrder, r.order_id)
         p = await session.get(CrowdfundProject, r.project_id)
-        can_apply = r.status == 'pending_info'
+        refund_allowed = _refund_is_open_for_project(p)
+        can_apply = r.status == 'pending_info' and refund_allowed
         text = msg.refund_detail(
             refund_no=_refund_no(r.id),
             project_no=project_no(p) if p else '-',
@@ -1680,6 +1854,12 @@ async def refund_order_detail(call: CallbackQuery):
             payout_info=r.payout_info,
             refunded_at=_fmt_dt(r.refunded_at) if r.refunded_at else None,
             user_id=r.user_id,
+            refund_reason=_refund_open_reason(p),
+            original_amount=float(o.paid_amount or o.expected_amount or 0) if o else float(r.amount or 0),
+            pay_no=o.faka_pay_no if o and o.faka_pay_no else '-',
+            pay_method=o.paid_method if o and o.paid_method else '-',
+            paid_at=_fmt_dt(o.paid_at) if o and o.paid_at else '-',
+            refund_allowed=refund_allowed,
         )
     await _edit_panel(call, text, reply_markup=refund_detail_keyboard(refund_id, can_apply=can_apply, relaunch_project_id=(p.id if p and p.creator_id == call.from_user.id and _can_relaunch_project(p) else None)))
     await call.answer()
@@ -3833,7 +4013,7 @@ async def support_start_callback(call: CallbackQuery, state: FSMContext):
         if await _is_blacklisted(session, call.from_user.id):
             await call.answer('你的账号暂时被限制使用。', show_alert=True)
             return
-        if source in ('pending', 'error') and ref_id:
+        if source in ('pending', 'error', 'payment') and ref_id:
             order = await session.get(PaymentOrder, ref_id)
             if order and order.user_id == call.from_user.id:
                 project = await session.get(CrowdfundProject, order.project_id) if order.project_id else None
@@ -3851,7 +4031,10 @@ async def support_start_callback(call: CallbackQuery, state: FSMContext):
                 context.update(project_id=project.id)
                 context['context_text'] = _support_simple_context(project, '项目详情')
 
-        # 若用户已有未关闭会话，继续沿用，避免每条消息都变成一张新工单。
+        context['context_text'] = await _build_support_business_context(session, call.from_user.id, context)
+
+        # 若用户已有未关闭会话，继续沿用；该会话已经转发过第一条消息后，
+        # 后续内容不再重复携带来源和业务上下文。
         ticket = await _support_active_ticket_for_user(session, call.from_user.id)
         if ticket:
             context['ticket_id'] = ticket.id
@@ -4074,6 +4257,245 @@ async def admin_support_reply_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await _edit_panel(call, f'⛔ 已取消回复客服工单 {_support_no(ticket_id)}。', reply_markup=contact_admin_keyboard(ticket_id))
     await call.answer('已取消回复')
+
+
+
+
+def _payment_admin_safe_system_no(call_data: str | None) -> str | None:
+    raw_no = (call_data or '').split(':')[-1]
+    try:
+        return normalize_system_no(raw_no)
+    except Exception:
+        return None
+
+
+async def _admin_verified_payment_by_system_no(session, system_no: str) -> VerifiedPayment | None:
+    return (await session.execute(
+        select(VerifiedPayment).where(VerifiedPayment.system_no == system_no)
+    )).scalar_one_or_none()
+
+
+@router.callback_query(F.data.startswith('admin:payment_result:'))
+async def admin_payment_result(call: CallbackQuery):
+    if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+        await call.answer('只能由管理员使用', show_alert=True)
+        return
+    system_no = _payment_admin_safe_system_no(call.data)
+    if not system_no:
+        await call.answer('系统单号无效', show_alert=True)
+        return
+    await call.answer('正在读取已保存的核验结果…')
+    async with SessionLocal() as session:
+        verified = await _admin_verified_payment_by_system_no(session, system_no)
+    if verified:
+        raw = (verified.raw_response or '未保存原始回复').strip()
+        text_value = (
+            '🔍 faka 核验结果\n\n'
+            f'系统单号：{verified.system_no}\n'
+            f'付款用户ID：{int(verified.user_id)}\n'
+            f'金额：{verified.amount} 元\n'
+            f'商品：{verified.product_name}\n'
+            f'商品类型：{verified.product_kind}\n'
+            f'支付方式：{verified.pay_method or "-"}\n'
+            f'支付通道：{verified.pay_channel or "-"}\n'
+            f'下单机器人：{verified.order_bot or "-"}\n'
+            f'本地状态：{verified.status}\n'
+            f'绑定项目：{verified.selected_project_id or "-"}\n'
+            f'绑定车票：{verified.bound_order_id or "-"}\n'
+            f'失败原因：{verified.failure_reason or "-"}\n\n'
+            f'原始核验内容：\n{raw}'
+        )
+        await call.message.answer(_panel_safe_text(text_value), parse_mode=None, disable_web_page_preview=True)
+        return
+    # 只在异常发生于“保存 verified_payments 之前”时才重新向 faka 查询。
+    try:
+        result = await faka_query_client.query_order(system_no)
+    except Exception as exc:
+        await call.message.answer(f'❌ 尚无已保存核验结果，重新查询 faka 也失败。\n系统单号：{system_no}\n错误：{exc}', parse_mode=None)
+        return
+    await call.message.answer(
+        _panel_safe_text(
+            '🔍 faka 临时查询结果（尚未保存）\n\n'
+            f'系统单号：{result.system_no or system_no}\n'
+            f'付款用户ID：{result.buyer_user_id or "-"}\n'
+            f'状态：{result.status or "-"}\n'
+            f'金额：{result.amount if result.amount is not None else "-"} 元\n'
+            f'商品：{result.product_name or "-"}\n'
+            f'支付方式：{result.pay_method or "-"}\n'
+            f'下单机器人：{result.order_bot or "-"}\n\n'
+            f'原始回复：\n{result.raw or "-"}'
+        ),
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith('admin:payment_matches:'))
+async def admin_payment_matches(call: CallbackQuery):
+    if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+        await call.answer('只能由管理员使用', show_alert=True)
+        return
+    system_no = _payment_admin_safe_system_no(call.data)
+    if not system_no:
+        await call.answer('系统单号无效', show_alert=True)
+        return
+    async with SessionLocal() as session:
+        verified = await _admin_verified_payment_by_system_no(session, system_no)
+        if not verified:
+            await call.answer('这笔付款尚未保存核验结果', show_alert=True)
+            return
+        orders = await matching_pending_orders(session, verified)
+        project_ids = {int(order.project_id) for order in orders if order.project_id}
+        projects = {
+            int(project.id): project
+            for project in (await session.execute(
+                select(CrowdfundProject).where(CrowdfundProject.id.in_(project_ids))
+            )).scalars().all()
+        } if project_ids else {}
+        choices = pending_choice_rows(orders, projects)
+    if not choices:
+        await call.message.answer(
+            f'🎫 没有匹配的待付车票\n\n系统单号：{system_no}\n可以继续点击「🚗 选择项目绑定」查看可恢复项目。',
+            reply_markup=admin_payment_contact_keyboard(system_no),
+        )
+        await call.answer()
+        return
+    await call.message.answer(
+        f'🎫 匹配待付车票\n\n系统单号：{system_no}\n付款用户：{int(verified.user_id)}\n请选择确认绑定的车票：',
+        reply_markup=admin_payment_order_choices_keyboard(int(verified.id), choices, system_no),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:payment_projects:'))
+async def admin_payment_projects(call: CallbackQuery):
+    if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+        await call.answer('只能由管理员使用', show_alert=True)
+        return
+    system_no = _payment_admin_safe_system_no(call.data)
+    if not system_no:
+        await call.answer('系统单号无效', show_alert=True)
+        return
+    async with SessionLocal() as session:
+        verified = await _admin_verified_payment_by_system_no(session, system_no)
+        if not verified:
+            await call.answer('这笔付款尚未保存核验结果', show_alert=True)
+            return
+        product = payment_product_by_kind(verified.product_kind)
+        if product is None:
+            await call.answer('商品类型无法识别，不能安全选择项目', show_alert=True)
+            return
+        projects = await eligible_projects(session, verified)
+        choices = project_choice_rows(projects, product)
+    if not choices:
+        await call.message.answer(
+            f'🚗 没有可恢复绑定项目\n\n系统单号：{system_no}\n已排除价格不符、状态不符以及用户已参加/已拥有资源的项目。',
+            reply_markup=admin_payment_contact_keyboard(system_no),
+        )
+        await call.answer()
+        return
+    await call.message.answer(
+        f'🚗 选择项目绑定\n\n系统单号：{system_no}\n付款用户：{int(verified.user_id)}\n请选择确认绑定的项目：',
+        reply_markup=admin_payment_project_choices_keyboard(int(verified.id), choices, system_no),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('admin:payment_retry:'))
+async def admin_payment_retry(call: CallbackQuery, bot: Bot):
+    if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+        await call.answer('只能由管理员使用', show_alert=True)
+        return
+    system_no = _payment_admin_safe_system_no(call.data)
+    if not system_no:
+        await call.answer('系统单号无效', show_alert=True)
+        return
+    async with SessionLocal() as session:
+        verified = await _admin_verified_payment_by_system_no(session, system_no)
+    if not verified:
+        await call.answer('尚无已保存的核验记录，不能只重试本地绑定', show_alert=True)
+        return
+    await call.answer('正在重新执行本地绑定…')
+    ok, result_text = await retry_verified_payment(int(verified.id), bot)
+    icon = '✅' if ok else '❌'
+    await call.message.answer(
+        f'{icon} 本地绑定重试结果\n\n系统单号：{system_no}\n{result_text}',
+        reply_markup=admin_payment_contact_keyboard(system_no),
+    )
+
+
+@router.callback_query(F.data.startswith('admin:payment_bind_order:'))
+async def admin_payment_bind_order(call: CallbackQuery, bot: Bot):
+    if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+        await call.answer('只能由管理员使用', show_alert=True)
+        return
+    parts = (call.data or '').split(':')
+    try:
+        verified_id = int(parts[-2])
+        order_id = int(parts[-1])
+    except Exception:
+        await call.answer('绑定参数无效', show_alert=True)
+        return
+    async with SessionLocal() as session:
+        verified = await session.get(VerifiedPayment, verified_id)
+        if not verified:
+            await call.answer('已核实付款记录不存在', show_alert=True)
+            return
+        outcome = await bind_verified_to_order(session, verified_id, order_id, int(verified.user_id))
+        if outcome.ok and outcome.order:
+            await run_paid_followups(bot, session, outcome.order, notify_user=True)
+            await call.message.answer(
+                f'✅ 已由管理员完成车票绑定\n\n系统单号：{verified.system_no}\n车票：T.{int(outcome.order.id):03d}',
+            )
+            await call.answer('绑定成功')
+            return
+        reason = outcome.reason
+        system_no = verified.system_no
+    await call.message.answer(
+        f'❌ 车票绑定失败\n\n系统单号：{system_no}\n原因：{reason}',
+        reply_markup=admin_payment_contact_keyboard(system_no),
+    )
+    await call.answer('绑定失败', show_alert=True)
+
+
+@router.callback_query(F.data.startswith('admin:payment_bind_project:'))
+async def admin_payment_bind_project(call: CallbackQuery, bot: Bot):
+    if not await _admin_group_allowed(call.from_user.id, call.message.chat.id):
+        await call.answer('只能由管理员使用', show_alert=True)
+        return
+    parts = (call.data or '').split(':')
+    try:
+        verified_id = int(parts[-2])
+        project_id = int(parts[-1])
+    except Exception:
+        await call.answer('绑定参数无效', show_alert=True)
+        return
+    async with SessionLocal() as session:
+        verified = await session.get(VerifiedPayment, verified_id)
+        if not verified:
+            await call.answer('已核实付款记录不存在', show_alert=True)
+            return
+        outcome = await bind_verified_to_project(
+            session,
+            verified_id,
+            project_id,
+            int(verified.user_id),
+            None,
+        )
+        if outcome.ok and outcome.order:
+            await run_paid_followups(bot, session, outcome.order, notify_user=True)
+            await call.message.answer(
+                f'✅ 已由管理员完成项目绑定\n\n系统单号：{verified.system_no}\n项目：P.{int(project_id):03d}\n车票：T.{int(outcome.order.id):03d}',
+            )
+            await call.answer('绑定成功')
+            return
+        reason = outcome.reason
+        system_no = verified.system_no
+    await call.message.answer(
+        f'❌ 项目绑定失败\n\n系统单号：{system_no}\n原因：{reason}',
+        reply_markup=admin_payment_contact_keyboard(system_no),
+    )
+    await call.answer('绑定失败', show_alert=True)
 
 
 @router.callback_query(F.data.startswith('admin:payment_contact:'))
@@ -4659,6 +5081,9 @@ async def refund_apply_start(call: CallbackQuery, state: FSMContext):
             return
         order = await session.get(PaymentOrder, r.order_id)
         project = await session.get(CrowdfundProject, r.project_id)
+        if not _refund_is_open_for_project(project):
+            await call.answer('个人临时不想参加不能退款；仅项目取消、过期或资源上传超时开放退款。', show_alert=True)
+            return
     await state.update_data(refund_id=refund_id)
     await state.set_state(RefundApplyCollect.payout_info)
     await call.message.answer(
@@ -4703,6 +5128,10 @@ async def collect_refund_info(message: Message, state: FSMContext, bot: Bot):
             return
         order = await session.get(PaymentOrder, r.order_id)
         project = await session.get(CrowdfundProject, r.project_id)
+        if not _refund_is_open_for_project(project):
+            await message.answer('当前项目不符合退款条件。个人临时不想参加不能退款；仅项目取消、过期或资源上传超时开放退款。')
+            await state.clear()
+            return
         r.status = 'pending_admin'
         r.payout_info = info_text or '见下方收款码/附件'
         await session.commit()
@@ -4851,19 +5280,31 @@ async def _admin_group_allowed(user_id: int, chat_id: int) -> bool:
 async def _health_text(bot: Bot) -> str:
     from app import runtime
     from app.db.base import engine
+
     checks = {}
     try:
         me = await bot.get_me()
         checks['Bot API'] = f'正常 (@{me.username})'
     except Exception as exc:
         checks['Bot API'] = f'异常：{exc}'
-    checks['Telethon'] = '已连接' if faka_query_client.client.is_connected() else '未连接'
+
+    telethon_connected = bool(faka_query_client.client.is_connected())
+    listener_expected = bool(
+        settings.PAYMENT_MODE == 'telethon'
+        and not settings.PAYMENT_TEST_MODE
+        and settings.PAYMENT_AUTO_CONFIRM_ENABLED
+    )
+    listener_running = bool(payment_auto_listener.is_running)
+    checks['Telethon'] = '已连接' if telethon_connected else '未连接'
+    checks['自动核验监听'] = '运行中' if listener_running else ('未运行' if listener_expected else '未启用')
+
     try:
         async with engine.connect() as conn:
             await conn.execute(text('SELECT 1'))
         checks['数据库'] = '正常 (PostgreSQL)'
     except Exception as exc:
         checks['数据库'] = f'异常：{exc}'
+
     try:
         me = await bot.get_me()
         member = await bot.get_chat_member(settings.PUBLIC_CHANNEL_ID, me.id)
@@ -4876,14 +5317,92 @@ async def _health_text(bot: Bot) -> str:
         checks['审核群权限'] = '正常' if member.status in ('member', 'administrator', 'creator') else f'异常：当前身份 {member.status}'
     except Exception as exc:
         checks['审核群权限'] = f'异常：{exc}'
+
     scheduler = runtime.scheduler
     checks['调度器'] = '运行中' if scheduler and scheduler.running else '未运行'
     checks['单实例锁'] = '已持有' if runtime.single_instance else '未持有'
     jobs = len(scheduler.get_jobs()) if scheduler else 0
-    async with SessionLocal() as session:
-        verify_metric = await get_metric(session, 'last_successful_verification')
-        backup_metric = await get_metric(session, 'last_database_backup')
-    last_verify = verify_metric.value if verify_metric else '暂无记录'
+
+    pending_local = awaiting_selection = attention = 0
+    last_payment_error = '暂无记录'
+    last_verify = '暂无记录'
+    last_faka = '暂无记录'
+    backup_metric = None
+    faka_metric = None
+    payment_error_metric = None
+    payment_query_error = None
+    try:
+        async with SessionLocal() as session:
+            pending_local = int((await session.execute(
+                select(func.count()).select_from(VerifiedPayment).where(
+                    VerifiedPayment.status.in_(['verified_unbound', 'processing'])
+                )
+            )).scalar() or 0)
+            awaiting_selection = int((await session.execute(
+                select(func.count()).select_from(VerifiedPayment).where(
+                    VerifiedPayment.status == 'awaiting_selection'
+                )
+            )).scalar() or 0)
+            attention = int((await session.execute(
+                select(func.count()).select_from(VerifiedPayment).where(
+                    VerifiedPayment.status == 'attention'
+                )
+            )).scalar() or 0)
+            latest_attention = (await session.execute(
+                select(VerifiedPayment)
+                .where(VerifiedPayment.status == 'attention')
+                .order_by(VerifiedPayment.updated_at.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+            if latest_attention:
+                last_payment_error = (
+                    f'{latest_attention.system_no}：'
+                    f'{latest_attention.failure_reason or latest_attention.user_notice_error or "需要人工处理"}'
+                )[:500]
+            verify_metric = await get_metric(session, 'last_successful_verification')
+            faka_metric = await get_metric(session, 'last_faka_query_success')
+            payment_error_metric = await get_metric(session, 'last_faka_query_error')
+            backup_metric = await get_metric(session, 'last_database_backup')
+            last_verify = verify_metric.value if verify_metric else '暂无记录'
+            last_faka = faka_metric.value if faka_metric else '暂无记录'
+            payment_query_error = payment_error_metric.value if payment_error_metric else None
+    except Exception as exc:
+        last_payment_error = f'支付健康数据读取失败：{exc}'
+
+    schema_ready = runtime.database_schema_ready is not False
+    red_reasons: list[str] = []
+    yellow_reasons: list[str] = []
+    if not schema_ready:
+        red_reasons.append(runtime.database_schema_message or '数据库结构未就绪')
+    if listener_expected and not telethon_connected:
+        red_reasons.append('Telethon 未连接')
+    if listener_expected and not listener_running:
+        red_reasons.append('自动核验监听未运行')
+    if attention:
+        yellow_reasons.append(f'{attention} 笔付款需要人工关注')
+    if pending_local:
+        yellow_reasons.append(f'{pending_local} 笔付款等待本地处理')
+    if awaiting_selection:
+        yellow_reasons.append(f'{awaiting_selection} 笔付款等待用户选择')
+    if payment_error_metric and (
+        not faka_metric
+        or (payment_error_metric.updated_at or datetime.min) > (faka_metric.updated_at or datetime.min)
+    ):
+        yellow_reasons.append('最近一次 faka 查单失败，尚无更新的成功记录')
+
+    if red_reasons:
+        payment_level = '🔴 异常'
+        payment_reason = '；'.join(red_reasons)
+    elif yellow_reasons:
+        payment_level = '🟡 注意'
+        payment_reason = '；'.join(yellow_reasons)
+    else:
+        payment_level = '🟢 正常'
+        payment_reason = '监听、查单和本地绑定均无积压'
+
+    if last_payment_error == '暂无记录' and payment_query_error:
+        last_payment_error = str(payment_query_error)[:500]
+
     backup_path = __import__('pathlib').Path(settings.BACKUP_STATUS_FILE)
     if not backup_path.is_absolute():
         backup_path = ENV_FILE.parent / backup_path
@@ -4891,10 +5410,20 @@ async def _health_text(bot: Bot) -> str:
         last_backup = backup_metric.value
     else:
         last_backup = backup_path.read_text(encoding='utf-8').strip() if backup_path.exists() else '暂无记录'
+
     return (
         '🩺 系统健康检查\n\n'
         + '\n'.join(f'{key}：{value}' for key, value in checks.items())
-        + f'\n待执行任务：{jobs}\n最后成功验票：{last_verify}\n最后数据库备份：{last_backup}'
+        + '\n\n💳 支付核验情况\n'
+        + f'状态：{payment_level}\n'
+        + f'说明：{payment_reason}\n'
+        + f'等待本地处理：{pending_local}\n'
+        + f'等待用户选择：{awaiting_selection}\n'
+        + f'需要人工关注：{attention}\n'
+        + f'最后 faka 查单成功：{last_faka}\n'
+        + f'最后成功验票：{last_verify}\n'
+        + f'最近付款异常：{last_payment_error}\n'
+        + f'\n待执行任务：{jobs}\n最后数据库备份：{last_backup}'
     )
 
 
